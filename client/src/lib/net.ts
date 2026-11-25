@@ -1,4 +1,13 @@
-import type { AppConfig, ClientMsg, DoorPhotoInfo, Phase, Role, RoundInfo, ServerMsg } from '../../../shared/protocol';
+import type {
+  AppConfig,
+  ClientMsg,
+  ContactSheetInfo,
+  DoorPhotoInfo,
+  Phase,
+  Role,
+  RoundInfo,
+  ServerMsg,
+} from '../../../shared/protocol';
 
 export type StateMsg = Extract<ServerMsg, { type: 'state' }>;
 type Handler<T extends ServerMsg['type']> = (msg: Extract<ServerMsg, { type: T }>) => void;
@@ -6,7 +15,7 @@ type Handler<T extends ServerMsg['type']> = (msg: Extract<ServerMsg, { type: T }
 /**
  * WebSocket client:
  *  - exponential back-off reconnect (0.5s → 1s → 2s … capped at 10s, with jitter)
- *  - after reconnecting the server immediately sends state / config / door-photo for a full resync
+ *  - after reconnecting the server immediately sends state / config / door-photo / contact-sheet for a full resync
  *  - NTP-style clock sync: uses the offset of the lowest-RTT sample among recent ones
  */
 export class Net {
@@ -27,6 +36,7 @@ export class Net {
   state: StateMsg | null = null;
   config: AppConfig | null = null;
   doorPhoto: DoorPhotoInfo | null = null;
+  contactSheet: ContactSheetInfo | null = null;
 
   constructor(role: Role, token?: string) {
     this.role = role;
@@ -206,12 +216,15 @@ export class Net {
       case 'door-photo':
         this.doorPhoto = msg.photo;
         break;
+      case 'contact-sheet':
+        this.contactSheet = msg.sheet;
+        break;
     }
     this.emit(msg.type, msg);
   }
 }
 
-/** connection dot in the corner (turns red when offline) */
+/** connection dot in the corner (turns safelight red when offline) */
 export function mountNetDot(net: Net): void {
   const dot = document.createElement('div');
   dot.className = 'net-dot';

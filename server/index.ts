@@ -1,5 +1,5 @@
 /**
- * 《入画三十秒》统一单端口服务：静态前端 + /assets + /data + /api + /ws
+ * 《入画三十秒 (RH-30)》v2 统一单端口服务：静态前端 + /assets + /data + /api + /ws
  */
 import http from 'node:http';
 import path from 'node:path';
@@ -9,8 +9,10 @@ import express, { NextFunction, Request, Response } from 'express';
 import { WebSocketServer, WebSocket, RawData } from 'ws';
 import {
   AppConfig,
+  AudioClip,
   ClientMsg,
   ClientStatus,
+  ContactSheetInfo,
   Phase,
   PHASE_SECONDS,
   Role,
@@ -23,11 +25,14 @@ import {
   ASSETS_DIR,
   DATA_DIR,
   assetExists,
+  countRollFramesSync,
   decodeJpeg,
   doorPhotoInfo,
   ensureDirs,
+  getContactSheet,
   listArchive,
   loadConfig,
+  pad,
   resetDoorPhoto,
   sanitizeConfig,
   saveConfig,
@@ -46,6 +51,10 @@ const HEARTBEAT_MS = 20_000;
 
 ensureDirs();
 let config: AppConfig = loadConfig();
+let currentSheet: ContactSheetInfo = { rollNumber: config.rollNumber, totalInRoll: 0, frames: [] };
+getContactSheet(config.rollNumber)
+  .then((s) => (currentSheet = s))
+  .catch(() => {});
 
 // ======================================================================
 // HTTP
@@ -64,9 +73,11 @@ app.get('/api/health', (_req, res) => {
   res.set('Cache-Control', 'no-store');
   res.json({
     ok: true,
+    version: '2.0.0-archival',
     state,
     clients: clientCounts(),
     round: round.id,
+    rollNumber: config.rollNumber,
     timeScale: TIME_SCALE,
     assets: { base: assetExists('base.mp4'), rewind: assetExists('rewind.mp4') },
     uptime: Math.round(process.uptime()),
@@ -74,13 +85,28 @@ app.get('/api/health', (_req, res) => {
   });
 });
 
+app.get('/api/contact-sheet', async (_req, res) => {
+  const sheet = await getContactSheet(config.rollNumber);
+  currentSheet = sheet;
+  res.set('Cache-Control', 'no-store');
+  res.json({ ok: true, sheet });
+});
+
 app.get('/api/archive', async (req, res) => {
   if (!tokenOk(req)) return void res.status(401).json({ ok: false, error: 'unauthorized' });
   const date = typeof req.query.date === 'string' && /^\d{8}$/.test(req.query.date) ? req.query.date : null;
   const all = req.query.all === '1';
-  const items = await listArchive(date, all);
+  const rollParam = req.query.roll === 'current' ? config.rollNumber : req.query.roll ? Number(req.query.roll) : null;
+  const rollFilter = rollParam != null && Number.isFinite(rollParam) ? rollParam : null;
+  const items = await listArchive(date, all, rollFilter);
   res.set('Cache-Control', 'no-store');
-  res.json({ ok: true, date: date || (all ? 'all' : 'today'), count: items.length, items });
+  res.json({
+    ok: true,
+    rollNumber: config.rollNumber,
+    date: date || (all ? 'all' : 'today'),
+    count: items.length,
+    items,
+  });
 });
 
 app.get('/api/config', (_req, res) => {
@@ -88,7 +114,7 @@ app.get('/api/config', (_req, res) => {
   res.json({ ok: true, config });
 });
 
-// /assets：外部挂载目录，运行中覆盖文件即可热更新（ETag + no-cache，每次协商校验）
+// /assets：外部挂载目录，运行中覆盖文件即可热更新
 const noCache = (res: Response) => res.setHeader('Cache-Control', 'no-cache');
 app.use(
   '/assets',
@@ -96,10 +122,17 @@ app.use(
 );
 app.use('/assets', (_req, res) => res.status(404).type('text/plain').send('asset not found'));
 
-// /data：持久化目录。若设置了 ADMIN_TOKEN，则观众归档照片需要 token 才能访问。
+// /data：持久化目录。
+// 注意：/door 需要无需 token 展示当前胶卷（/archive/roll-XX/）的接触印相表；
+// 若设置了 ADMIN_TOKEN，仅保护非当前卷的历史归档。
 app.use('/data', (req: Request, res: Response, next: NextFunction) => {
   if (/\.tmp$/i.test(req.path)) return void res.status(404).end();
-  if (req.path.startsWith('/archive') && !tokenOk(req)) return void res.status(401).end();
+  if (req.path.startsWith('/archive')) {
+    const curPrefix = `/archive/roll-${pad(config.rollNumber, 2)}/`;
+    if (!req.path.startsWith(curPrefix) && !tokenOk(req)) {
+      return void res.status(401).end();
+    }
+  }
   next();
 });
 app.use(
@@ -203,7 +236,6 @@ function touch(p: Peer): void {
   if (p.role) lastSeenByRole[p.role] = p.lastSeen;
 }
 
-// 服务端 20 秒 Ping/Pong 心跳：上一轮未回 pong 的连接直接 terminate
 const heartbeat = setInterval(() => {
   for (const [ws, p] of peers) {
     if (!p.alive) {
@@ -254,15 +286,17 @@ wss.on('connection', (ws, req) => {
   });
 });
 
-function sendFullSync(ws: WebSocket, peer: Peer): void {
+async function sendFullSync(ws: WebSocket, peer: Peer): Promise<void> {
   send(ws, { type: 'time', clientTime: 0, serverTime: Date.now() });
   send(ws, stateMsg());
   send(ws, { type: 'config', config });
   send(ws, { type: 'door-photo', photo: doorPhotoInfo(), serverTime: Date.now() });
+  currentSheet = await getContactSheet(config.rollNumber);
+  send(ws, { type: 'contact-sheet', sheet: currentSheet, serverTime: Date.now() });
   if (peer.role === 'admin') send(ws, { type: 'clients', clients: clientStatuses(), serverTime: Date.now() });
-  // main 中途重连：若本轮已有观众原声，补发
-  if (peer.role === 'main' && lastAudio && lastAudio.roundId === round.id && state !== 'IDLE') {
-    send(ws, { type: 'audio', ...lastAudio });
+  // main 中途重连：若本轮已有观众录音片段，补发完整数组
+  if (peer.role === 'main' && audioClips.length > 0 && state !== 'IDLE') {
+    send(ws, { type: 'audio-sync', clips: audioClips, roundId: round.id });
   }
 }
 
@@ -275,7 +309,7 @@ function handleMessage(ws: WebSocket, peer: Peer, msg: ClientMsg): void {
       lastSeenByRole[msg.role] = Date.now();
       console.log(`[ws] ${msg.role} 上线 (${peer.ip})`);
       if (msg.role === 'admin' && !peer.isAdmin) send(ws, { type: 'ack', what: 'auth', ok: false, message: 'Wrong ADMIN_TOKEN' });
-      sendFullSync(ws, peer);
+      void sendFullSync(ws, peer);
       pushClients();
       return;
     }
@@ -284,7 +318,6 @@ function handleMessage(ws: WebSocket, peer: Peer, msg: ClientMsg): void {
     case 'hb':
       return;
     case 'START_SESSION': {
-      // 唯一启动入口：仅接受 admin 端
       if (peer.role !== 'admin' || !(peer.isAdmin || (ADMIN_TOKEN && msg.token === ADMIN_TOKEN))) {
         console.log(`[ws] 拒绝来自 ${peer.role ?? '未注册'} 的 START_SESSION`);
         return send(ws, { type: 'ack', what: 'START_SESSION', ok: false, message: 'Only /admin can start a session' });
@@ -294,12 +327,18 @@ function handleMessage(ws: WebSocket, peer: Peer, msg: ClientMsg): void {
         type: 'ack',
         what: 'START_SESSION',
         ok,
-        message: ok ? 'Shutter pressed · entering the frame' : `Current state is ${state}; can only start from IDLE`,
+        message: ok
+          ? `Shutter released · Roll ${pad(round.rollNumber, 2)} Frame ${pad(round.frameNumber, 2)}A`
+          : `Current state is ${state}; can only start from IDLE`,
       });
     }
-    case 'speak':
+    case 'speak': {
       if (peer.role !== 'station1') return;
-      return onSpeak(ws, msg.mime, msg.data, msg.audioOffsetMs);
+      const anyMsg = msg as ClientMsg & { data?: string; audioOffsetMs?: number };
+      const dataUrl = msg.dataUrl ?? anyMsg.data ?? '';
+      const offsetMs = msg.offsetMs ?? anyMsg.audioOffsetMs ?? 0;
+      return onSpeak(ws, msg.mime, dataUrl, offsetMs);
+    }
     case 'breaker':
       if (peer.role !== 'station2') return;
       return onBreaker(ws);
@@ -338,26 +377,33 @@ let phaseStartedAt = Date.now();
 let phaseDurationMs = 0;
 let phaseTimer: NodeJS.Timeout | null = null;
 let freezeSaving = false;
-let lastAudio: { mime: string; data: string; audioOffsetMs: number; roundId: number } | null = null;
+let audioClips: AudioClip[] = [];
 
-function freshRound(id: number): RoundInfo {
+function freshRound(id: number, rollNumber: number, frameNumber: number): RoundInfo {
   return {
     id,
+    rollNumber,
+    frameNumber,
     activeStartedAt: null,
     didSpeak: false,
+    audioClipCount: 0,
+    audioOffsetsMs: [],
     didPullBreaker: false,
-    audioOffsetMs: null,
     breakerPulledAtSec: null,
     breakerLocked: false,
     hasFreeze: false,
     trigger: null,
   };
 }
-let round: RoundInfo = freshRound(0);
+
+let round: RoundInfo = freshRound(0, config.rollNumber, countRollFramesSync(config.rollNumber) + 1);
 
 function durationFor(p: Phase): number {
   if (p === 'IDLE') return 0;
-  const sec = p === 'ENTER_BUFFER' ? config.enterBufferSec : PHASE_SECONDS[p];
+  let sec: number;
+  if (p === 'ENTER_BUFFER') sec = config.enterBufferSec;
+  else if (p === 'CCTV_REVEAL') sec = config.cctvRevealSec;
+  else sec = PHASE_SECONDS[p];
   return Math.round(sec * 1000 * TIME_SCALE);
 }
 
@@ -384,7 +430,7 @@ function enter(next: Phase, endAtMs?: number): void {
   if (next === 'ACTIVE_30S') round.activeStartedAt = phaseStartedAt;
 
   if (phaseDurationMs > 0) schedule(endAtMs ?? phaseStartedAt + phaseDurationMs);
-  console.log(`[state] → ${next} (${phaseDurationMs}ms) round=${round.id}`);
+  console.log(`[state] → ${next} (${phaseDurationMs}ms) roll=${round.rollNumber} frame=${pad(round.frameNumber, 2)}A round=${round.id}`);
   broadcast(stateMsg());
 }
 
@@ -398,9 +444,10 @@ function schedule(atMs: number): void {
 
 function tryStart(trigger: string): boolean {
   if (state !== 'IDLE') return false;
-  round = freshRound(round.id + 1);
+  const nextFrame = countRollFramesSync(config.rollNumber) + 1;
+  round = freshRound(round.id + 1, config.rollNumber, nextFrame);
   round.trigger = trigger;
-  lastAudio = null;
+  audioClips = [];
   enter('ENTER_BUFFER');
   return true;
 }
@@ -410,44 +457,57 @@ function activeSec(): number {
   return (Date.now() - phaseStartedAt) / TIME_SCALE / 1000;
 }
 
-function onSpeak(ws: WebSocket, mime: string, data: string, audioOffsetMs: number): void {
+function onSpeak(ws: WebSocket, mime: string, dataUrl: string, offsetMs: number): void {
   if (state !== 'ACTIVE_30S' && state !== 'FLASH_FREEZE') {
-    return send(ws, { type: 'ack', what: 'speak', ok: false, message: 'Recording not accepted in this phase' });
+    return send(ws, { type: 'ack', what: 'speak', ok: false, message: 'Audio clip not accepted in this phase' });
   }
-  if (typeof data !== 'string' || data.length < 100) return send(ws, { type: 'ack', what: 'speak', ok: false, message: 'empty' });
-  const offset = Math.max(0, Math.min(PHASE_SECONDS.ACTIVE_30S * 1000 * TIME_SCALE, Math.round(Number(audioOffsetMs) || 0)));
-  // 录音必须开始于 A 段（05s~13s，容差 0.3s），否则丢弃
+  if (typeof dataUrl !== 'string' || dataUrl.length < 100) {
+    return send(ws, { type: 'ack', what: 'speak', ok: false, message: 'empty' });
+  }
+  if (audioClips.length >= TIMELINE.maxAudioClips) {
+    return send(ws, { type: 'ack', what: 'speak', ok: false, message: `Max ${TIMELINE.maxAudioClips} clips reached this round` });
+  }
+  const offset = Math.max(0, Math.min(PHASE_SECONDS.ACTIVE_30S * 1000 * TIME_SCALE, Math.round(Number(offsetMs) || 0)));
+  // 录音必须开始于 Protocol 01 窗口（04s~16s，容差 0.5s）
   const offsetSec = offset / 1000 / TIME_SCALE;
-  if (offsetSec < TIMELINE.station1A[0] - 0.3 || offsetSec > TIMELINE.station1A[1]) {
-    return send(ws, { type: 'ack', what: 'speak', ok: false, message: 'Recording outside the 05s–13s window; ignored' });
+  if (offsetSec < TIMELINE.station1P1[0] - 0.5 || offsetSec > TIMELINE.station1P1[1] + 0.5) {
+    return send(ws, { type: 'ack', what: 'speak', ok: false, message: 'Clip outside the 04s–16s vocal calibration window; ignored' });
   }
-  if (round.didSpeak) return send(ws, { type: 'ack', what: 'speak', ok: false, message: 'A recording was already received this round' });
+  const clip: AudioClip = {
+    mime: String(mime || 'audio/webm').slice(0, 80),
+    dataUrl,
+    offsetMs: offset,
+  };
+  audioClips.push(clip);
+  audioClips.sort((a, b) => a.offsetMs - b.offsetMs);
   round.didSpeak = true;
-  round.audioOffsetMs = offset;
-  lastAudio = { mime: String(mime || 'audio/webm').slice(0, 80), data, audioOffsetMs: offset, roundId: round.id };
-  console.log(`[round ${round.id}] 收到观众喊话 ${(data.length / 1024).toFixed(0)}KB @${offset}ms`);
-  broadcast({ type: 'audio', ...lastAudio }, toRole('main'));
-  send(ws, { type: 'ack', what: 'speak', ok: true });
+  round.audioClipCount = audioClips.length;
+  round.audioOffsetsMs = audioClips.map((c) => c.offsetMs);
+  console.log(
+    `[round ${round.id}] 收到校准语音 #${audioClips.length}/${TIMELINE.maxAudioClips} ${(dataUrl.length / 1024).toFixed(0)}KB @${offset}ms`,
+  );
+  broadcast({ type: 'audio', clip, index: audioClips.length - 1, roundId: round.id }, toRole('main'));
+  send(ws, { type: 'ack', what: 'speak', ok: true, message: `Clip ${audioClips.length}/${TIMELINE.maxAudioClips} logged` });
   broadcast(stateMsg());
 }
 
 function onBreaker(ws: WebSocket): void {
   if (state !== 'ACTIVE_30S' || round.didPullBreaker) return;
   const t = activeSec();
-  if (t < TIMELINE.station2C[0] - 0.5) {
-    return send(ws, { type: 'ack', what: 'breaker', ok: false, message: 'Breaker phase has not started yet' });
+  if (t < TIMELINE.station2P3[0] - 0.5) {
+    return send(ws, { type: 'ack', what: 'breaker', ok: false, message: 'Fixation phase has not started yet' });
   }
   round.didPullBreaker = true;
   round.breakerPulledAtSec = Math.round(t * 1000) / 1000;
   if (t < TIMELINE.breakerSpoilerGuard) {
-    // 防剧透：锁定，等到 29.5s 再全局闪白
+    // 防提前截断保护：锁定推杆显示 FIXING EXPOSURE...，等到 29.5s 再全局定格
     round.breakerLocked = true;
     schedule(phaseStartedAt + TIMELINE.breakerDelayedFlash * 1000 * TIME_SCALE);
-    console.log(`[round ${round.id}] 电闸提前拉下 @${t.toFixed(2)}s → 锁定至 ${TIMELINE.breakerDelayedFlash}s`);
+    console.log(`[round ${round.id}] 定影推杆提前拉到底 @${t.toFixed(2)}s → 锁定至 ${TIMELINE.breakerDelayedFlash}s`);
     broadcast({ type: 'breaker', status: 'locked', atSec: round.breakerPulledAtSec });
     broadcast(stateMsg());
   } else {
-    console.log(`[round ${round.id}] 电闸拉下 @${t.toFixed(2)}s → 立即闪白`);
+    console.log(`[round ${round.id}] 定影推杆完成 @${t.toFixed(2)}s → 立即定格`);
     broadcast({ type: 'breaker', status: 'flash', atSec: round.breakerPulledAtSec });
     enter('FLASH_FREEZE');
   }
@@ -456,18 +516,22 @@ function onBreaker(ws: WebSocket): void {
 async function onFreeze(ws: WebSocket, data: string): Promise<void> {
   const buf = typeof data === 'string' ? decodeJpeg(data) : null;
   if (!buf) return send(ws, { type: 'ack', what: 'freeze', ok: false, message: 'Not a valid JPEG' });
-  // 同一轮只保存第一张（多台 /main 同时在线时避免重复归档）
-  if (round.hasFreeze || freezeSaving) return send(ws, { type: 'ack', what: 'freeze', ok: false, message: 'Freeze frame already saved this round' });
+  if (round.hasFreeze || freezeSaving) {
+    return send(ws, { type: 'ack', what: 'freeze', ok: false, message: 'Freeze frame already saved this round' });
+  }
   if (state === 'IDLE' || state === 'ENTER_BUFFER' || state === 'ACTIVE_30S') {
     return send(ws, { type: 'ack', what: 'freeze', ok: false, message: 'Freeze frame not accepted in this phase' });
   }
   freezeSaving = true;
   try {
-    const { photo, archiveName } = await saveFreeze(buf, round.id);
+    const { photo, archiveName, sheet } = await saveFreeze(buf, round.rollNumber, round.frameNumber, round.id);
     round.hasFreeze = true;
-    console.log(`[round ${round.id}] 定格照已保存 ${archiveName} (${(buf.length / 1024).toFixed(0)}KB)`);
+    currentSheet = sheet;
+    console.log(`[round ${round.id}] 底片已入档 ${archiveName} (${(buf.length / 1024).toFixed(0)}KB)`);
     send(ws, { type: 'ack', what: 'freeze', ok: true, message: archiveName });
     broadcast({ type: 'door-photo', photo, serverTime: Date.now() });
+    broadcast({ type: 'contact-sheet', sheet, serverTime: Date.now() });
+    broadcast(stateMsg());
   } catch (err) {
     console.error('[freeze] 保存失败', err);
     send(ws, { type: 'ack', what: 'freeze', ok: false, message: 'Save failed' });
@@ -479,27 +543,79 @@ async function onFreeze(ws: WebSocket, data: string): Promise<void> {
 async function onAdmin(ws: WebSocket, action: string, cfg?: Partial<AppConfig>): Promise<void> {
   switch (action) {
     case 'reset':
-      lastAudio = null;
+      audioClips = [];
       enter('IDLE');
       return send(ws, { type: 'ack', what: 'reset', ok: true, message: 'Reset to IDLE' });
+
+    case 'skipPhase': {
+      if (state === 'IDLE') {
+        return send(ws, { type: 'ack', what: 'skipPhase', ok: false, message: 'Already in IDLE' });
+      }
+      const prev = state;
+      const next = NEXT[state];
+      enter(next);
+      return send(ws, { type: 'ack', what: 'skipPhase', ok: true, message: `Skipped ${prev} → ${next}` });
+    }
+
+    case 'newRoll': {
+      const nextRoll = config.rollNumber + 1;
+      config = sanitizeConfig({ ...config, rollNumber: nextRoll }, config);
+      try {
+        await saveConfig(config);
+      } catch (err) {
+        console.error('[config] 保存新胶卷号失败', err);
+      }
+      const photo = await resetDoorPhoto();
+      currentSheet = await getContactSheet(config.rollNumber);
+      if (state === 'IDLE') {
+        round.rollNumber = config.rollNumber;
+        round.frameNumber = 1;
+      }
+      console.log(`[admin] 开启新胶卷 ROLL ${pad(config.rollNumber, 2)}（历史归档完整保留）`);
+      broadcast({ type: 'config', config });
+      broadcast({ type: 'door-photo', photo, serverTime: Date.now() });
+      broadcast({ type: 'contact-sheet', sheet: currentSheet, serverTime: Date.now() });
+      broadcast(stateMsg());
+      return send(ws, {
+        type: 'ack',
+        what: 'newRoll',
+        ok: true,
+        message: `Started Roll ${pad(config.rollNumber, 2)} · contact sheet cleared (archive preserved)`,
+      });
+    }
+
     case 'resetDoor': {
       const photo = await resetDoorPhoto();
       broadcast({ type: 'door-photo', photo, serverTime: Date.now() });
-      return send(ws, { type: 'ack', what: 'resetDoor', ok: true, message: 'Entrance photo reset to the default negative' });
+      return send(ws, { type: 'ack', what: 'resetDoor', ok: true, message: 'Latest proof cache cleared (archive preserved)' });
     }
+
     case 'testFlash':
       broadcast({ type: 'flash', serverTime: Date.now() }, toRole('main'));
       return send(ws, { type: 'ack', what: 'testFlash', ok: true, message: 'Test flash sent to main screen' });
+
     case 'setConfig': {
-      config = sanitizeConfig(cfg, config);
+      // rollNumber 仅由 newRoll 或显式正整数更新
+      const merged: Partial<AppConfig> = {
+        enterBufferSec: cfg?.enterBufferSec ?? config.enterBufferSec,
+        cctvRevealSec: cfg?.cctvRevealSec ?? config.cctvRevealSec,
+        rollNumber: cfg?.rollNumber ?? config.rollNumber,
+      };
+      config = sanitizeConfig(merged, config);
       try {
         await saveConfig(config);
       } catch (err) {
         console.error('[config] 保存失败', err);
       }
       broadcast({ type: 'config', config });
-      return send(ws, { type: 'ack', what: 'setConfig', ok: true, message: 'config.json saved' });
+      return send(ws, {
+        type: 'ack',
+        what: 'setConfig',
+        ok: true,
+        message: `Saved · Buffer ${config.enterBufferSec}s · CCTV ${config.cctvRevealSec}s`,
+      });
     }
+
     default:
       return send(ws, { type: 'ack', what: action, ok: false, message: 'unknown action' });
   }
@@ -507,7 +623,7 @@ async function onAdmin(ws: WebSocket, action: string, cfg?: Partial<AppConfig>):
 
 // ======================================================================
 server.listen(PORT, HOST, () => {
-  console.log(`《入画三十秒》服务已启动 http://${HOST}:${PORT}  (TIME_SCALE=${TIME_SCALE})`);
+  console.log(`《入画三十秒 (RH-30)》v2 服务已启动 http://${HOST}:${PORT}  (TIME_SCALE=${TIME_SCALE}, ROLL=${pad(config.rollNumber, 2)})`);
   console.log(`  assets: ${ASSETS_DIR}`);
   console.log(`  data:   ${DATA_DIR}`);
   console.log(`  public: ${PUBLIC_DIR}`);

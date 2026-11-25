@@ -53,7 +53,6 @@ export async function keepAwake(): Promise<void> {
       /* fall back to the silent-audio trick */
     }
   }
-  // older iPads: a looping silent <audio> keeps the screen awake
   if (!silentAudio) {
     silentAudio = document.createElement('audio');
     silentAudio.src = silentWav();
@@ -89,6 +88,10 @@ export interface UnlockOptions {
   fullscreen?: boolean;
 }
 
+export function withTimeout<T>(p: Promise<T>, ms = 600): Promise<T | void> {
+  return Promise.race([p, new Promise<void>((r) => window.setTimeout(r, ms))]);
+}
+
 export function showStartOverlay(opts: UnlockOptions): Promise<void> {
   return new Promise((resolve) => {
     const ov = document.createElement('div');
@@ -96,22 +99,24 @@ export function showStartOverlay(opts: UnlockOptions): Promise<void> {
     const code = opts.code || 'RH';
     const seed = [...code].reduce((a, c) => a + c.charCodeAt(0), 0);
     ov.innerHTML = `
-      ${filmStrip(seed % 20 + 1)}
+      ${filmStrip((seed % 20) + 1)}
       <div class="start-wrap">
         <div class="cassette">
           <div class="band"><span class="iso">135</span><span class="brand">RUHUA RH-30</span><span class="iso">36 EXP</span></div>
           <div class="body">
             <div class="kicker"><span class="k1"></span><span class="k2"></span></div>
             <div class="title"></div>
-            <div class="sub"></div>
+            <div class="sub-row">
+              <div class="sub"></div>
+              <span class="stamp">Load in subdued light</span>
+            </div>
           </div>
           <div class="dx"><div class="cells">${dxCells(seed)}</div><div class="exp">${escapeHtml(code)}<small>ISO 400/27°</small></div></div>
-          <span class="stamp">Load in subdued light</span>
         </div>
         <button class="start-btn"></button>
         <div class="start-err"></div>
       </div>
-      ${filmStrip(seed % 20 + 15)}`;
+      ${filmStrip((seed % 20) + 15)}`;
     ov.querySelector('.k1')!.textContent = `Thirty Seconds Into the Frame · ${opts.kicker || location.pathname}`;
     ov.querySelector('.k2')!.textContent = code;
     ov.querySelector('.title')!.textContent = opts.title;
@@ -127,11 +132,11 @@ export function showStartOverlay(opts: UnlockOptions): Promise<void> {
       const fsP = opts.fullscreen === false ? Promise.resolve() : requestFullscreen();
       const wakeP = keepAwake();
       try {
-        await opts.onUnlock?.();
+        if (opts.onUnlock) await withTimeout(Promise.resolve(opts.onUnlock()), 1500);
       } catch (e) {
         err.textContent = 'Media permission failed: ' + ((e as Error)?.message || e) + ' (HTTPS and browser permission required)';
       }
-      await Promise.allSettled([audioP, fsP, wakeP]);
+      await Promise.allSettled([withTimeout(audioP), withTimeout(fsP), withTimeout(wakeP)]);
       ov.remove();
       resolve();
     });
@@ -182,7 +187,7 @@ export function edgeText(start = 1, count = 16): string {
     const nn = String(n).padStart(2, '0');
     parts.push(
       i % 3 === 0
-        ? `<span>RUHUA SAFETY FILM</span><span>RH 3030</span>${dxBars(n * 31)}`
+        ? `<span>RUHUA SAFETY FILM</span><span>RH-30</span>${dxBars(n * 31)}`
         : i % 3 === 1
           ? `<span class="fr">▸${nn}</span><span>${nn}A</span>`
           : `<span>${nn}</span>${dxBars(n * 17, 12)}<span class="fr">▸${nn}A</span>`,

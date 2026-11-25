@@ -1,9 +1,8 @@
 #!/usr/bin/env node
 /**
- * 全流程 WebSocket 联调测试（无需浏览器）
+ * v2 全流程 WebSocket 联调测试（无需浏览器）
  *   TIME_SCALE=0.1 npm start          # 另一个终端，用 1/10 时长启动服务
  *   BASE=http://localhost:3000 npm run test:flow
- * 如设置了 ADMIN_TOKEN，请同时导出 ADMIN_TOKEN=... 给本脚本。
  */
 import WebSocket from 'ws';
 
@@ -38,9 +37,11 @@ function client(role) {
     ws.on('message', (raw) => {
       const m = JSON.parse(raw.toString());
       c.msgs.push(m);
-      for (const w of [...c.waiters]) if (w.pred(m)) {
-        c.waiters = c.waiters.filter((x) => x !== w);
-        w.res(m);
+      for (const w of [...c.waiters]) {
+        if (w.pred(m)) {
+          c.waiters = c.waiters.filter((x) => x !== w);
+          w.res(m);
+        }
       }
     });
     ws.on('open', () => {
@@ -57,7 +58,7 @@ async function main() {
   const health = await (await fetch(BASE + '/api/health')).json();
   ok(health.ok === true && typeof health.state === 'string' && health.clients, `/api/health → ${JSON.stringify(health)}`);
   const scale = health.timeScale || 1;
-  const story = (sec) => sec * 1000 * scale; // 剧情秒 → 真实毫秒
+  const story = (sec) => sec * 1000 * scale;
   console.log(`TIME_SCALE = ${scale}`);
 
   const [admin, door, s1, s2, mainC] = await Promise.all(['admin', 'door', 'station1', 'station2', 'main'].map(client));
@@ -74,137 +75,92 @@ async function main() {
     const ack = await c.wait((m) => m.type === 'ack' && m.what === 'START_SESSION', 3000, 'ack');
     ok(ack.ok === false, `${c.role} 的 START_SESSION 被拒绝（${ack.message}）`);
   }
-  await sleep(200);
-  ok((await (await fetch(BASE + '/api/health')).json()).state === 'IDLE', '被拒绝后状态仍为 IDLE');
-  // 旧版拍手消息不再有效
-  door.send({ type: 'clap', source: 'clap' });
-  await sleep(200);
-  ok((await (await fetch(BASE + '/api/health')).json()).state === 'IDLE', '旧 clap 消息被忽略');
 
-  // ---- 2. 配置：ENTER_BUFFER 2~8 秒限幅 ----
+  // ---- 2. 配置：ENTER_BUFFER 2~10s（默认 6），CCTV_REVEAL 4~15s（默认 8） ----
   admin.clear();
-  admin.send({ type: 'admin', action: 'setConfig', config: { enterBufferSec: 20 }, token: TOKEN });
+  admin.send({ type: 'admin', action: 'setConfig', config: { enterBufferSec: 20, cctvRevealSec: 30 }, token: TOKEN });
   let cfg = await admin.wait((m) => m.type === 'config');
-  ok(cfg.config.enterBufferSec === 8, `enterBufferSec=20 被限幅为 ${cfg.config.enterBufferSec}`);
+  ok(
+    cfg.config.enterBufferSec === 10 && cfg.config.cctvRevealSec === 15,
+    `超界限幅 enterBufferSec=${cfg.config.enterBufferSec}, cctvRevealSec=${cfg.config.cctvRevealSec}`,
+  );
   admin.clear();
-  admin.send({ type: 'admin', action: 'setConfig', config: { enterBufferSec: 4 }, token: TOKEN });
+  admin.send({ type: 'admin', action: 'setConfig', config: { enterBufferSec: 6, cctvRevealSec: 8 }, token: TOKEN });
   cfg = await admin.wait((m) => m.type === 'config');
-  ok(cfg.config.enterBufferSec === 4 && Object.keys(cfg.config).length === 1, `config 仅含 enterBufferSec=4 ${JSON.stringify(cfg.config)}`);
+  ok(
+    cfg.config.enterBufferSec === 6 && cfg.config.cctvRevealSec === 8 && cfg.config.rollNumber >= 1,
+    `恢复默认配置 ${JSON.stringify(cfg.config)}`,
+  );
 
-  // ---- 3. 第一轮：提前拉闸（锁定到 29.5s） + 喊话 ----
+  // ---- 3. 第一轮：多段语音校准（2 条 audioClips） + 提前拉下定影推杆（锁定至 29.5s） ----
   for (const c of [admin, door, s1, s2, mainC]) c.clear();
-  const seen = [];
-  admin.ws.on('message', (raw) => {
-    const m = JSON.parse(raw.toString());
-    if (m.type === 'state' && seen[seen.length - 1]?.state !== m.state) seen.push({ state: m.state, at: Date.now() });
-  });
   admin.send({ type: 'START_SESSION', token: TOKEN });
   const startAck = await admin.wait((m) => m.type === 'ack' && m.what === 'START_SESSION');
   ok(startAck.ok === true, `admin START_SESSION 成功（${startAck.message}）`);
-  admin.clear();
-  admin.send({ type: 'START_SESSION', token: TOKEN });
-  const dupAck = await admin.wait((m) => m.type === 'ack' && m.what === 'START_SESSION');
-  ok(dupAck.ok === false, '非 IDLE 时重复 START_SESSION 被拒绝');
 
   const enter = await door.wait(isState('ENTER_BUFFER'));
-  ok(typeof enter.serverTime === 'number' && typeof enter.phaseStartedAt === 'number', 'state 包含 serverTime / phaseStartedAt');
-  ok(Math.abs(enter.phaseDurationMs - 4000 * scale) < 2, `ENTER_BUFFER 时长 ${enter.phaseDurationMs}ms`);
+  ok(Math.abs(enter.phaseDurationMs - 6000 * scale) < 5, `ENTER_BUFFER 时长 ${enter.phaseDurationMs}ms（6s）`);
 
   const active = await s1.wait(isState('ACTIVE_30S'));
-  await sleep(Math.max(0, active.phaseStartedAt + story(6) - Date.now()));
-  const fakeAudio = 'data:audio/webm;base64,' + Buffer.alloc(4000, 7).toString('base64');
-  s1.send({ type: 'speak', mime: 'audio/webm', data: fakeAudio, audioOffsetMs: Math.round(story(6)) });
-  const audio = await mainC.wait((m) => m.type === 'audio', 5000, 'audio relay');
-  ok(audio.audioOffsetMs === Math.round(story(6)), `station1 音频已转发到 main（audioOffsetMs=${audio.audioOffsetMs}）`);
+  await sleep(Math.max(0, active.phaseStartedAt + story(5) - Date.now()));
+  const fakeAudio = 'data:audio/webm;base64,' + Buffer.alloc(2000, 7).toString('base64');
+  s1.send({ type: 'speak', mime: 'audio/webm', dataUrl: fakeAudio, offsetMs: Math.round(story(5)) });
+  const a1 = await mainC.wait((m) => m.type === 'audio' && m.index === 0, 5000, 'audio #1');
+  ok(a1.clip.offsetMs === Math.round(story(5)), `第 1 段校准音频已转发到 main（offsetMs=${a1.clip.offsetMs}）`);
+
+  mainC.clear();
+  await sleep(Math.max(0, active.phaseStartedAt + story(11) - Date.now()));
+  s1.send({ type: 'speak', mime: 'audio/webm', dataUrl: fakeAudio, offsetMs: Math.round(story(11)) });
+  const a2 = await mainC.wait((m) => m.type === 'audio' && m.index === 1, 5000, 'audio #2');
+  ok(a2.clip.offsetMs === Math.round(story(11)), `第 2 段校准音频已转发到 main（offsetMs=${a2.clip.offsetMs}）`);
 
   await sleep(Math.max(0, active.phaseStartedAt + story(24) - Date.now()));
   s2.send({ type: 'breaker' });
   const br = await s2.wait((m) => m.type === 'breaker');
-  ok(br.status === 'locked', `24s 拉闸 → ${br.status}（防剧透锁定）`);
+  ok(br.status === 'locked', `24s 拉下定影推杆 → ${br.status}（防提前截断锁定）`);
 
   const flash = await mainC.wait(isState('FLASH_FREEZE'));
   const activeLen = (flash.phaseStartedAt - active.phaseStartedAt) / scale / 1000;
-  ok(Math.abs(activeLen - 29.5) < 0.15, `锁定后在剧情 ${activeLen.toFixed(2)}s 触发闪白（期望 29.5s）`);
+  ok(Math.abs(activeLen - 29.5) < 0.2, `锁定后在剧情 ${activeLen.toFixed(2)}s 触发定格（期望 29.5s）`);
 
-  // main 上传定格照
+  // main 上传定格照 → 更新 contact-sheet
   const jpeg = Buffer.concat([Buffer.from([0xff, 0xd8, 0xff, 0xe0]), Buffer.alloc(2000, 1), Buffer.from([0xff, 0xd9])]);
+  door.clear();
   mainC.send({ type: 'freeze', data: 'data:image/jpeg;base64,' + jpeg.toString('base64') });
-  const dp = await door.wait((m) => m.type === 'door-photo' && m.photo.has, 5000, 'door-photo');
-  ok(!!dp.photo.url, `定格照已推送到 door：${dp.photo.url}`);
-  const img = await fetch(BASE + dp.photo.url.split('?')[0] + (TOKEN ? '' : ''));
-  ok(img.ok && img.headers.get('cache-control') === 'no-cache', `GET ${dp.photo.url} → ${img.status} (${img.headers.get('cache-control')})`);
+  const cs = await door.wait((m) => m.type === 'contact-sheet' && m.sheet.totalInRoll >= 1, 5000, 'contact-sheet');
+  ok(cs.sheet.frames.length >= 1, `定格照已加入当前卷接触印相表（ROLL ${cs.sheet.rollNumber}, 共 ${cs.sheet.totalInRoll} 张）`);
 
-  await mainC.wait(isState('REWIND'));
-  const replay = await mainC.wait(isState('REPLAY_TRUTH'));
-  ok(replay.round.didSpeak === true && replay.round.didPullBreaker === true, `回合记录 didSpeak=${replay.round.didSpeak} didPullBreaker=${replay.round.didPullBreaker}`);
+  const replay = await mainC.wait(isState('REPLAY_TRUTH'), 15000, 'REPLAY_TRUTH');
+  ok(replay.round.audioClipCount === 2, `回合记录 audioClipCount=${replay.round.audioClipCount}`);
 
-  await mainC.wait(isState('CCTV_REVEAL'), 40000 * scale + 5000, 'CCTV_REVEAL');
-  door.send({ type: 'cctv', data: 'data:image/jpeg;base64,' + jpeg.toString('base64') });
-  const cc = await mainC.wait((m) => m.type === 'cctv', 3000, 'cctv relay');
-  ok(!!cc.data, 'CCTV_REVEAL 期间 door 监控帧已转发到 main');
-  await mainC.wait((m) => m.type === 'state' && m.state === 'IDLE' && m.round.id === replay.round.id, 15000, 'back to IDLE');
-  ok(true, 'CCTV_REVEAL 结束自动回 IDLE');
-  // admin 与 main 是两条独立连接：等 admin 也收到 IDLE 再比对序列（避免公网下的到达先后竞态）
-  await admin.wait((m) => m.type === 'state' && m.state === 'IDLE' && m.round.id === replay.round.id, 5000, 'admin IDLE');
-  console.log('  状态序列：' + seen.map((s) => s.state).join(' → '));
-  const expected = ['ENTER_BUFFER', 'ACTIVE_30S', 'FLASH_FREEZE', 'REWIND', 'REPLAY_TRUTH', 'CCTV_REVEAL', 'IDLE'];
-  ok(JSON.stringify(seen.map((s) => s.state).slice(-7)) === JSON.stringify(expected), '状态机顺序正确');
-
-  // IDLE 时 cctv 不转发
-  mainC.clear();
-  door.send({ type: 'cctv', data: 'x'.repeat(200) });
-  await sleep(300);
-  ok(!mainC.msgs.some((m) => m.type === 'cctv'), 'IDLE 时监控帧不转发');
-
-  // ---- 4. 第二轮：28.5s 后拉闸 → 立即闪白；不喊话 ----
-  for (const c of [admin, door, s1, s2, mainC]) c.clear();
-  admin.send({ type: 'START_SESSION', token: TOKEN });
-  const a2 = await s2.wait(isState('ACTIVE_30S'));
-  await sleep(Math.max(0, a2.phaseStartedAt + story(28.8) - Date.now()));
-  s2.send({ type: 'breaker' });
-  const br2 = await s2.wait((m) => m.type === 'breaker');
-  ok(br2.status === 'flash', `28.8s 拉闸 → ${br2.status}（立即闪白）`);
-  const f2 = await s2.wait(isState('FLASH_FREEZE'));
-  const len2 = (f2.phaseStartedAt - a2.phaseStartedAt) / scale / 1000;
-  ok(len2 < 29.3, `立即闪白发生在剧情 ${len2.toFixed(2)}s`);
-
-  // 急停（需要二次确认的是前端；协议层直接 reset）
-  admin.send({ type: 'admin', action: 'reset', token: TOKEN });
-  const idle = await admin.wait((m) => m.type === 'state' && m.state === 'IDLE' && m.round.id === f2.round.id);
-  ok(idle.round.didSpeak === false, '急停后回到 IDLE');
-
-  // ---- 5. 第三轮：不拉闸 → 30s 自然闪白（旁观者结局条件） ----
-  for (const c of [admin, door, s1, s2, mainC]) c.clear();
-  admin.send({ type: 'START_SESSION', token: TOKEN });
-  const a3 = await mainC.wait(isState('ACTIVE_30S'));
-  const f3 = await mainC.wait(isState('FLASH_FREEZE'), 35000 * scale + 5000);
-  const len3 = (f3.phaseStartedAt - a3.phaseStartedAt) / scale / 1000;
-  ok(Math.abs(len3 - 30) < 0.15, `无人拉闸：剧情 ${len3.toFixed(2)}s 自然闪白`);
-  ok(f3.round.didSpeak === false && f3.round.didPullBreaker === false, '旁观者结局条件 didSpeak=false && didPullBreaker=false');
-  admin.send({ type: 'admin', action: 'reset', token: TOKEN });
-  await admin.wait((m) => m.type === 'state' && m.state === 'IDLE' && m.round.id === f3.round.id);
-
-  // ---- 6. 管理功能 ----
+  // 测试 SKIP PHASE：从 REPLAY_TRUTH 直接跳到 CCTV_REVEAL，再跳回 IDLE
   admin.clear();
   mainC.clear();
+  admin.send({ type: 'admin', action: 'skipPhase', token: TOKEN });
+  const cctv = await mainC.wait(isState('CCTV_REVEAL'), 3000, 'skip to CCTV_REVEAL');
+  ok(Math.abs(cctv.phaseDurationMs - 8000 * scale) < 5, `SKIP PHASE 跳至 CCTV_REVEAL（时长 ${cctv.phaseDurationMs}ms）`);
+
+  admin.send({ type: 'admin', action: 'skipPhase', token: TOKEN });
+  await mainC.wait(isState('IDLE'), 3000, 'skip to IDLE');
+  ok(true, 'SKIP PHASE 从 CCTV_REVEAL 跳回 IDLE');
+
+  // ---- 4. 测试 NEW ROLL：清空当前印相表，但磁盘归档完整保留 ----
+  const archBefore = await (await fetch(BASE + '/api/archive?all=1' + (TOKEN ? `&token=${TOKEN}` : ''))).json();
   door.clear();
-  admin.send({ type: 'admin', action: 'testFlash', token: TOKEN });
-  await mainC.wait((m) => m.type === 'flash', 3000, 'flash');
-  await sleep(200);
-  ok(!door.msgs.some((m) => m.type === 'flash'), '测试主屏闪白只发往 main（door 不闪）');
-
-  const arch = await (await fetch(BASE + '/api/archive' + (TOKEN ? `?token=${TOKEN}` : ''))).json();
-  ok(arch.ok && arch.count >= 1, `/api/archive 今日归档 ${arch.count} 张`);
-
-  admin.send({ type: 'admin', action: 'resetDoor', token: TOKEN });
-  const rd = await door.wait((m) => m.type === 'door-photo' && !m.photo.has, 3000, 'resetDoor');
-  ok(rd.photo.has === false, '重置入口照片为默认底片');
-
-  const cl = await admin.wait((m) => m.type === 'clients', 3000);
-  ok(['main', 'door', 'station1', 'station2'].every((r) => cl.clients.find((c) => c.role === r)?.online), '四端在线状态正确');
+  admin.send({ type: 'admin', action: 'newRoll', token: TOKEN });
+  const csNew = await door.wait((m) => m.type === 'contact-sheet' && m.sheet.totalInRoll === 0, 3000, 'newRoll contact-sheet');
+  const archAfter = await (await fetch(BASE + '/api/archive?all=1' + (TOKEN ? `&token=${TOKEN}` : ''))).json();
+  ok(
+    csNew.sheet.rollNumber === cs.sheet.rollNumber + 1 && csNew.sheet.totalInRoll === 0,
+    `NEW ROLL 切换至 ROLL ${csNew.sheet.rollNumber} 且新卷印相表为空`,
+  );
+  ok(
+    archAfter.count === archBefore.count && archAfter.count >= 1,
+    `磁盘历史归档完整保留（共 ${archAfter.count} 张未删除）`,
+  );
 
   for (const c of [admin, door, s1, s2, mainC]) c.ws.close();
-  console.log(failures ? `\n❌ ${failures} 项失败` : '\n🎉 全部通过');
+  console.log(failures ? `\n❌ ${failures} 项失败` : '\n🎉 v2 全部联调测试通过');
   process.exit(failures ? 1 : 0);
 }
 

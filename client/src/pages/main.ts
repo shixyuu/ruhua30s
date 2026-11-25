@@ -1,22 +1,32 @@
 /**
- * /main — Mac + projector + external wide-angle camera
- * - The 30-second camera recording stays local (MediaRecorder → Blob URL replay) and is never uploaded
- * - Only the mono freeze frame at 30s is uploaded (JPEG ≤1280px, q=0.78)
+ * /main — Mac + projector + external wide-angle camera (v2 Archival Edition)
+ * - 30-second camera recording stays strictly local (MediaRecorder → Blob URL replay) and is never uploaded.
+ * - Only the monochrome freeze frame at 30s is uploaded to ./data/archive/roll-XX/.
+ * - REPLAY_TRUTH plays back in complete system silence with neutral 300–3200 Hz filtered visitor audioClips and a corner archival timecode.
  */
 import { Net, mountNetDot } from '../lib/net';
-import { audioCtx, heartbeat, out, rewindSfx, setAudioSink, shutter, stopAllLoops, unlockAudio } from '../lib/sfx';
-import { assetAvailable, dataURLToArrayBuffer, drawDefaultDoorPhoto, filmFilter, pickVideoMime } from '../lib/media';
-import { cropMarks, filmStrip, keepAwake, requestFullscreen } from '../lib/unlock';
+import { audioCtx, enlargerTimer, out, rewindSfx, setAudioSink, shutter, stopAllLoops, unlockAudio } from '../lib/sfx';
+import { assetAvailable, dataURLToArrayBuffer, drawReferencePlate, filmFilter, pickVideoMime } from '../lib/media';
+import { cropMarks, filmStrip, keepAwake, requestFullscreen, withTimeout } from '../lib/unlock';
 import { TITLE_EN } from '../lib/brand';
 import { clear, drawIdle, drawNoRecording, drawRewind, drawSimFilm, preloadCanvasFonts, setupCanvas } from '../lib/film';
-import type { Phase } from '../../../shared/protocol';
-import { TIMELINE } from '../../../shared/protocol';
+import type { AudioClip, Phase } from '../../../shared/protocol';
 
 const LS_CAM = 'ruhua.main.camera';
 const LS_SINK = 'ruhua.main.sink';
-const BYSTANDER = 'You kept to the rules and did not become the killer. But you also watched it end.';
 
 type SinkEl = HTMLMediaElement & { setSinkId?: (id: string) => Promise<void> };
+
+function pad2(n: number): string {
+  return String(Math.max(0, Math.floor(n))).padStart(2, '0');
+}
+
+function waxCircleSvg(): string {
+  return `<svg class="cctv-wax" viewBox="0 0 200 130" preserveAspectRatio="none" aria-hidden="true">
+    <path d="M 16,65 C 14,22 58,8 104,9 C 154,10 188,27 187,66 C 186,104 148,121 97,120 C 46,119 14,101 21,57"
+      fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" />
+  </svg>`;
+}
 
 export default async function mainPage(app: HTMLElement): Promise<void> {
   document.title = `Main projector · ${TITLE_EN}`;
@@ -25,31 +35,34 @@ export default async function mainPage(app: HTMLElement): Promise<void> {
     <video class="layer hidden" id="base" playsinline preload="auto"></video>
     <video class="layer hidden" id="rewind" playsinline preload="auto"></video>
     <video class="layer hidden" id="replay" playsinline muted></video>
-    <div class="countdown hidden" id="countdownBox"><div class="k"><span>ENTER BUFFER</span><span class="chem"><span class="on"><b>DEV</b></span><span><b>STOP</b></span><span><b>FIX</b></span></span></div><div class="n" id="countdown"></div></div>
-    <div class="bystander" id="bystander"><p id="bystanderText"></p></div>
+    <div class="countdown hidden" id="countdownBox">
+      <div class="k"><span>PREPARE EXPOSURE</span><span class="meta" id="prepMeta">ROLL 01 · FR 01A</span></div>
+      <div class="n" id="countdown"></div>
+    </div>
+    <div class="replay-hud hidden" id="replayHud"></div>
     <div class="cctv hidden" id="cctv">
-      <div class="rule"><span><b>RH-30</b> · NODE SYNC · CONTACT PROOF</span><span id="cctvClock">--:--:--</span></div>
+      <div class="rule"><span><b>RH-30</b> · ARCHIVAL CONTACT PROOF · <span id="cctvRoll">ROLL 01</span></span><span id="cctvClock">--:--:--</span></div>
       <div class="pane left">
         <div class="neg">
           ${filmStrip(29)}
-          <div class="frame"><img id="freezeImg" alt="" /></div>
+          <div class="frame"><img id="freezeImg" alt="" />${waxCircleSvg()}</div>
           ${filmStrip(30)}
-          <span class="ring"></span><span class="grease">PRINT ✓</span>
         </div>
-        <div class="cap"><span class="no" id="frameNo">FR 001</span><span class="t">New node negative synced to the entrance</span></div>
+        <div class="cap"><span class="no" id="frameNo">FRAME 01A</span><span class="t">ADDED TO ENTRANCE CONTACT SHEET</span></div>
       </div>
       <div class="pane right">
         <div class="frame">
           <img id="cctvImg" class="hidden" alt="" />
-          <div class="nosignal hidden" id="nosig">ENTRANCE FEED · NO SIGNAL</div>
-          <div class="osd"><span>CH-01</span><span class="live">LIVE</span></div>
+          <div class="nosignal hidden" id="nosig">ENTRANCE MONITOR · STANDBY</div>
+          <div class="osd"><span>MON-01</span><span class="live">ENTRANCE</span></div>
         </div>
-        <div class="cap"><span class="no">CH-01</span><span class="t">Entrance live feed · next visitor</span></div>
+        <div class="cap"><span class="no">MON-01</span><span class="t">Entrance live monitor · next group</span></div>
       </div>
-      <div class="exit"><span>Please exit to the north</span><span class="arr">↑</span></div>
+      <div class="exit"><span>EXIT NORTH</span><span class="arr">↑</span></div>
     </div>
     <div class="flash" id="flash"></div>
     <video id="cam" class="hidden" muted playsinline autoplay></video>`;
+
   const $ = <T extends HTMLElement>(s: string) => app.querySelector(s) as T;
   const fx = $<HTMLCanvasElement>('#fx');
   const g = setupCanvas(fx);
@@ -59,9 +72,10 @@ export default async function mainPage(app: HTMLElement): Promise<void> {
   const replayV = $<HTMLVideoElement>('#replay');
   const countdown = $<HTMLDivElement>('#countdown');
   const countdownBox = $<HTMLDivElement>('#countdownBox');
-  const bystander = $<HTMLDivElement>('#bystander');
-  $<HTMLParagraphElement>('#bystanderText').textContent = BYSTANDER;
+  const prepMeta = $<HTMLSpanElement>('#prepMeta');
+  const replayHud = $<HTMLDivElement>('#replayHud');
   const frameNo = $<HTMLSpanElement>('#frameNo');
+  const cctvRoll = $<HTMLSpanElement>('#cctvRoll');
   const cctvClock = $<HTMLSpanElement>('#cctvClock');
   const cctv = $<HTMLDivElement>('#cctv');
   const freezeImg = $<HTMLImageElement>('#freezeImg');
@@ -71,7 +85,7 @@ export default async function mainPage(app: HTMLElement): Promise<void> {
   const camV = $<HTMLVideoElement>('#cam');
 
   const net = new Net('main');
-  (window as any).__net = net; // debugging / automated tests
+  (window as any).__net = net;
   mountNetDot(net);
 
   // ====================================================================
@@ -169,100 +183,140 @@ export default async function mainPage(app: HTMLElement): Promise<void> {
   }
 
   // ====================================================================
-  // visitor's voice: telephone-receiver filter
+  // multi-clip visitor voices: neutral laboratory intercom bandpass (300–3200 Hz)
   // ====================================================================
-  let voice: { roundId: number; offset: number; buffer: AudioBuffer | null; el: HTMLAudioElement | null } | null = null;
-  let voiceSource: AudioScheduledSourceNode | null = null;
-  let voiceTimer: number | null = null;
-  let voicePlayedRound = -1;
+  interface DecodedClip {
+    key: string;
+    roundId: number;
+    offsetMs: number;
+    buffer: AudioBuffer | null;
+    el: HTMLAudioElement | null;
+    played: boolean;
+  }
 
-  function telephoneChain(): AudioNode {
+  let clipsRoundId = -1;
+  let clips: DecodedClip[] = [];
+  let clipTimers: number[] = [];
+  let activeSources: AudioScheduledSourceNode[] = [];
+
+  /** Clean, intelligible laboratory intercom passband (300 Hz – 3200 Hz, minimal coloration) */
+  function intercomChain(): AudioNode {
     const c = audioCtx();
-    const bp = c.createBiquadFilter(); // 300–3000 Hz band-pass: centre √(300·3000) ≈ 949 Hz, Q = 949/2700 ≈ 0.35
-    bp.type = 'bandpass';
-    bp.frequency.value = 949;
-    bp.Q.value = 0.35;
     const hp = c.createBiquadFilter();
     hp.type = 'highpass';
     hp.frequency.value = 300;
-    hp.Q.value = 0.7;
+    hp.Q.value = 0.707;
     const lp = c.createBiquadFilter();
     lp.type = 'lowpass';
-    lp.frequency.value = 3000;
-    lp.Q.value = 0.7;
-    const shaper = c.createWaveShaper();
-    const n = 1024;
-    const curve = new Float32Array(n);
-    const k = 6;
-    for (let i = 0; i < n; i++) {
-      const x = (i * 2) / n - 1;
-      curve[i] = ((1 + k) * x) / (1 + k * Math.abs(x));
-    }
-    shaper.curve = curve;
-    shaper.oversample = '2x';
+    lp.frequency.value = 3200;
+    lp.Q.value = 0.707;
+    const comp = c.createDynamicsCompressor();
+    comp.threshold.value = -18;
+    comp.knee.value = 12;
+    comp.ratio.value = 3;
+    comp.attack.value = 0.005;
+    comp.release.value = 0.15;
     const gain = c.createGain();
-    gain.gain.value = 2.2;
-    bp.connect(hp).connect(lp).connect(shaper).connect(gain).connect(out());
-    return bp;
+    gain.gain.value = 1.65;
+    hp.connect(lp).connect(comp).connect(gain).connect(out());
+    return hp;
   }
 
-  net.on('audio', async (m) => {
-    const entry = { roundId: m.roundId, offset: m.audioOffsetMs, buffer: null as AudioBuffer | null, el: null as HTMLAudioElement | null };
-    voice = entry;
+  async function ingestClip(clip: AudioClip, roundId: number, idxHint: number): Promise<void> {
+    if (clipsRoundId !== roundId) {
+      stopVoices();
+      clipsRoundId = roundId;
+      clips = [];
+    }
+    const key = `${roundId}:${clip.offsetMs}:${idxHint}`;
+    if (clips.some((c) => c.key === key)) return;
+    const entry: DecodedClip = {
+      key,
+      roundId,
+      offsetMs: clip.offsetMs,
+      buffer: null,
+      el: null,
+      played: false,
+    };
+    clips.push(entry);
     try {
-      entry.buffer = await audioCtx().decodeAudioData(dataURLToArrayBuffer(m.data));
+      entry.buffer = await audioCtx().decodeAudioData(dataURLToArrayBuffer(clip.dataUrl));
     } catch {
-      // some codecs fail decodeAudioData: fall back to <audio> + MediaElementSource
       const el = new Audio();
-      el.src = m.data;
+      el.src = clip.dataUrl;
       el.preload = 'auto';
       entry.el = el;
     }
-    if (net.phase === 'REPLAY_TRUTH') scheduleVoice();
+    if (net.phase === 'REPLAY_TRUTH' && net.round?.id === roundId) {
+      scheduleClip(entry);
+    }
+  }
+
+  net.on('audio', (m) => {
+    void ingestClip(m.clip, m.roundId, m.index);
   });
 
-  function scheduleVoice(): void {
+  net.on('audio-sync', (m) => {
+    m.clips.forEach((c, i) => void ingestClip(c, m.roundId, i));
+  });
+
+  function scheduleClip(entry: DecodedClip): void {
     const st = net.state;
-    if (!st || !voice || voice.roundId !== st.round.id || voicePlayedRound === st.round.id) return;
-    const v = voice;
-    const startAtLocal = net.toLocal(st.phaseStartedAt + v.offset);
+    if (!st || st.state !== 'REPLAY_TRUTH' || entry.roundId !== st.round.id || entry.played) return;
+    const startAtLocal = net.toLocal(st.phaseStartedAt + entry.offsetMs);
     const delayMs = startAtLocal - Date.now();
     const play = (skipSec: number) => {
-      voicePlayedRound = st.round.id;
+      if (net.phase !== 'REPLAY_TRUTH' || entry.played) return;
+      entry.played = true;
       const c = audioCtx();
-      const input = telephoneChain();
-      if (v.buffer) {
-        if (skipSec >= v.buffer.duration) return;
+      const input = intercomChain();
+      if (entry.buffer) {
+        if (skipSec >= entry.buffer.duration) return;
         const s = c.createBufferSource();
-        s.buffer = v.buffer;
+        s.buffer = entry.buffer;
         s.connect(input);
         s.start(c.currentTime + 0.01, Math.max(0, skipSec));
-        voiceSource = s;
-      } else if (v.el) {
+        activeSources.push(s);
+      } else if (entry.el) {
         try {
-          c.createMediaElementSource(v.el).connect(input);
+          c.createMediaElementSource(entry.el).connect(input);
         } catch {
           /* already connected */
         }
-        v.el.currentTime = Math.max(0, skipSec);
-        v.el.play().catch(() => {});
+        entry.el.currentTime = Math.max(0, skipSec);
+        entry.el.play().catch(() => {});
       }
     };
-    if (voiceTimer) clearTimeout(voiceTimer);
-    if (delayMs > 0) voiceTimer = window.setTimeout(() => play(0), delayMs);
-    else play(-delayMs / 1000);
+    if (delayMs > 0) {
+      const tid = window.setTimeout(() => play(0), delayMs);
+      clipTimers.push(tid);
+    } else {
+      play(-delayMs / 1000);
+    }
   }
 
-  function stopVoice(): void {
-    if (voiceTimer) clearTimeout(voiceTimer);
-    voiceTimer = null;
-    try {
-      voiceSource?.stop();
-    } catch {
-      /* ignore */
+  function scheduleAllVoices(): void {
+    const st = net.state;
+    if (!st) return;
+    for (const entry of clips) {
+      if (entry.roundId === st.round.id && !entry.played) scheduleClip(entry);
     }
-    voiceSource = null;
-    voice?.el?.pause();
+  }
+
+  function stopVoices(): void {
+    for (const tid of clipTimers) clearTimeout(tid);
+    clipTimers = [];
+    for (const s of activeSources) {
+      try {
+        s.stop();
+      } catch {
+        /* ignore */
+      }
+    }
+    activeSources = [];
+    for (const entry of clips) {
+      entry.el?.pause();
+    }
   }
 
   // ====================================================================
@@ -277,18 +331,18 @@ export default async function mainPage(app: HTMLElement): Promise<void> {
 
   let freezeDataUrl: string | null = null;
   let freezeRound = -1;
-  function captureFreeze(roundId: number): void {
+  function captureFreeze(roundId: number, rollNumber: number, frameNumber: number): void {
     if (freezeRound === roundId) return;
     freezeRound = roundId;
     let src: CanvasImageSource;
-    if (camLive() && camV.videoWidth > 0) src = camV;
-    else {
-      // no camera: use the last simulated-film frame so the flow works with zero assets
-      drawSimFilm(g, 30);
+    if (camLive() && camV.videoWidth > 0) {
+      src = camV;
+    } else {
+      drawSimFilm(g, 30, rollNumber, frameNumber);
       src = fx;
     }
     const c = filmFilter(src, 1280);
-    freezeDataUrl = c.toDataURL('image/jpeg', 0.78);
+    freezeDataUrl = c.toDataURL('image/jpeg', 0.8);
     net.send({ type: 'freeze', data: freezeDataUrl });
   }
 
@@ -303,8 +357,7 @@ export default async function mainPage(app: HTMLElement): Promise<void> {
   let rewindFailed = false;
 
   const hideAll = () => {
-    for (const el of [baseV, rewindV, replayV, countdownBox, cctv]) el.classList.add('hidden');
-    bystander.classList.remove('show');
+    for (const el of [baseV, rewindV, replayV, countdownBox, replayHud, cctv]) el.classList.add('hidden');
   };
 
   function sinkAll(): void {
@@ -321,27 +374,34 @@ export default async function mainPage(app: HTMLElement): Promise<void> {
   async function onPhase(phase: Phase, fresh: boolean): Promise<void> {
     const st = net.state!;
     const roundId = st.round.id;
+    const rollNo = st.round.rollNumber ?? net.config?.rollNumber ?? 1;
+    const frmNo = st.round.frameNumber ?? 1;
     const elapsedSec = net.elapsedMs() / 1000;
     hideAll();
+
     switch (phase) {
       case 'IDLE':
         stopAllLoops();
-        stopVoice();
+        stopVoices();
         await stopRecording(false);
         baseV.pause();
         rewindV.pause();
         replayV.pause();
-        checkAssets();
+        void checkAssets();
         break;
 
       case 'ENTER_BUFFER':
-        stopVoice();
+        stopAllLoops();
+        stopVoices();
+        if (clipsRoundId !== roundId) {
+          clipsRoundId = roundId;
+          clips = [];
+        }
+        prepMeta.textContent = `ROLL ${pad2(rollNo)} · FR ${pad2(frmNo)}A`;
         countdownBox.classList.remove('hidden');
-        heartbeat.setRate(70);
-        heartbeat.start(Math.max(0.5, net.remainingMs() / 1000), 0.9);
         baseFailed = rewindFailed = false;
         await Promise.all([ensureCamera(), checkAssets()]);
-        if (net.phase !== 'ENTER_BUFFER') break; // already moved on; don't clobber
+        if (net.phase !== 'ENTER_BUFFER') break;
         if (assets.base) {
           videoSrc(baseV, 'base.mp4');
           baseV.currentTime = 0;
@@ -349,7 +409,7 @@ export default async function mainPage(app: HTMLElement): Promise<void> {
         break;
 
       case 'ACTIVE_30S':
-        heartbeat.start(0.3, 1);
+        enlargerTimer.start(0.85, 0.3);
         if (!camLive()) await ensureCamera();
         startRecording(roundId);
         if (assets.base && !baseFailed) {
@@ -364,7 +424,7 @@ export default async function mainPage(app: HTMLElement): Promise<void> {
         if (fresh && net.elapsedMs() < 600) flash(200);
         stopAllLoops();
         baseV.pause();
-        captureFreeze(roundId);
+        captureFreeze(roundId, rollNo, frmNo);
         await stopRecording(true);
         if (assets.rewind) videoSrc(rewindV, 'rewind.mp4');
         break;
@@ -381,9 +441,10 @@ export default async function mainPage(app: HTMLElement): Promise<void> {
         break;
 
       case 'REPLAY_TRUTH':
-        // total silence: drop all score and alarms, keep only the visitor's voice
+        // Total system silence: zero metronome, zero score, zero moralizing text — only visitor audioClips
         stopAllLoops();
         rewindV.pause();
+        replayHud.classList.remove('hidden');
         if (replayUrl && replayRound === roundId) {
           replayV.src = replayUrl;
           replayV.classList.remove('hidden');
@@ -394,15 +455,16 @@ export default async function mainPage(app: HTMLElement): Promise<void> {
           }
           replayV.play().catch(() => {});
         }
-        scheduleVoice();
+        scheduleAllVoices();
         break;
 
       case 'CCTV_REVEAL':
         stopAllLoops();
-        stopVoice();
+        stopVoices();
         replayV.pause();
         cctv.classList.remove('hidden');
-        frameNo.textContent = `FR ${String(roundId).padStart(3, '0')}`;
+        cctvRoll.textContent = `ROLL ${pad2(rollNo)}`;
+        frameNo.textContent = `FRAME ${pad2(frmNo)}A`;
         cctvPhaseStart = Date.now();
         lastCctvAt = 0;
         cctvImg.classList.add('hidden');
@@ -411,7 +473,7 @@ export default async function mainPage(app: HTMLElement): Promise<void> {
         else if (net.doorPhoto?.url) freezeImg.src = net.doorPhoto.url;
         else {
           const c = document.createElement('canvas');
-          drawDefaultDoorPhoto(c);
+          drawReferencePlate(c);
           freezeImg.src = c.toDataURL('image/jpeg', 0.8);
         }
         break;
@@ -423,7 +485,7 @@ export default async function mainPage(app: HTMLElement): Promise<void> {
     if (!fresh) return;
     curPhase = m.state;
     curRound = m.round.id;
-    onPhase(m.state, true);
+    void onPhase(m.state, true);
   });
 
   net.on('cctv', (m) => {
@@ -441,22 +503,24 @@ export default async function mainPage(app: HTMLElement): Promise<void> {
     const phase = net.phase;
     const t = net.storySec();
     const st = net.state;
+    const rollNo = st?.round.rollNumber ?? net.config?.rollNumber ?? 1;
+    const frmNo = st?.round.frameNumber ?? 1;
+
     switch (phase) {
       case 'IDLE':
-        drawIdle(g, net.now());
+        drawIdle(g, net.now(), rollNo);
         break;
       case 'ENTER_BUFFER': {
-        drawIdle(g, net.now());
-        const remain = net.remainingMs() / 1000 / net.timeScale;
-        countdown.textContent = remain > 3 ? '' : String(Math.max(1, Math.ceil(remain)));
+        drawIdle(g, net.now(), rollNo);
+        const remain = Math.max(1, Math.ceil(net.remainingMs() / 1000 / net.timeScale));
+        countdown.textContent = pad2(remain);
         break;
       }
       case 'ACTIVE_30S':
-        heartbeat.setRate(72 + (Math.min(30, t) / 30) * 60);
-        if (!assets.base || baseFailed) drawSimFilm(g, t);
-        else {
+        if (!assets.base || baseFailed) {
+          drawSimFilm(g, t, rollNo, frmNo);
+        } else {
           clear(g);
-          // drift correction (real-time scale only)
           if (net.timeScale === 1 && performance.now() - lastDrift > 2000 && !baseV.paused) {
             lastDrift = performance.now();
             const want = net.elapsedMs() / 1000;
@@ -465,20 +529,20 @@ export default async function mainPage(app: HTMLElement): Promise<void> {
         }
         break;
       case 'REWIND':
-        if (!assets.rewind || rewindFailed) drawRewind(g, net.elapsedMs() / Math.max(1, st?.phaseDurationMs || 3000));
+        if (!assets.rewind || rewindFailed) drawRewind(g, net.elapsedMs() / Math.max(1, st?.phaseDurationMs || 3000), rollNo);
         else clear(g);
         break;
       case 'REPLAY_TRUTH': {
-        if (!(replayUrl && replayRound === st?.round.id)) drawNoRecording(g, t);
+        if (!(replayUrl && replayRound === st?.round.id)) drawNoRecording(g);
         else clear(g);
-        const show = !!st && !st.round.didSpeak && !st.round.didPullBreaker && t >= 30 - TIMELINE.bystanderLastSec;
-        bystander.classList.toggle('show', show);
+        const tc = Math.min(30, Math.max(0, t)).toFixed(1).padStart(4, '0');
+        replayHud.textContent = `ARCHIVAL PLAYBACK · ROLL ${pad2(rollNo)} · FR ${pad2(frmNo)}A · 00:${tc}`;
         break;
       }
       case 'CCTV_REVEAL': {
         clear(g);
         const now = Date.now();
-        const firstWait = Math.min(1500, (st?.phaseDurationMs || 6000) * 0.25);
+        const firstWait = Math.min(1200, (st?.phaseDurationMs || 8000) * 0.2);
         const noFrames = lastCctvAt === 0 ? now - cctvPhaseStart > firstWait : now - lastCctvAt > 2000;
         nosig.classList.toggle('hidden', !noFrames);
         cctvClock.textContent = new Date(net.now()).toLocaleTimeString('en-GB', { hour12: false });
@@ -499,8 +563,8 @@ export default async function mainPage(app: HTMLElement): Promise<void> {
   requestAnimationFrame(frame);
 
   window.addEventListener('keydown', (e) => {
-    if (e.key === 's' || e.key === 'S') setupPanel();
-    if (e.key === 'f' || e.key === 'F') requestFullscreen();
+    if (e.key === 's' || e.key === 'S') void setupPanel();
+    if (e.key === 'f' || e.key === 'F') void requestFullscreen();
   });
 
   function setupPanel(): Promise<void> {
@@ -510,7 +574,7 @@ export default async function mainPage(app: HTMLElement): Promise<void> {
       el.className = 'setup';
       el.innerHTML = `
         <div class="ticket">
-          <div class="head"><h2><small>RUHUA FILM LAB · JOB TICKET · PROJ /main</small>Main projector<br>setup</h2><span class="stamp double">Pre-flight</span></div>
+          <div class="head"><h2><small>RUHUA FILM LAB · ARCHIVAL TICKET · PROJ /main</small>Main projector<br>setup</h2><span class="stamp double">Pre-flight</span></div>
           <div class="fields">
             <label><span class="no">01 / CAMERA</span>Choose the external USB wide-angle camera<select id="camSel"></select></label>
             <label><span class="no">02 / AUDIO OUT</span>Audio output device<select id="sinkSel"></select></label>
@@ -520,8 +584,8 @@ export default async function mainPage(app: HTMLElement): Promise<void> {
           <div class="fields">
             <div class="pv"><video id="pv" muted playsinline autoplay></video>${cropMarks()}<span class="mono">PREVIEW · CAM</span></div>
             <div class="row">
-              <button id="refresh">Refresh devices</button>
-              <button class="primary" id="go">Unlock audio/video &amp; go fullscreen</button>
+              <button id="refresh" type="button">Refresh devices</button>
+              <button class="primary" id="go" type="button">Unlock audio/video &amp; go fullscreen</button>
             </div>
           </div>
         </div>`;
@@ -532,16 +596,15 @@ export default async function mainPage(app: HTMLElement): Promise<void> {
       const info = el.querySelector('#assetInfo') as HTMLDivElement;
       updateAssetInfo = () => {
         info.innerHTML =
-          `<b>base.mp4</b> ··· ${assets.base ? '<span class="ok">FOUND</span>' : '<span class="warn">MISSING → simulated film (canvas)</span>'}<br>` +
-          `<b>rewind.mp4</b> ··· ${assets.rewind ? '<span class="ok">FOUND</span>' : '<span class="warn">MISSING → procedural rewind</span>'}`;
+          `<b>base.mp4</b> ··· ${assets.base ? '<span class="ok">FOUND</span>' : '<span class="warn">STANDBY → architectural daylight plate</span>'}<br>` +
+          `<b>rewind.mp4</b> ··· ${assets.rewind ? '<span class="ok">FOUND</span>' : '<span class="warn">STANDBY → motorized transport</span>'}`;
       };
-      checkAssets();
+      void checkAssets();
 
       async function fill(): Promise<void> {
         try {
           let devs = await navigator.mediaDevices.enumerateDevices();
           if (!devs.some((d) => d.kind === 'videoinput' && d.label)) {
-            // ask for permission once so device labels become available
             const tmp = await navigator.mediaDevices.getUserMedia({ video: true, audio: false }).catch(() => null);
             tmp?.getTracks().forEach((t) => t.stop());
             devs = await navigator.mediaDevices.enumerateDevices();
@@ -586,32 +649,31 @@ export default async function mainPage(app: HTMLElement): Promise<void> {
         pv.play().catch(() => {});
       }
 
-      camSel.addEventListener('change', preview);
-      (el.querySelector('#refresh') as HTMLButtonElement).addEventListener('click', fill);
+      camSel.addEventListener('change', () => void preview());
+      (el.querySelector('#refresh') as HTMLButtonElement).addEventListener('click', () => void fill());
       (el.querySelector('#go') as HTMLButtonElement).addEventListener('click', async () => {
         const fsP = requestFullscreen();
         const auP = unlockAudio();
-        keepAwake();
+        void keepAwake();
         camId = camSel.value;
         sinkId = sinkSel.value;
         localStorage.setItem(LS_CAM, camId);
         localStorage.setItem(LS_SINK, sinkId);
-        await Promise.allSettled([fsP, auP]);
-        if (sinkId) await setAudioSink(sinkId);
+        await Promise.allSettled([withTimeout(fsP), withTimeout(auP)]);
+        if (sinkId) await withTimeout(setAudioSink(sinkId));
         sinkAll();
-        // unlock autoplay on the video elements
         for (const v of [baseV, rewindV, replayV]) {
           v.muted = v === replayV;
           v.play().catch(() => {});
           v.pause();
         }
-        if (!camLive()) await openCamera(camId);
+        if (!camLive()) await withTimeout(openCamera(camId), 1500);
         pv.srcObject = null;
         el.remove();
         updateAssetInfo = null;
         resolve();
       });
-      fill();
+      void fill();
     });
   }
 }

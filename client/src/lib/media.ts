@@ -1,4 +1,4 @@
-/** Media helpers: MIME detection, base64, film filter, default darkroom negative, asset probing */
+/** Media helpers: MIME detection, base64, silver-gelatin film filter, 00A baseline reference plate, asset probing */
 
 export function pickMime(candidates: string[]): string {
   if (typeof MediaRecorder === 'undefined') return '';
@@ -56,7 +56,7 @@ function sourceSize(src: CanvasImageSource): [number, number] {
 }
 
 /**
- * High-contrast mono film grain filter.
+ * Silver-gelatin monochrome archival film filter.
  * Returns the processed canvas (width <= maxW).
  */
 export function filmFilter(src: CanvasImageSource, maxW = 1280, opts: { contrast?: number; grain?: number } = {}): HTMLCanvasElement {
@@ -70,8 +70,8 @@ export function filmFilter(src: CanvasImageSource, maxW = 1280, opts: { contrast
   g.drawImage(src, 0, 0, w, h);
   const img = g.getImageData(0, 0, w, h);
   const d = img.data;
-  const contrast = opts.contrast ?? 1.9;
-  const grain = opts.grain ?? 38;
+  const contrast = opts.contrast ?? 1.55;
+  const grain = opts.grain ?? 26;
   const cx = w / 2;
   const cy = h / 2;
   const maxR = Math.hypot(cx, cy);
@@ -79,27 +79,15 @@ export function filmFilter(src: CanvasImageSource, maxW = 1280, opts: { contrast
     for (let x = 0; x < w; x++) {
       const i = (y * w + x) * 4;
       let v = 0.299 * d[i] + 0.587 * d[i + 1] + 0.114 * d[i + 2];
-      v = (v - 128) * contrast + 128; // high contrast
-      v += (Math.random() - 0.5) * grain; // grain
+      v = (v - 128) * contrast + 128;
+      v += (Math.random() - 0.5) * grain;
       const r = Math.hypot(x - cx, y - cy) / maxR;
-      v *= 1 - Math.pow(r, 2.4) * 0.65; // vignette
+      v *= 1 - Math.pow(r, 2.5) * 0.42;
       v = v < 0 ? 0 : v > 255 ? 255 : v;
       d[i] = d[i + 1] = d[i + 2] = v;
     }
   }
   g.putImageData(img, 0, 0);
-  // occasional scratches
-  g.globalAlpha = 0.18;
-  g.strokeStyle = '#fff';
-  for (let k = 0; k < 4; k++) {
-    const x = Math.random() * w;
-    g.lineWidth = Math.random() * 1.5 + 0.3;
-    g.beginPath();
-    g.moveTo(x, 0);
-    g.lineTo(x + (Math.random() - 0.5) * 20, h);
-    g.stroke();
-  }
-  g.globalAlpha = 1;
   return c;
 }
 
@@ -121,11 +109,11 @@ export function cctvFrame(video: HTMLVideoElement, canvas: HTMLCanvasElement, la
   const d = img.data;
   for (let i = 0; i < d.length; i += 4) {
     let v = 0.299 * d[i] + 0.587 * d[i + 1] + 0.114 * d[i + 2];
-    v = (v - 128) * 1.4 + 128 + (Math.random() - 0.5) * 24;
+    v = (v - 128) * 1.35 + 128 + (Math.random() - 0.5) * 20;
     d[i] = d[i + 1] = d[i + 2] = v < 0 ? 0 : v > 255 ? 255 : v;
   }
   g.putImageData(img, 0, 0);
-  g.fillStyle = 'rgba(255,255,255,0.88)';
+  g.fillStyle = 'rgba(232,226,213,0.85)';
   g.font = "10px 'RH Mono', ui-monospace, monospace";
   g.fillText(label, 8, h - 8);
   g.textAlign = 'right';
@@ -133,71 +121,86 @@ export function cctvFrame(video: HTMLVideoElement, canvas: HTMLCanvasElement, la
   g.textAlign = 'left';
 }
 
-/** procedurally generated darkroom default negative */
-export function drawDefaultDoorPhoto(c: HTMLCanvasElement, w = 1280, h = 800): void {
+/**
+ * Clean 16:9 baseline architectural reference plate (00A) for empty contact sheets.
+ * Depicts a quiet sunlit interior wall with slanted window-pane light and a 7-step density wedge.
+ */
+export function drawReferencePlate(c: HTMLCanvasElement, w = 1280, h = 720): void {
   c.width = w;
   c.height = h;
   const g = c.getContext('2d')!;
-  // darkroom base tone
-  const bg = g.createRadialGradient(w * 0.5, h * 0.45, 20, w * 0.5, h * 0.5, Math.max(w, h) * 0.75);
-  bg.addColorStop(0, '#5a5a5a');
-  bg.addColorStop(0.45, '#2a2a2a');
-  bg.addColorStop(1, '#050505');
+
+  // calm interior grey-white architectural gradient
+  const bg = g.createLinearGradient(0, 0, w, h);
+  bg.addColorStop(0, '#cfc9bc');
+  bg.addColorStop(0.55, '#b8b2a5');
+  bg.addColorStop(1, '#8c877c');
   g.fillStyle = bg;
   g.fillRect(0, 0, w, h);
-  // horizon and wall corner
-  g.strokeStyle = 'rgba(200,200,200,0.18)';
-  g.lineWidth = 2;
-  g.beginPath();
-  g.moveTo(0, h * 0.72);
-  g.lineTo(w, h * 0.7);
-  g.moveTo(w * 0.22, 0);
-  g.lineTo(w * 0.25, h * 0.72);
-  g.stroke();
-  // subject silhouette (from behind)
-  g.fillStyle = 'rgba(10,10,10,0.92)';
-  const px = w * 0.62;
-  const py = h * 0.72;
-  g.beginPath();
-  g.ellipse(px, py - 300, 34, 40, 0, 0, Math.PI * 2);
-  g.fill();
-  g.beginPath();
-  g.moveTo(px - 70, py - 250);
-  g.quadraticCurveTo(px, py - 275, px + 70, py - 250);
-  g.lineTo(px + 55, py - 90);
-  g.lineTo(px + 35, py);
-  g.lineTo(px - 35, py);
-  g.lineTo(px - 55, py - 90);
-  g.closePath();
-  g.fill();
-  // anomalous shadow (blurred)
+
+  // slanted architectural window-mullion daylight patch across the center wall
   g.save();
-  g.filter = 'blur(18px)';
-  g.fillStyle = 'rgba(0,0,0,0.85)';
-  g.beginPath();
-  g.ellipse(w * 0.33, h * 0.42, 70, 230, -0.08, 0, Math.PI * 2);
-  g.fill();
+  g.filter = 'blur(8px)';
+  g.fillStyle = 'rgba(247, 243, 234, 0.72)';
+  const skew = w * 0.085;
+  const panes = [
+    [w * 0.26, h * 0.16, w * 0.21, h * 0.54],
+    [w * 0.5, h * 0.16, w * 0.21, h * 0.54],
+  ];
+  for (const [px, py, pw, ph] of panes) {
+    g.beginPath();
+    g.moveTo(px + skew * 0.4, py);
+    g.lineTo(px + pw + skew * 0.4, py);
+    g.lineTo(px + pw - skew * 0.4, py + ph);
+    g.lineTo(px - skew * 0.4, py + ph);
+    g.closePath();
+    g.fill();
+    // horizontal transom shadow bar
+    g.fillStyle = 'rgba(165, 159, 148, 0.52)';
+    const my = py + ph * 0.48;
+    g.fillRect(px - skew * 0.4, my, pw + skew * 0.8, h * 0.022);
+    g.fillStyle = 'rgba(247, 243, 234, 0.72)';
+  }
   g.restore();
-  // grain
+
+  // subtle architectural baseboard / floor line
+  g.strokeStyle = 'rgba(40, 36, 32, 0.22)';
+  g.lineWidth = 1.5;
+  g.beginPath();
+  g.moveTo(0, h * 0.82);
+  g.lineTo(w, h * 0.82);
+  g.stroke();
+
+  // fine silver-halide grain
   const img = g.getImageData(0, 0, w, h);
   const d = img.data;
   for (let i = 0; i < d.length; i += 4) {
-    const n = (Math.random() - 0.5) * 46;
-    const v = Math.max(0, Math.min(255, d[i] + n));
-    d[i] = d[i + 1] = d[i + 2] = v;
+    const n = (Math.random() - 0.5) * 20;
+    d[i] = Math.max(0, Math.min(255, d[i] + n));
+    d[i + 1] = Math.max(0, Math.min(255, d[i + 1] + n));
+    d[i + 2] = Math.max(0, Math.min(255, d[i + 2] + n));
   }
   g.putImageData(img, 0, 0);
-  // film edge: black rebate + sprockets + invented edge print
-  g.fillStyle = '#050505';
-  g.fillRect(0, 0, w, 44);
-  g.fillRect(0, h - 44, w, 44);
-  g.fillStyle = 'rgba(235,229,214,0.22)';
-  for (let x = 12; x < w; x += 34) {
-    g.fillRect(x, 14, 16, 16);
-    g.fillRect(x, h - 30, 16, 16);
+
+  // Stouffer-style 7-step density calibration wedge at bottom right
+  const steps = 7;
+  const sw = 28;
+  const sh = 14;
+  const sx0 = w - 42 - steps * sw;
+  const sy0 = h - 34;
+  for (let s = 0; s < steps; s++) {
+    const v = Math.round(28 + (s / (steps - 1)) * 208);
+    g.fillStyle = `rgb(${v},${v},${v})`;
+    g.fillRect(sx0 + s * sw, sy0, sw, sh);
   }
-  g.fillStyle = 'rgba(200,137,44,0.75)';
-  g.font = "13px 'RH Mono', ui-monospace, monospace";
-  for (let x = 30, n = 0; x < w; x += 300, n++) g.fillText(`RUHUA SAFETY FILM  0${n}  ▸0${n}A`, x, 40 + 0 * n);
-  g.fillText('NODE 000 · DEFAULT NEGATIVE', 30, h - 48);
+  g.strokeStyle = 'rgba(20, 18, 16, 0.45)';
+  g.lineWidth = 1;
+  g.strokeRect(sx0, sy0, steps * sw, sh);
+
+  // discreet reference plate mark
+  g.fillStyle = 'rgba(25, 22, 19, 0.68)';
+  g.font = "500 14px 'RH Mono', ui-monospace, monospace";
+  g.fillText('REF 00A · BASELINE DAYLIGHT CALIBRATION PLATE', 40, h - 22);
 }
+
+export const drawDefaultDoorPhoto = drawReferencePlate;
