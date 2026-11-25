@@ -1,82 +1,68 @@
 /**
- * /station1 — tablet 2: south-west archival terminal
- *  t = 04s ~ 16s: PROTOCOL 01 · VOCAL CALIBRATION (hold to speak, up to 4 clips/round, max 6s/clip, calm VU meter + TRANSMITTING)
- *  t = 16s ~ 25s: PROTOCOL 02 · OPTICAL DODGING IN PROGRESS (steady darkroom notice)
- *  t = 25s ~ 30s: AWAITING FIXATION AT NORTH-WEST STATION (dimmed notice)
+ * /station1 — tablet 2: south-west acoustic developer gauge
+ * - Pure black (#000000) outside DEVELOPING.
+ * - During DEVELOPING: full-screen vintage analog needle meter driven smoothly by live microphone energy,
+ *   with a single caption below: MAKE NOISE TO DEVELOP (never displays devProgress percentage).
+ * - Streams normalized energy (0.0–1.0) at 12 Hz via WebSocket `{ type: 'AUDIO_ENERGY', level }`.
  */
 import { Net, mountNetDot } from '../lib/net';
-import { audioCtx, cueBeep } from '../lib/sfx';
-import { blobToDataURL, pickAudioMime } from '../lib/media';
+import { audioCtx } from '../lib/sfx';
 import { showStartOverlay } from '../lib/unlock';
 import { TITLE_EN } from '../lib/brand';
-import { TIMELINE } from '../../../shared/protocol';
 
-const TITLE_P1 = 'PROTOCOL 01 · VOCAL CALIBRATION';
-const COPY_P1 =
-  "Exposure drift detected in the archival footage. Hold the receiver and speak clearly to keep the subject's attention within the frame.";
+const SEND_INTERVAL_MS = 83; // ~12 Hz
 
-const TITLE_P2 = 'PROTOCOL 02 · OPTICAL DODGING IN PROGRESS';
-const COPY_P2 = 'Maintain physical shadow coverage across the overexposed center until fixation.';
+function arcPoint(cx: number, cy: number, r: number, deg: number): [number, number] {
+  const rad = ((deg - 90) * Math.PI) / 180;
+  return [cx + r * Math.cos(rad), cy + r * Math.sin(rad)];
+}
 
-const TITLE_WAIT = 'PROTOCOL 03 · FIXATION STANDBY';
-const COPY_WAIT = 'AWAITING FIXATION AT NORTH-WEST STATION';
-
-type Seg = 'black' | 'P1' | 'P2' | 'WAIT';
-
-const VU_BARS = 16;
+function arcPath(cx: number, cy: number, r: number, startDeg: number, endDeg: number): string {
+  const [x1, y1] = arcPoint(cx, cy, r, startDeg);
+  const [x2, y2] = arcPoint(cx, cy, r, endDeg);
+  const large = Math.abs(endDeg - startDeg) > 180 ? 1 : 0;
+  return `M ${x1.toFixed(1)} ${y1.toFixed(1)} A ${r} ${r} 0 ${large} 1 ${x2.toFixed(1)} ${y2.toFixed(1)}`;
+}
 
 export default async function station1(app: HTMLElement): Promise<void> {
-  document.title = `South-west terminal · ${TITLE_EN}`;
+  document.title = `Acoustic Developer · ${TITLE_EN}`;
+
+  const ticks: string[] = [];
+  for (let i = 0; i <= 20; i++) {
+    const deg = -52 + (i / 20) * 104;
+    const major = i % 5 === 0;
+    const [x1, y1] = arcPoint(240, 230, major ? 150 : 160, deg);
+    const [x2, y2] = arcPoint(240, 230, 174, deg);
+    ticks.push(
+      `<line x1="${x1.toFixed(1)}" y1="${y1.toFixed(1)}" x2="${x2.toFixed(1)}" y2="${y2.toFixed(1)}" stroke="rgba(232,226,213,${major ? 0.85 : 0.35})" stroke-width="${major ? 2.2 : 1.1}" />`,
+    );
+  }
+
   app.innerHTML = `
-    <div class="station black" id="root">
-      <div class="st-band">
-        <span class="id"><span>T-02</span></span>
-        <span class="zone" id="zone">SW archival terminal</span>
-        <span class="clock" id="clock">--.-</span>
-      </div>
-      <div class="st-body stack" id="body">
-        <div class="st-copy">
-          <div class="st-kicker" id="kicker"></div>
-          <p class="st-msg" id="msg"></p>
-        </div>
-        <div class="st-aside hidden" id="aside">
-          <div class="vu-panel">
-            <div class="vu-head">
-              <span id="vuStatus">READY · HOLD RECEIVER TO TRANSMIT</span>
-              <span class="mono" id="clipCount">0 / ${TIMELINE.maxAudioClips} CLIPS</span>
-            </div>
-            <div class="vu-bars" id="vuBars">${Array.from({ length: VU_BARS }, () => '<i></i>').join('')}</div>
-            <div class="st-sub" id="sub">MAX ${TIMELINE.maxClipDurationSec}.0 S PER TRANSMISSION</div>
-          </div>
-          <button class="speak-btn" id="talk" type="button">
-            <span class="speak-ring"></span>
-            <span class="speak-cap">HOLD<br>TO SPEAK</span>
-          </button>
-        </div>
-      </div>
-      <div class="st-foot">
-        <span>RH-30 / SW TERMINAL · <span id="foot">STANDBY</span></span>
-        <span class="chem" id="chem">
-          <span data-s="P1"><b>P01</b> 04–16</span>
-          <span data-s="P2"><b>P02</b> 16–25</span>
-          <span data-s="WAIT"><b>FIX</b> 25–30</span>
-        </span>
+    <div class="inst-screen black" id="root">
+      <div class="meter-stage">
+        <svg class="analog-meter" viewBox="0 0 480 300" aria-label="Acoustic developer meter">
+          <rect x="14" y="14" width="452" height="272" rx="4" fill="#0B0A09" stroke="rgba(232,226,213,0.22)" stroke-width="1.5" />
+          <path id="arcQuiet" d="${arcPath(240, 230, 184, -52, -40)}" fill="none" stroke="#9E2A22" stroke-width="8" stroke-linecap="butt" />
+          <path id="arcActive" d="${arcPath(240, 230, 184, -40, 52)}" fill="none" stroke="#538C4D" stroke-width="8" stroke-linecap="butt" />
+          <path d="${arcPath(240, 230, 174, -52, 52)}" fill="none" stroke="rgba(232,226,213,0.35)" stroke-width="1.2" />
+          ${ticks.join('')}
+          <text x="64" y="250" fill="rgba(232,226,213,0.45)" font-family="'RH Mono', monospace" font-size="11" letter-spacing="2">QUIET</text>
+          <text x="364" y="250" fill="rgba(123,168,98,0.75)" font-family="'RH Mono', monospace" font-size="11" letter-spacing="2">DEVELOP</text>
+          <g id="needle" transform="rotate(-52 240 230)">
+            <line x1="240" y1="230" x2="240" y2="56" stroke="#E8E2D5" stroke-width="2.6" stroke-linecap="round" />
+            <circle cx="240" cy="230" r="10" fill="#1C1916" stroke="#E8E2D5" stroke-width="2" />
+            <circle cx="240" cy="230" r="3" fill="#9E2A22" />
+          </g>
+        </svg>
+        <div class="inst-caption">MAKE NOISE TO DEVELOP</div>
       </div>
     </div>`;
 
   const root = app.querySelector('#root') as HTMLDivElement;
-  const aside = app.querySelector('#aside') as HTMLDivElement;
-  const zone = app.querySelector('#zone') as HTMLSpanElement;
-  const clock = app.querySelector('#clock') as HTMLSpanElement;
-  const foot = app.querySelector('#foot') as HTMLSpanElement;
-  const kicker = app.querySelector('#kicker') as HTMLDivElement;
-  const msgEl = app.querySelector('#msg') as HTMLParagraphElement;
-  const vuStatus = app.querySelector('#vuStatus') as HTMLSpanElement;
-  const clipCountEl = app.querySelector('#clipCount') as HTMLSpanElement;
-  const vuBars = Array.from(app.querySelectorAll<HTMLElement>('#vuBars > i'));
-  const subEl = app.querySelector('#sub') as HTMLDivElement;
-  const btn = app.querySelector('#talk') as HTMLButtonElement;
-  const chem = Array.from(app.querySelectorAll<HTMLSpanElement>('#chem > span'));
+  const arcQuiet = app.querySelector('#arcQuiet') as SVGPathElement;
+  const arcActive = app.querySelector('#arcActive') as SVGPathElement;
+  const needle = app.querySelector('#needle') as SVGGElement;
 
   const net = new Net('station1');
   (window as any).__net = net;
@@ -85,271 +71,93 @@ export default async function station1(app: HTMLElement): Promise<void> {
   let mic: MediaStream | null = null;
   let analyser: AnalyserNode | null = null;
   let micSrc: MediaStreamAudioSourceNode | null = null;
-  const freqBuf = new Uint8Array(64);
-  const mime = pickAudioMime();
+  const waveBuf = new Uint8Array(256);
 
-  // ---------------- multi-clip recording + VU meter ----------------
-  let rec: MediaRecorder | null = null;
-  let chunks: Blob[] = [];
-  let recStartServer = 0;
-  let recStartLocal = 0;
-  let recRound = -1;
-  let maxClipTimer: number | null = null;
-  let activeRoundId = -1;
-  let sentCount = 0;
-
-  async function ensureMic(): Promise<MediaStream | null> {
-    if (mic && mic.getAudioTracks().some((t) => t.readyState === 'live')) return mic;
+  async function ensureMic(): Promise<void> {
+    if (mic && mic.getAudioTracks().some((t) => t.readyState === 'live')) return;
     try {
       mic = await navigator.mediaDevices.getUserMedia({
         audio: { echoCancellation: true, noiseSuppression: false, autoGainControl: true },
         video: false,
       });
-      try {
-        const c = audioCtx();
-        analyser = c.createAnalyser();
-        analyser.fftSize = 128;
-        analyser.smoothingTimeConstant = 0.72;
-        micSrc?.disconnect();
-        micSrc = c.createMediaStreamSource(mic);
-        micSrc.connect(analyser);
-      } catch {
-        analyser = null;
-      }
+      const c = audioCtx();
+      analyser = c.createAnalyser();
+      analyser.fftSize = 256;
+      analyser.smoothingTimeConstant = 0.65;
+      micSrc?.disconnect();
+      micSrc = c.createMediaStreamSource(mic);
+      micSrc.connect(analyser);
     } catch (e) {
       console.warn('microphone unavailable', e);
       mic = null;
       analyser = null;
     }
-    return mic;
   }
 
-  function syncClipCounter(): void {
-    const srvCount = net.round?.id === activeRoundId ? (net.round?.audioClipCount ?? 0) : 0;
-    const count = Math.max(sentCount, srvCount);
-    clipCountEl.textContent = `${count} / ${TIMELINE.maxAudioClips} CLIPS`;
-    const full = count >= TIMELINE.maxAudioClips;
-    if (seg === 'P1' && !rec) {
-      btn.disabled = full;
-      if (full) {
-        vuStatus.textContent = 'CALIBRATION LOG COMPLETE';
-        subEl.textContent = 'MAXIMUM 4 TRANSMISSIONS RECORDED';
-      }
+  function updateThresholdArc(): void {
+    const floor = Math.max(0.02, Math.min(0.5, net.config?.noiseFloor ?? 0.08));
+    const splitDeg = -52 + floor * 104;
+    arcQuiet.setAttribute('d', arcPath(240, 230, 184, -52, splitDeg));
+    arcActive.setAttribute('d', arcPath(240, 230, 184, splitDeg, 52));
+  }
+  net.on('config', updateThresholdArc);
+
+  function readEnergy(): number {
+    if (!analyser) return 0;
+    analyser.getByteTimeDomainData(waveBuf);
+    let sum = 0;
+    for (let i = 0; i < waveBuf.length; i++) {
+      const d = (waveBuf[i] - 128) / 128;
+      sum += d * d;
     }
+    const rms = Math.sqrt(sum / waveBuf.length);
+    return Math.max(0, Math.min(1, rms * 3.8));
   }
 
-  function clearVu(): void {
-    for (const b of vuBars) b.className = '';
+  let smoothed = 0;
+  let lastSentAt = 0;
+
+  function renderPhase(): void {
+    const active = net.connected && net.phase === 'DEVELOPING';
+    root.classList.toggle('black', !active);
+    if (active) void ensureMic();
   }
-
-  function updateVu(): void {
-    if (!rec) {
-      clearVu();
-      return;
-    }
-    let level = 0;
-    if (analyser) {
-      analyser.getByteTimeDomainData(freqBuf);
-      let sum = 0;
-      for (let i = 0; i < freqBuf.length; i++) {
-        const d = (freqBuf[i] - 128) / 128;
-        sum += d * d;
-      }
-      level = Math.min(1, Math.sqrt(sum / freqBuf.length) * 3.4);
-    } else {
-      // gentle fallback activity pulse if browser lacks AnalyserNode stream
-      level = 0.18 + 0.12 * Math.sin(performance.now() / 140);
-    }
-    const lit = Math.round(level * VU_BARS);
-    vuBars.forEach((bar, idx) => {
-      const on = idx < lit;
-      bar.className = on ? (idx >= VU_BARS - 3 ? 'hi' : 'on') : '';
-    });
-    const heldSec = Math.min(TIMELINE.maxClipDurationSec, (performance.now() - recStartLocal) / 1000);
-    subEl.textContent = `TRANSMITTING · ${heldSec.toFixed(1)} / ${TIMELINE.maxClipDurationSec}.0 S`;
-  }
-
-  async function startRec(): Promise<void> {
-    const r = net.round;
-    if (rec || !r || seg !== 'P1') return;
-    if (r.id !== activeRoundId) {
-      activeRoundId = r.id;
-      sentCount = r.audioClipCount ?? 0;
-    }
-    if (sentCount >= TIMELINE.maxAudioClips || (r.audioClipCount ?? 0) >= TIMELINE.maxAudioClips) {
-      syncClipCounter();
-      return;
-    }
-    const s = await ensureMic();
-    if (!s || seg !== 'P1') {
-      if (!s) {
-        vuStatus.textContent = 'MICROPHONE UNAVAILABLE';
-        subEl.textContent = 'CHECK HTTPS & BROWSER PERMISSION';
-      }
-      return;
-    }
-    try {
-      rec = mime ? new MediaRecorder(s, { mimeType: mime }) : new MediaRecorder(s);
-    } catch {
-      rec = new MediaRecorder(s);
-    }
-    chunks = [];
-    recRound = r.id;
-    recStartServer = net.now();
-    recStartLocal = performance.now();
-    const activeRecorder = rec;
-    activeRecorder.onstart = () => {
-      recStartServer = net.now();
-      recStartLocal = performance.now();
-    };
-    activeRecorder.ondataavailable = (e) => e.data && e.data.size && chunks.push(e.data);
-    activeRecorder.onstop = async () => {
-      if (maxClipTimer) {
-        clearTimeout(maxClipTimer);
-        maxClipTimer = null;
-      }
-      const type = activeRecorder.mimeType || mime || 'audio/webm';
-      const blob = new Blob(chunks, { type });
-      const round = net.round;
-      if (rec === activeRecorder) rec = null;
-      btn.classList.remove('rec');
-      clearVu();
-      if (!round || round.id !== recRound || blob.size < 400 || !round.activeStartedAt) {
-        if (seg === 'P1') {
-          vuStatus.textContent = 'HOLD LONGER TO LOG VOICE';
-          subEl.textContent = `MAX ${TIMELINE.maxClipDurationSec}.0 S PER TRANSMISSION`;
-        }
-        return;
-      }
-      const offsetMs = Math.max(0, Math.round(recStartServer - round.activeStartedAt));
-      const dataUrl = await blobToDataURL(blob);
-      if (net.send({ type: 'speak', mime: type, dataUrl, offsetMs })) {
-        sentCount = Math.min(TIMELINE.maxAudioClips, Math.max(sentCount + 1, (round.audioClipCount ?? 0) + 1));
-        vuStatus.textContent = `TRANSMISSION ${sentCount} LOGGED`;
-        subEl.textContent =
-          sentCount < TIMELINE.maxAudioClips ? 'READY FOR NEXT SPEAKER' : 'MAXIMUM 4 TRANSMISSIONS RECORDED';
-        syncClipCounter();
-      }
-    };
-
-    activeRecorder.start(200);
-    btn.classList.add('rec');
-    vuStatus.textContent = 'TRANSMITTING';
-    if (maxClipTimer) clearTimeout(maxClipTimer);
-    maxClipTimer = window.setTimeout(() => stopRec(), TIMELINE.maxClipDurationSec * 1000 * net.timeScale);
-  }
-
-  function stopRec(): void {
-    if (maxClipTimer) {
-      clearTimeout(maxClipTimer);
-      maxClipTimer = null;
-    }
-    if (rec && rec.state !== 'inactive') {
-      try {
-        rec.requestData();
-      } catch {
-        /* ignore */
-      }
-      try {
-        rec.stop();
-      } catch {
-        rec = null;
-      }
-    }
-  }
-
-  btn.addEventListener('pointerdown', (e) => {
-    e.preventDefault();
-    try {
-      btn.setPointerCapture(e.pointerId);
-    } catch {
-      /* ignore */
-    }
-    void startRec();
-  });
-  for (const ev of ['pointerup', 'pointercancel', 'lostpointercapture'] as const) {
-    btn.addEventListener(ev, () => stopRec());
-  }
-
-  net.on('state', () => {
-    if (net.round && net.round.id !== activeRoundId) {
-      activeRoundId = net.round.id;
-      sentCount = net.round.audioClipCount ?? 0;
-    }
-    syncClipCounter();
-  });
-
-  // ---------------- phase rendering ----------------
-  let seg: Seg = 'black';
-  function setSeg(next: Seg): void {
-    if (next === seg) return;
-    const prev = seg;
-    seg = next;
-    chem.forEach((c) => c.classList.toggle('on', c.dataset.s === next));
-    if (next !== 'P1') stopRec();
-
-    if (next === 'P1') {
-      if (prev !== 'P1') cueBeep();
-      root.className = 'station st-p1';
-      zone.textContent = 'SW terminal · Vocal calibration';
-      foot.textContent = 'PROTOCOL 01';
-      kicker.textContent = TITLE_P1;
-      msgEl.textContent = COPY_P1;
-      aside.classList.remove('hidden');
-      vuStatus.textContent = 'READY · HOLD RECEIVER TO TRANSMIT';
-      subEl.textContent = `MAX ${TIMELINE.maxClipDurationSec}.0 S PER TRANSMISSION`;
-      syncClipCounter();
-    } else if (next === 'P2') {
-      cueBeep();
-      root.className = 'station st-p2';
-      zone.textContent = 'SW terminal · Optical dodging assist';
-      foot.textContent = 'PROTOCOL 02';
-      kicker.textContent = TITLE_P2;
-      msgEl.textContent = COPY_P2;
-      aside.classList.add('hidden');
-    } else if (next === 'WAIT') {
-      root.className = 'station st-dim';
-      zone.textContent = 'SW terminal · Standby';
-      foot.textContent = 'AWAITING FIXATION';
-      kicker.textContent = TITLE_WAIT;
-      msgEl.textContent = COPY_WAIT;
-      aside.classList.add('hidden');
-    } else {
-      root.className = 'station black';
-      aside.classList.add('hidden');
-      kicker.textContent = '';
-      msgEl.textContent = '';
-    }
-  }
+  net.on('state', renderPhase);
+  net.on('open', renderPhase);
 
   function tick(): void {
-    let next: Seg = 'black';
-    if (net.connected && net.phase === 'ACTIVE_30S') {
-      const t = net.storySec();
-      if (t >= TIMELINE.station1P1[0] && t < TIMELINE.station1P1[1]) next = 'P1';
-      else if (t >= TIMELINE.station1P2[0] && t < TIMELINE.station1P2[1]) next = 'P2';
-      else if (t >= TIMELINE.station1Wait[0] && t <= TIMELINE.station1Wait[1] + 0.3) next = 'WAIT';
+    const active = net.connected && net.phase === 'DEVELOPING';
+    if (active) {
+      const raw = readEnergy();
+      // Fast needle attack, calm physical ballistic decay
+      smoothed = raw > smoothed ? smoothed + (raw - smoothed) * 0.42 : smoothed + (raw - smoothed) * 0.14;
+      const deg = -52 + smoothed * 104;
+      needle.setAttribute('transform', `rotate(${deg.toFixed(2)} 240 230)`);
+
+      const now = performance.now();
+      if (now - lastSentAt >= SEND_INTERVAL_MS) {
+        lastSentAt = now;
+        net.send({ type: 'AUDIO_ENERGY', level: Number(raw.toFixed(3)) });
+      }
+    } else if (smoothed > 0.001) {
+      smoothed = 0;
+      needle.setAttribute('transform', 'rotate(-52 240 230)');
     }
-    setSeg(next);
-    if (next !== 'black') {
-      const end =
-        next === 'P1' ? TIMELINE.station1P1[1] : next === 'P2' ? TIMELINE.station1P2[1] : TIMELINE.station1Wait[1];
-      clock.textContent = Math.max(0, end - net.storySec()).toFixed(1).padStart(4, '0');
-    }
-    if (next === 'P1') updateVu();
     requestAnimationFrame(tick);
   }
 
   await showStartOverlay({
     code: 'T-02',
     kicker: '/station1',
-    title: 'South-west archival terminal',
-    subtitle: 'Tap to allow the microphone, go fullscreen\nand keep the screen awake.',
-    button: 'Tap to start',
+    title: 'ACOUSTIC DEVELOPER',
+    subtitle: 'Tap to allow microphone & fullscreen',
+    button: 'TAP TO START',
     onUnlock: async () => {
       await ensureMic();
     },
   });
   net.connect();
+  updateThresholdArc();
+  renderPhase();
   requestAnimationFrame(tick);
 }

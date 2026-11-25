@@ -10,12 +10,12 @@ import type {
 } from '../../../shared/protocol';
 
 export type StateMsg = Extract<ServerMsg, { type: 'state' }>;
+export type DevMsg = Extract<ServerMsg, { type: 'dev' }>;
 type Handler<T extends ServerMsg['type']> = (msg: Extract<ServerMsg, { type: T }>) => void;
 
 /**
  * WebSocket client:
  *  - exponential back-off reconnect (0.5s → 1s → 2s … capped at 10s, with jitter)
- *  - after reconnecting the server immediately sends state / config / door-photo / contact-sheet for a full resync
  *  - NTP-style clock sync: uses the offset of the lowest-RTT sample among recent ones
  */
 export class Net {
@@ -37,6 +37,7 @@ export class Net {
   config: AppConfig | null = null;
   doorPhoto: DoorPhotoInfo | null = null;
   contactSheet: ContactSheetInfo | null = null;
+  lastDev: DevMsg | null = null;
 
   constructor(role: Role, token?: string) {
     this.role = role;
@@ -76,11 +77,6 @@ export class Net {
     return Math.max(0, this.state.phaseDurationMs - this.elapsedMs());
   }
 
-  /** server time → local Date.now() time usable for performance/AudioContext */
-  toLocal(serverMs: number): number {
-    return serverMs - this.offset;
-  }
-
   on<T extends ServerMsg['type'] | 'open' | 'close'>(
     type: T,
     fn: T extends ServerMsg['type'] ? Handler<T> : () => void,
@@ -106,11 +102,6 @@ export class Net {
       return true;
     }
     return false;
-  }
-
-  /** bytes queued in the send buffer (CCTV frame back-pressure) */
-  buffered(): number {
-    return this.ws?.bufferedAmount ?? 0;
   }
 
   connect(): void {
@@ -218,6 +209,9 @@ export class Net {
         break;
       case 'contact-sheet':
         this.contactSheet = msg.sheet;
+        break;
+      case 'dev':
+        this.lastDev = msg;
         break;
     }
     this.emit(msg.type, msg);

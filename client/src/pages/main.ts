@@ -1,107 +1,73 @@
 /**
- * /main — Mac + projector + external wide-angle camera (v2 Archival Edition)
- * - 30-second camera recording stays strictly local (MediaRecorder → Blob URL replay) and is never uploaded.
- * - Only the monochrome freeze frame at 30s is uploaded to ./data/archive/roll-XX/.
- * - REPLAY_TRUTH plays back in complete system silence with neutral 300–3200 Hz filtered visitor audioClips and a corner archival timecode.
+ * /main — Mac + projector + wide-angle USB camera (v3 Live Darkroom Engine)
+ * - 100% live optical photogram synthesis: zero pre-recorded video files, zero fake film borders/sprockets.
+ * - ENTER_BUFFER: deep safelight red + large countdown
+ * - SAFELIGHT_COMPOSE: pure #9A0A0A safelight + corner SAFELIGHT · COMPOSE + remaining sec
+ * - EXPOSURE: bright warm enlarger beam #F6F2E8 + 1 Hz mechanical timer + 18 FPS dual-buffer sampling
+ * - DEVELOPING: chemical bath sound + live developing print driven by server devProgress
+ * - FIXED_REVEAL: crisp shutter + 120ms gentle flash, silence, frozen frame, clean borderless JPEG upload + last 4s EXIT NORTH ↑
  */
 import { Net, mountNetDot } from '../lib/net';
-import { audioCtx, enlargerTimer, out, rewindSfx, setAudioSink, shutter, stopAllLoops, unlockAudio } from '../lib/sfx';
-import { assetAvailable, dataURLToArrayBuffer, drawReferencePlate, filmFilter, pickVideoMime } from '../lib/media';
-import { cropMarks, filmStrip, keepAwake, requestFullscreen, withTimeout } from '../lib/unlock';
+import {
+  audioCtx,
+  devBathAudio,
+  enlargerTimer,
+  relayClick,
+  safelightClick,
+  setAudioSink,
+  shutter,
+  stopAllLoops,
+  unlockAudio,
+} from '../lib/sfx';
+import {
+  DarkroomEngine,
+  drawExposureBeam,
+  drawIdleDarkroom,
+  drawSafelightField,
+  setupCanvas,
+} from '../lib/darkroom';
+import { keepAwake, requestFullscreen, withTimeout } from '../lib/unlock';
 import { TITLE_EN } from '../lib/brand';
-import { clear, drawIdle, drawNoRecording, drawRewind, drawSimFilm, preloadCanvasFonts, setupCanvas } from '../lib/film';
-import type { AudioClip, Phase } from '../../../shared/protocol';
+import type { Phase, PrintMode } from '../../../shared/protocol';
 
 const LS_CAM = 'ruhua.main.camera';
 const LS_SINK = 'ruhua.main.sink';
-
-type SinkEl = HTMLMediaElement & { setSinkId?: (id: string) => Promise<void> };
+const SAMPLE_INTERVAL_MS = 55; // ~18 FPS live exposure sampling
 
 function pad2(n: number): string {
   return String(Math.max(0, Math.floor(n))).padStart(2, '0');
 }
 
-function waxCircleSvg(): string {
-  return `<svg class="cctv-wax" viewBox="0 0 200 130" preserveAspectRatio="none" aria-hidden="true">
-    <path d="M 16,65 C 14,22 58,8 104,9 C 154,10 188,27 187,66 C 186,104 148,121 97,120 C 46,119 14,101 21,57"
-      fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" />
-  </svg>`;
-}
-
 export default async function mainPage(app: HTMLElement): Promise<void> {
-  document.title = `Main projector · ${TITLE_EN}`;
+  document.title = `Enlarger Projector · ${TITLE_EN}`;
   app.innerHTML = `
     <canvas class="layer" id="fx"></canvas>
-    <video class="layer hidden" id="base" playsinline preload="auto"></video>
-    <video class="layer hidden" id="rewind" playsinline preload="auto"></video>
-    <video class="layer hidden" id="replay" playsinline muted></video>
-    <div class="countdown hidden" id="countdownBox">
-      <div class="k"><span>PREPARE EXPOSURE</span><span class="meta" id="prepMeta">ROLL 01 · FR 01A</span></div>
-      <div class="n" id="countdown"></div>
-    </div>
-    <div class="replay-hud hidden" id="replayHud"></div>
-    <div class="cctv hidden" id="cctv">
-      <div class="rule"><span><b>RH-30</b> · ARCHIVAL CONTACT PROOF · <span id="cctvRoll">ROLL 01</span></span><span id="cctvClock">--:--:--</span></div>
-      <div class="pane left">
-        <div class="neg">
-          ${filmStrip(29)}
-          <div class="frame"><img id="freezeImg" alt="" />${waxCircleSvg()}</div>
-          ${filmStrip(30)}
-        </div>
-        <div class="cap"><span class="no" id="frameNo">FRAME 01A</span><span class="t">ADDED TO ENTRANCE CONTACT SHEET</span></div>
-      </div>
-      <div class="pane right">
-        <div class="frame">
-          <img id="cctvImg" class="hidden" alt="" />
-          <div class="nosignal hidden" id="nosig">ENTRANCE MONITOR · STANDBY</div>
-          <div class="osd"><span>MON-01</span><span class="live">ENTRANCE</span></div>
-        </div>
-        <div class="cap"><span class="no">MON-01</span><span class="t">Entrance live monitor · next group</span></div>
-      </div>
-      <div class="exit"><span>EXIT NORTH</span><span class="arr">↑</span></div>
-    </div>
+    <div class="main-countdown hidden" id="countdownBox"><span id="countdown">5</span></div>
+    <div class="main-corner hidden" id="safelightHud">SAFELIGHT · COMPOSE · <span id="safelightSec">5</span>S</div>
+    <div class="main-corner hidden" id="revealHud"></div>
+    <div class="main-exit" id="exitSign">EXIT NORTH ↑</div>
     <div class="flash" id="flash"></div>
     <video id="cam" class="hidden" muted playsinline autoplay></video>`;
 
   const $ = <T extends HTMLElement>(s: string) => app.querySelector(s) as T;
   const fx = $<HTMLCanvasElement>('#fx');
   const g = setupCanvas(fx);
-  preloadCanvasFonts();
-  const baseV = $<HTMLVideoElement>('#base');
-  const rewindV = $<HTMLVideoElement>('#rewind');
-  const replayV = $<HTMLVideoElement>('#replay');
-  const countdown = $<HTMLDivElement>('#countdown');
   const countdownBox = $<HTMLDivElement>('#countdownBox');
-  const prepMeta = $<HTMLSpanElement>('#prepMeta');
-  const replayHud = $<HTMLDivElement>('#replayHud');
-  const frameNo = $<HTMLSpanElement>('#frameNo');
-  const cctvRoll = $<HTMLSpanElement>('#cctvRoll');
-  const cctvClock = $<HTMLSpanElement>('#cctvClock');
-  const cctv = $<HTMLDivElement>('#cctv');
-  const freezeImg = $<HTMLImageElement>('#freezeImg');
-  const cctvImg = $<HTMLImageElement>('#cctvImg');
-  const nosig = $<HTMLDivElement>('#nosig');
+  const countdown = $<HTMLSpanElement>('#countdown');
+  const safelightHud = $<HTMLDivElement>('#safelightHud');
+  const safelightSecEl = $<HTMLSpanElement>('#safelightSec');
+  const revealHud = $<HTMLDivElement>('#revealHud');
+  const exitSign = $<HTMLDivElement>('#exitSign');
   const flashEl = $<HTMLDivElement>('#flash');
   const camV = $<HTMLVideoElement>('#cam');
 
+  const engine = new DarkroomEngine();
   const net = new Net('main');
   (window as any).__net = net;
   mountNetDot(net);
 
   // ====================================================================
-  // asset probe (re-HEAD on every return to IDLE so files can be hot-swapped)
-  // ====================================================================
-  const assets = { base: false, rewind: false };
-  async function checkAssets(): Promise<void> {
-    const [b, r] = await Promise.all([assetAvailable('/assets/base.mp4'), assetAvailable('/assets/rewind.mp4')]);
-    assets.base = b;
-    assets.rewind = r;
-    updateAssetInfo?.();
-  }
-  let updateAssetInfo: (() => void) | null = null;
-
-  // ====================================================================
-  // camera
+  // camera & audio sink
   // ====================================================================
   let camStream: MediaStream | null = null;
   let camId = localStorage.getItem(LS_CAM) || '';
@@ -138,349 +104,137 @@ export default async function mainPage(app: HTMLElement): Promise<void> {
   }
 
   // ====================================================================
-  // local recording (never uploaded)
+  // gentle flash
   // ====================================================================
-  let recorder: MediaRecorder | null = null;
-  let recChunks: Blob[] = [];
-  let recRound = -1;
-  let replayUrl: string | null = null;
-  let replayRound = -1;
-
-  function startRecording(roundId: number): void {
-    if (recorder || !camLive()) return;
-    const mime = pickVideoMime();
-    try {
-      recorder = new MediaRecorder(camStream!, mime ? { mimeType: mime, videoBitsPerSecond: 5_000_000 } : undefined);
-    } catch {
-      recorder = new MediaRecorder(camStream!);
-    }
-    recChunks = [];
-    recRound = roundId;
-    recorder.ondataavailable = (e) => e.data && e.data.size && recChunks.push(e.data);
-    recorder.start(1000);
-  }
-
-  function stopRecording(keep: boolean): Promise<void> {
-    return new Promise((resolve) => {
-      const r = recorder;
-      if (!r) return resolve();
-      recorder = null;
-      r.onstop = () => {
-        if (keep && recChunks.length) {
-          if (replayUrl) URL.revokeObjectURL(replayUrl);
-          replayUrl = URL.createObjectURL(new Blob(recChunks, { type: r.mimeType || 'video/webm' }));
-          replayRound = recRound;
-        }
-        recChunks = [];
-        resolve();
-      };
-      try {
-        r.stop();
-      } catch {
-        resolve();
-      }
-    });
-  }
-
-  // ====================================================================
-  // multi-clip visitor voices: neutral laboratory intercom bandpass (300–3200 Hz)
-  // ====================================================================
-  interface DecodedClip {
-    key: string;
-    roundId: number;
-    offsetMs: number;
-    buffer: AudioBuffer | null;
-    el: HTMLAudioElement | null;
-    played: boolean;
-  }
-
-  let clipsRoundId = -1;
-  let clips: DecodedClip[] = [];
-  let clipTimers: number[] = [];
-  let activeSources: AudioScheduledSourceNode[] = [];
-
-  /** Clean, intelligible laboratory intercom passband (300 Hz – 3200 Hz, minimal coloration) */
-  function intercomChain(): AudioNode {
-    const c = audioCtx();
-    const hp = c.createBiquadFilter();
-    hp.type = 'highpass';
-    hp.frequency.value = 300;
-    hp.Q.value = 0.707;
-    const lp = c.createBiquadFilter();
-    lp.type = 'lowpass';
-    lp.frequency.value = 3200;
-    lp.Q.value = 0.707;
-    const comp = c.createDynamicsCompressor();
-    comp.threshold.value = -18;
-    comp.knee.value = 12;
-    comp.ratio.value = 3;
-    comp.attack.value = 0.005;
-    comp.release.value = 0.15;
-    const gain = c.createGain();
-    gain.gain.value = 1.65;
-    hp.connect(lp).connect(comp).connect(gain).connect(out());
-    return hp;
-  }
-
-  async function ingestClip(clip: AudioClip, roundId: number, idxHint: number): Promise<void> {
-    if (clipsRoundId !== roundId) {
-      stopVoices();
-      clipsRoundId = roundId;
-      clips = [];
-    }
-    const key = `${roundId}:${clip.offsetMs}:${idxHint}`;
-    if (clips.some((c) => c.key === key)) return;
-    const entry: DecodedClip = {
-      key,
-      roundId,
-      offsetMs: clip.offsetMs,
-      buffer: null,
-      el: null,
-      played: false,
-    };
-    clips.push(entry);
-    try {
-      entry.buffer = await audioCtx().decodeAudioData(dataURLToArrayBuffer(clip.dataUrl));
-    } catch {
-      const el = new Audio();
-      el.src = clip.dataUrl;
-      el.preload = 'auto';
-      entry.el = el;
-    }
-    if (net.phase === 'REPLAY_TRUTH' && net.round?.id === roundId) {
-      scheduleClip(entry);
-    }
-  }
-
-  net.on('audio', (m) => {
-    void ingestClip(m.clip, m.roundId, m.index);
-  });
-
-  net.on('audio-sync', (m) => {
-    m.clips.forEach((c, i) => void ingestClip(c, m.roundId, i));
-  });
-
-  function scheduleClip(entry: DecodedClip): void {
-    const st = net.state;
-    if (!st || st.state !== 'REPLAY_TRUTH' || entry.roundId !== st.round.id || entry.played) return;
-    const startAtLocal = net.toLocal(st.phaseStartedAt + entry.offsetMs);
-    const delayMs = startAtLocal - Date.now();
-    const play = (skipSec: number) => {
-      if (net.phase !== 'REPLAY_TRUTH' || entry.played) return;
-      entry.played = true;
-      const c = audioCtx();
-      const input = intercomChain();
-      if (entry.buffer) {
-        if (skipSec >= entry.buffer.duration) return;
-        const s = c.createBufferSource();
-        s.buffer = entry.buffer;
-        s.connect(input);
-        s.start(c.currentTime + 0.01, Math.max(0, skipSec));
-        activeSources.push(s);
-      } else if (entry.el) {
-        try {
-          c.createMediaElementSource(entry.el).connect(input);
-        } catch {
-          /* already connected */
-        }
-        entry.el.currentTime = Math.max(0, skipSec);
-        entry.el.play().catch(() => {});
-      }
-    };
-    if (delayMs > 0) {
-      const tid = window.setTimeout(() => play(0), delayMs);
-      clipTimers.push(tid);
-    } else {
-      play(-delayMs / 1000);
-    }
-  }
-
-  function scheduleAllVoices(): void {
-    const st = net.state;
-    if (!st) return;
-    for (const entry of clips) {
-      if (entry.roundId === st.round.id && !entry.played) scheduleClip(entry);
-    }
-  }
-
-  function stopVoices(): void {
-    for (const tid of clipTimers) clearTimeout(tid);
-    clipTimers = [];
-    for (const s of activeSources) {
-      try {
-        s.stop();
-      } catch {
-        /* ignore */
-      }
-    }
-    activeSources = [];
-    for (const entry of clips) {
-      entry.el?.pause();
-    }
-  }
-
-  // ====================================================================
-  // flash / freeze
-  // ====================================================================
-  function flash(ms = 200): void {
+  function flash(ms = 120, peakOpacity = 0.45): void {
+    flashEl.style.opacity = String(peakOpacity);
     flashEl.classList.add('on');
+    window.setTimeout(() => {
+      flashEl.classList.remove('on');
+      flashEl.style.opacity = '';
+    }, ms);
+  }
+  net.on('flash', () => {
     shutter();
-    window.setTimeout(() => flashEl.classList.remove('on'), ms);
-  }
-  net.on('flash', () => flash(200));
+    flash(150, 0.85);
+  });
 
-  let freezeDataUrl: string | null = null;
-  let freezeRound = -1;
-  function captureFreeze(roundId: number, rollNumber: number, frameNumber: number): void {
-    if (freezeRound === roundId) return;
-    freezeRound = roundId;
-    let src: CanvasImageSource;
-    if (camLive() && camV.videoWidth > 0) {
-      src = camV;
-    } else {
-      drawSimFilm(g, 30, rollNumber, frameNumber);
-      src = fx;
+  // ====================================================================
+  // exposure sampler & developing state
+  // ====================================================================
+  let sampleTimer: number | null = null;
+  let liveDevProgress = 0;
+  let frozenDevProgress = 0;
+  let activePrintMode: PrintMode = 'photogram_negative';
+  let freezeUploadedRound = -1;
+
+  function stopSampler(): void {
+    if (sampleTimer !== null) {
+      clearInterval(sampleTimer);
+      sampleTimer = null;
     }
-    const c = filmFilter(src, 1280);
-    freezeDataUrl = c.toDataURL('image/jpeg', 0.8);
-    net.send({ type: 'freeze', data: freezeDataUrl });
   }
+
+  function startSampler(): void {
+    stopSampler();
+    engine.beginExposure();
+    const sampleOnce = () => {
+      if (net.phase !== 'EXPOSURE') return stopSampler();
+      const totalSec = net.config?.exposureSec ?? 15;
+      const elapsedSec = net.storySec();
+      engine.sampleExposureFrame(camLive() ? camV : null, elapsedSec, totalSec);
+    };
+    sampleOnce();
+    sampleTimer = window.setInterval(sampleOnce, SAMPLE_INTERVAL_MS);
+  }
+
+  net.on('dev', (m) => {
+    liveDevProgress = m.devProgress;
+    if (net.phase === 'DEVELOPING') {
+      devBathAudio.update(liveDevProgress);
+    }
+  });
 
   // ====================================================================
   // phase changes
   // ====================================================================
   let curPhase: Phase | null = null;
   let curRound = -1;
-  let lastCctvAt = 0;
-  let cctvPhaseStart = 0;
-  let baseFailed = false;
-  let rewindFailed = false;
 
-  const hideAll = () => {
-    for (const el of [baseV, rewindV, replayV, countdownBox, replayHud, cctv]) el.classList.add('hidden');
-  };
-
-  function sinkAll(): void {
-    for (const el of [baseV, rewindV] as SinkEl[]) {
-      if (sinkId && typeof el.setSinkId === 'function') el.setSinkId(sinkId === 'default' ? '' : sinkId).catch(() => {});
-    }
-  }
-
-  function videoSrc(v: HTMLVideoElement, name: string): void {
-    v.src = `/assets/${name}?v=${Date.now()}`;
-    v.load();
+  function hideOverlays(): void {
+    countdownBox.classList.add('hidden');
+    safelightHud.classList.add('hidden');
+    revealHud.classList.add('hidden');
+    exitSign.classList.remove('show');
   }
 
   async function onPhase(phase: Phase, fresh: boolean): Promise<void> {
     const st = net.state!;
     const roundId = st.round.id;
-    const rollNo = st.round.rollNumber ?? net.config?.rollNumber ?? 1;
-    const frmNo = st.round.frameNumber ?? 1;
-    const elapsedSec = net.elapsedMs() / 1000;
-    hideAll();
+    activePrintMode = st.round.printMode ?? net.config?.printMode ?? 'photogram_negative';
+    hideOverlays();
+    stopSampler();
 
     switch (phase) {
       case 'IDLE':
         stopAllLoops();
-        stopVoices();
-        await stopRecording(false);
-        baseV.pause();
-        rewindV.pause();
-        replayV.pause();
-        void checkAssets();
         break;
 
       case 'ENTER_BUFFER':
         stopAllLoops();
-        stopVoices();
-        if (clipsRoundId !== roundId) {
-          clipsRoundId = roundId;
-          clips = [];
-        }
-        prepMeta.textContent = `ROLL ${pad2(rollNo)} · FR ${pad2(frmNo)}A`;
+        liveDevProgress = 0;
         countdownBox.classList.remove('hidden');
-        baseFailed = rewindFailed = false;
-        await Promise.all([ensureCamera(), checkAssets()]);
-        if (net.phase !== 'ENTER_BUFFER') break;
-        if (assets.base) {
-          videoSrc(baseV, 'base.mp4');
-          baseV.currentTime = 0;
-        }
+        await ensureCamera();
         break;
 
-      case 'ACTIVE_30S':
-        enlargerTimer.start(0.85, 0.3);
-        if (!camLive()) await ensureCamera();
-        startRecording(roundId);
-        if (assets.base && !baseFailed) {
-          if (!baseV.src) videoSrc(baseV, 'base.mp4');
-          baseV.classList.remove('hidden');
-          if (elapsedSec > 0.3) baseV.currentTime = elapsedSec;
-          baseV.play().catch(() => (baseFailed = true));
-        }
-        break;
-
-      case 'FLASH_FREEZE':
-        if (fresh && net.elapsedMs() < 600) flash(200);
+      case 'SAFELIGHT_COMPOSE':
         stopAllLoops();
-        baseV.pause();
-        captureFreeze(roundId, rollNo, frmNo);
-        await stopRecording(true);
-        if (assets.rewind) videoSrc(rewindV, 'rewind.mp4');
+        if (fresh) safelightClick();
+        safelightHud.classList.remove('hidden');
+        await ensureCamera();
         break;
 
-      case 'REWIND':
+      case 'EXPOSURE':
         stopAllLoops();
-        rewindSfx(Math.max(0.3, net.remainingMs() / 1000));
-        if (assets.rewind && !rewindFailed) {
-          if (!rewindV.src) videoSrc(rewindV, 'rewind.mp4');
-          rewindV.classList.remove('hidden');
-          if (elapsedSec > 0.3) rewindV.currentTime = elapsedSec;
-          rewindV.play().catch(() => (rewindFailed = true));
-        }
+        if (fresh) relayClick(true);
+        enlargerTimer.start(0.85, 0.1);
+        await ensureCamera();
+        if (net.phase === 'EXPOSURE') startSampler();
         break;
 
-      case 'REPLAY_TRUTH':
-        // Total system silence: zero metronome, zero score, zero moralizing text — only visitor audioClips
-        stopAllLoops();
-        rewindV.pause();
-        replayHud.classList.remove('hidden');
-        if (replayUrl && replayRound === roundId) {
-          replayV.src = replayUrl;
-          replayV.classList.remove('hidden');
-          try {
-            if (elapsedSec > 0.5) replayV.currentTime = elapsedSec;
-          } catch {
-            /* webm may not be seekable */
-          }
-          replayV.play().catch(() => {});
-        }
-        scheduleAllVoices();
+      case 'DEVELOPING':
+        enlargerTimer.stop();
+        if (fresh) relayClick(false);
+        engine.finalizeLatent();
+        liveDevProgress = st.round.devProgress ?? 0;
+        devBathAudio.start();
+        devBathAudio.update(liveDevProgress);
         break;
 
-      case 'CCTV_REVEAL':
+      case 'FIXED_REVEAL': {
         stopAllLoops();
-        stopVoices();
-        replayV.pause();
-        cctv.classList.remove('hidden');
-        cctvRoll.textContent = `ROLL ${pad2(rollNo)}`;
-        frameNo.textContent = `FRAME ${pad2(frmNo)}A`;
-        cctvPhaseStart = Date.now();
-        lastCctvAt = 0;
-        cctvImg.classList.add('hidden');
-        nosig.classList.add('hidden');
-        if (freezeDataUrl && freezeRound === roundId) freezeImg.src = freezeDataUrl;
-        else if (net.doorPhoto?.url) freezeImg.src = net.doorPhoto.url;
-        else {
-          const c = document.createElement('canvas');
-          drawReferencePlate(c);
-          freezeImg.src = c.toDataURL('image/jpeg', 0.8);
+        engine.finalizeLatent();
+        frozenDevProgress = st.round.finalDevProgress ?? st.round.devProgress ?? liveDevProgress;
+        if (fresh) {
+          shutter();
+          flash(120, 0.45);
         }
+        // Render & freeze exact final print and upload clean borderless JPEG
+        const jpegData = engine.exportCleanJpeg(frozenDevProgress, activePrintMode);
+        if (freezeUploadedRound !== roundId) {
+          freezeUploadedRound = roundId;
+          net.send({ type: 'freeze', data: jpegData });
+        }
+        const devPct = Math.round(frozenDevProgress * 100);
+        revealHud.textContent = `ROLL ${pad2(st.round.rollNumber)} · FR ${pad2(st.round.frameNumber)}A · DEV ${devPct}% · FIXED`;
+        revealHud.classList.remove('hidden');
         break;
+      }
     }
   }
 
   net.on('state', (m) => {
+    activePrintMode = m.round.printMode ?? net.config?.printMode ?? activePrintMode;
     const fresh = m.state !== curPhase || m.round.id !== curRound;
     if (!fresh) return;
     curPhase = m.state;
@@ -488,75 +242,50 @@ export default async function mainPage(app: HTMLElement): Promise<void> {
     void onPhase(m.state, true);
   });
 
-  net.on('cctv', (m) => {
-    if (net.phase !== 'CCTV_REVEAL') return;
-    cctvImg.src = m.data;
-    cctvImg.classList.remove('hidden');
-    lastCctvAt = Date.now();
-  });
-
   // ====================================================================
   // render loop
   // ====================================================================
-  let lastDrift = 0;
   function frame(): void {
     const phase = net.phase;
-    const t = net.storySec();
-    const st = net.state;
-    const rollNo = st?.round.rollNumber ?? net.config?.rollNumber ?? 1;
-    const frmNo = st?.round.frameNumber ?? 1;
-
     switch (phase) {
       case 'IDLE':
-        drawIdle(g, net.now(), rollNo);
+        drawIdleDarkroom(g, net.now());
         break;
+
       case 'ENTER_BUFFER': {
-        drawIdle(g, net.now(), rollNo);
+        drawIdleDarkroom(g, net.now());
         const remain = Math.max(1, Math.ceil(net.remainingMs() / 1000 / net.timeScale));
-        countdown.textContent = pad2(remain);
+        countdown.textContent = String(remain);
         break;
       }
-      case 'ACTIVE_30S':
-        if (!assets.base || baseFailed) {
-          drawSimFilm(g, t, rollNo, frmNo);
-        } else {
-          clear(g);
-          if (net.timeScale === 1 && performance.now() - lastDrift > 2000 && !baseV.paused) {
-            lastDrift = performance.now();
-            const want = net.elapsedMs() / 1000;
-            if (Math.abs(baseV.currentTime - want) > 0.25 && want < (baseV.duration || 30)) baseV.currentTime = want;
-          }
-        }
-        break;
-      case 'REWIND':
-        if (!assets.rewind || rewindFailed) drawRewind(g, net.elapsedMs() / Math.max(1, st?.phaseDurationMs || 3000), rollNo);
-        else clear(g);
-        break;
-      case 'REPLAY_TRUTH': {
-        if (!(replayUrl && replayRound === st?.round.id)) drawNoRecording(g);
-        else clear(g);
-        const tc = Math.min(30, Math.max(0, t)).toFixed(1).padStart(4, '0');
-        replayHud.textContent = `ARCHIVAL PLAYBACK · ROLL ${pad2(rollNo)} · FR ${pad2(frmNo)}A · 00:${tc}`;
+
+      case 'SAFELIGHT_COMPOSE': {
+        drawSafelightField(g);
+        const remain = Math.max(1, Math.ceil(net.remainingMs() / 1000 / net.timeScale));
+        safelightSecEl.textContent = String(remain);
         break;
       }
-      case 'CCTV_REVEAL': {
-        clear(g);
-        const now = Date.now();
-        const firstWait = Math.min(1200, (st?.phaseDurationMs || 8000) * 0.2);
-        const noFrames = lastCctvAt === 0 ? now - cctvPhaseStart > firstWait : now - lastCctvAt > 2000;
-        nosig.classList.toggle('hidden', !noFrames);
-        cctvClock.textContent = new Date(net.now()).toLocaleTimeString('en-GB', { hour12: false });
-        if (noFrames) cctvImg.classList.add('hidden');
+
+      case 'EXPOSURE':
+        drawExposureBeam(g);
+        break;
+
+      case 'DEVELOPING':
+        engine.renderPrint(g, g.canvas.width, g.canvas.height, liveDevProgress, activePrintMode, 0.93);
+        break;
+
+      case 'FIXED_REVEAL': {
+        engine.renderPrint(g, g.canvas.width, g.canvas.height, frozenDevProgress, activePrintMode, 1.0);
+        const remainStorySec = net.remainingMs() / 1000 / net.timeScale;
+        exitSign.classList.toggle('show', remainStorySec <= 4.0);
         break;
       }
-      default:
-        clear(g);
     }
     requestAnimationFrame(frame);
   }
 
   // ====================================================================
-  // setup panel
+  // setup panel (S reopens, F fullscreen)
   // ====================================================================
   await setupPanel();
   net.connect();
@@ -574,18 +303,20 @@ export default async function mainPage(app: HTMLElement): Promise<void> {
       el.className = 'setup';
       el.innerHTML = `
         <div class="ticket">
-          <div class="head"><h2><small>RUHUA FILM LAB · ARCHIVAL TICKET · PROJ /main</small>Main projector<br>setup</h2><span class="stamp double">Pre-flight</span></div>
-          <div class="fields">
-            <label><span class="no">01 / CAMERA</span>Choose the external USB wide-angle camera<select id="camSel"></select></label>
-            <label><span class="no">02 / AUDIO OUT</span>Audio output device<select id="sinkSel"></select></label>
-            <div class="assets" id="assetInfo"></div>
-            <div class="hint">While running: press S to reopen this panel, F for fullscreen.</div>
+          <div class="head">
+            <h2><small>RH-30 · LIVE ENLARGER · /main</small>Main projector setup</h2>
+            <span class="mono">S = SETUP · F = FULLSCREEN</span>
           </div>
           <div class="fields">
-            <div class="pv"><video id="pv" muted playsinline autoplay></video>${cropMarks()}<span class="mono">PREVIEW · CAM</span></div>
+            <label><span class="no">01 / CAMERA</span>External USB wide-angle camera<select id="camSel"></select></label>
+            <label><span class="no">02 / AUDIO OUT</span>Audio output device<select id="sinkSel"></select></label>
+            <div class="hint" id="camHint">Camera stream stays strictly local for live photogram accumulation.</div>
+          </div>
+          <div class="fields">
+            <div class="pv"><video id="pv" muted playsinline autoplay></video><span class="mono">LIVE CAMERA PREVIEW</span></div>
             <div class="row">
               <button id="refresh" type="button">Refresh devices</button>
-              <button class="primary" id="go" type="button">Unlock audio/video &amp; go fullscreen</button>
+              <button class="primary" id="go" type="button">UNLOCK &amp; GO FULLSCREEN</button>
             </div>
           </div>
         </div>`;
@@ -593,13 +324,7 @@ export default async function mainPage(app: HTMLElement): Promise<void> {
       const camSel = el.querySelector('#camSel') as HTMLSelectElement;
       const sinkSel = el.querySelector('#sinkSel') as HTMLSelectElement;
       const pv = el.querySelector('#pv') as HTMLVideoElement;
-      const info = el.querySelector('#assetInfo') as HTMLDivElement;
-      updateAssetInfo = () => {
-        info.innerHTML =
-          `<b>base.mp4</b> ··· ${assets.base ? '<span class="ok">FOUND</span>' : '<span class="warn">STANDBY → architectural daylight plate</span>'}<br>` +
-          `<b>rewind.mp4</b> ··· ${assets.rewind ? '<span class="ok">FOUND</span>' : '<span class="warn">STANDBY → motorized transport</span>'}`;
-      };
-      void checkAssets();
+      const hint = el.querySelector('#camHint') as HTMLDivElement;
 
       async function fill(): Promise<void> {
         try {
@@ -617,7 +342,7 @@ export default async function mainPage(app: HTMLElement): Promise<void> {
             o.textContent = d.label || `Camera ${i + 1}`;
             camSel.appendChild(o);
           });
-          if (!cams.length) camSel.innerHTML = '<option value="">(no camera detected)</option>';
+          if (!cams.length) camSel.innerHTML = '<option value="">(no camera detected — procedural simulation active)</option>';
           const saved = cams.find((d) => d.deviceId === camId);
           const external = cams.find((d) => !/facetime|built-?in|integrated|\u5185\u5efa/i.test(d.label));
           camSel.value = (saved || external || cams[0])?.deviceId || '';
@@ -626,7 +351,7 @@ export default async function mainPage(app: HTMLElement): Promise<void> {
           sinkSel.innerHTML = '';
           const canSink = typeof (audioCtx() as any).setSinkId === 'function' || 'setSinkId' in HTMLMediaElement.prototype;
           if (!canSink || !sinks.length) {
-            sinkSel.innerHTML = '<option value="">System default output (this browser cannot choose an output)</option>';
+            sinkSel.innerHTML = '<option value="">System default output</option>';
           } else {
             sinks.forEach((d, i) => {
               const o = document.createElement('option');
@@ -638,7 +363,7 @@ export default async function mainPage(app: HTMLElement): Promise<void> {
           }
           await preview();
         } catch (err) {
-          info.innerHTML += `<br>Device enumeration failed: ${(err as Error).message} (HTTPS required)`;
+          hint.textContent = `Device enumeration failed: ${(err as Error).message} (HTTPS required)`;
         }
       }
 
@@ -661,16 +386,9 @@ export default async function mainPage(app: HTMLElement): Promise<void> {
         localStorage.setItem(LS_SINK, sinkId);
         await Promise.allSettled([withTimeout(fsP), withTimeout(auP)]);
         if (sinkId) await withTimeout(setAudioSink(sinkId));
-        sinkAll();
-        for (const v of [baseV, rewindV, replayV]) {
-          v.muted = v === replayV;
-          v.play().catch(() => {});
-          v.pause();
-        }
         if (!camLive()) await withTimeout(openCamera(camId), 1500);
         pv.srcObject = null;
         el.remove();
-        updateAssetInfo = null;
         resolve();
       });
       void fill();

@@ -3,14 +3,12 @@ import fsp from 'node:fs/promises';
 import path from 'node:path';
 import {
   AppConfig,
-  CCTV_REVEAL_MAX,
-  CCTV_REVEAL_MIN,
+  CONFIG_BOUNDS,
   ContactFrame,
   ContactSheetInfo,
   DEFAULT_CONFIG,
   DoorPhotoInfo,
-  ENTER_BUFFER_MAX,
-  ENTER_BUFFER_MIN,
+  PrintMode,
 } from '../shared/protocol.js';
 
 export const ROOT_DIR = process.cwd();
@@ -42,15 +40,53 @@ export function rollDirPath(rollNumber: number): string {
   return path.join(ARCHIVE_DIR, rollDirName(rollNumber));
 }
 
+function round1(n: number): number {
+  return Math.round(n * 10) / 10;
+}
+
+function round3(n: number): number {
+  return Math.round(n * 1000) / 1000;
+}
+
 export function sanitizeConfig(input: Partial<AppConfig> | undefined, base: AppConfig): AppConfig {
   const src = input || {};
-  const enterBufferSec =
-    Math.round(clamp(src.enterBufferSec ?? base.enterBufferSec, ENTER_BUFFER_MIN, ENTER_BUFFER_MAX, base.enterBufferSec) * 10) / 10;
-  const cctvRevealSec =
-    Math.round(clamp(src.cctvRevealSec ?? base.cctvRevealSec, CCTV_REVEAL_MIN, CCTV_REVEAL_MAX, base.cctvRevealSec) * 10) / 10;
+  const enterBufferSec = round1(
+    clamp(src.enterBufferSec ?? base.enterBufferSec, CONFIG_BOUNDS.enterBufferSec.min, CONFIG_BOUNDS.enterBufferSec.max, base.enterBufferSec),
+  );
+  const safelightSec = round1(
+    clamp(src.safelightSec ?? base.safelightSec, CONFIG_BOUNDS.safelightSec.min, CONFIG_BOUNDS.safelightSec.max, base.safelightSec),
+  );
+  const exposureSec = round1(
+    clamp(src.exposureSec ?? base.exposureSec, CONFIG_BOUNDS.exposureSec.min, CONFIG_BOUNDS.exposureSec.max, base.exposureSec),
+  );
+  const maxDevelopSec = round1(
+    clamp(src.maxDevelopSec ?? base.maxDevelopSec, CONFIG_BOUNDS.maxDevelopSec.min, CONFIG_BOUNDS.maxDevelopSec.max, base.maxDevelopSec),
+  );
+  const revealSec = round1(
+    clamp(src.revealSec ?? base.revealSec, CONFIG_BOUNDS.revealSec.min, CONFIG_BOUNDS.revealSec.max, base.revealSec),
+  );
+  const noiseFloor = round3(
+    clamp(src.noiseFloor ?? base.noiseFloor, CONFIG_BOUNDS.noiseFloor.min, CONFIG_BOUNDS.noiseFloor.max, base.noiseFloor),
+  );
+  const devSpeed = round3(
+    clamp(src.devSpeed ?? base.devSpeed, CONFIG_BOUNDS.devSpeed.min, CONFIG_BOUNDS.devSpeed.max, base.devSpeed),
+  );
+  const printMode: PrintMode =
+    src.printMode === 'positive_print' || src.printMode === 'photogram_negative' ? src.printMode : base.printMode;
   const rollRaw = typeof src.rollNumber === 'number' ? src.rollNumber : Number(src.rollNumber);
   const rollNumber = Number.isFinite(rollRaw) && rollRaw >= 1 ? Math.floor(rollRaw) : Math.max(1, Math.floor(base.rollNumber || 1));
-  return { enterBufferSec, cctvRevealSec, rollNumber };
+
+  return {
+    enterBufferSec,
+    safelightSec,
+    exposureSec,
+    maxDevelopSec,
+    revealSec,
+    noiseFloor,
+    devSpeed,
+    printMode,
+    rollNumber,
+  };
 }
 
 /** 扫描磁盘上已有的最大卷号，避免 config 缺失时覆盖已有卷目录 */
@@ -171,18 +207,19 @@ export async function getContactSheet(rollNumber: number): Promise<ContactSheetI
       /* ignore */
     }
   }
-  // 按文件名时间戳（及 mtime）升序，保证 01A → 02A → 03A 稳定生长
   raw.sort((a, b) => a.name.localeCompare(b.name) || a.mtime - b.mtime);
   const frames: ContactFrame[] = raw.map((it, idx) => {
     const index = idx + 1;
-    const m = /-f(\d+)/i.exec(it.name);
-    const num = m ? Number(m[1]) || index : index;
+    const fm = /-f(\d+)/i.exec(it.name);
+    const dm = /-d(\d+)/i.exec(it.name);
+    const num = fm ? Number(fm[1]) || index : index;
     return {
       frameNo: `${pad(num, 2)}A`,
       index,
       url: `/data/archive/${rFolder}/${encodeURIComponent(it.name)}`,
       timestamp: it.mtime,
       name: `${rFolder}/${it.name}`,
+      devPercent: dm ? Number(dm[1]) : undefined,
     };
   });
   return {
@@ -197,11 +234,13 @@ export async function saveFreeze(
   rollNumber: number,
   frameNumber: number,
   roundId: number,
+  devPercent = 0,
 ): Promise<{ photo: DoorPhotoInfo; archiveName: string; sheet: ContactSheetInfo }> {
   const rFolder = rollDirName(rollNumber);
   const dir = path.join(ARCHIVE_DIR, rFolder);
   await fsp.mkdir(dir, { recursive: true });
-  const fileName = `${timeStamp()}-f${pad(frameNumber, 2)}-r${roundId}.jpg`;
+  const dp = Math.max(0, Math.round(devPercent));
+  const fileName = `${timeStamp()}-f${pad(frameNumber, 2)}-d${dp}-r${roundId}.jpg`;
   await fsp.writeFile(path.join(dir, fileName), buf);
   const tmp = tmpName(DOOR_FILE);
   await fsp.writeFile(tmp, buf);
@@ -225,6 +264,7 @@ export interface ArchiveItem {
   name: string;
   roll: number | null;
   frameNo: string | null;
+  devPercent: number | null;
   url: string;
   size: number;
   mtime: number;
@@ -257,10 +297,12 @@ export async function listArchive(date: string | null, all: boolean, rollFilter?
         try {
           const st = await fsp.stat(path.join(ARCHIVE_DIR, entry.name, name));
           const fm = /-f(\d+)/i.exec(name);
+          const dm = /-d(\d+)/i.exec(name);
           items.push({
             name: `${entry.name}/${name}`,
             roll: rollNo,
             frameNo: fm ? `${pad(Number(fm[1]), 2)}A` : null,
+            devPercent: dm ? Number(dm[1]) : null,
             url: `/data/archive/${encodeURIComponent(entry.name)}/${encodeURIComponent(name)}`,
             size: st.size,
             mtime: Math.floor(st.mtimeMs),
@@ -278,6 +320,7 @@ export async function listArchive(date: string | null, all: boolean, rollFilter?
           name,
           roll: null,
           frameNo: null,
+          devPercent: null,
           url: `/data/archive/${encodeURIComponent(name)}`,
           size: st.size,
           mtime: Math.floor(st.mtimeMs),

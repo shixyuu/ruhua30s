@@ -1,79 +1,73 @@
 /**
- * 《入画三十秒 (RH-30)》v2 — 暗房档案与集体顺从版 前后端共享协议。
- * 服务端是唯一真相源：所有终端根据 state 包里的 serverTime / phaseStartedAt 校准本地时钟。
+ * 《入画三十秒 (RH-30)》v3 — 纯现场活体暗房引擎（Zero Pre-recorded Media）前后端共享协议。
+ * 服务端是唯一真相源：所有终端根据 state / dev 包里的 serverTime / phaseStartedAt 校准本地时钟。
  */
 
 export type Phase =
   | 'IDLE'
   | 'ENTER_BUFFER'
-  | 'ACTIVE_30S'
-  | 'FLASH_FREEZE'
-  | 'REWIND'
-  | 'REPLAY_TRUTH'
-  | 'CCTV_REVEAL';
+  | 'SAFELIGHT_COMPOSE'
+  | 'EXPOSURE'
+  | 'DEVELOPING'
+  | 'FIXED_REVEAL';
+
+export type PrintMode = 'photogram_negative' | 'positive_print';
 
 export type Role = 'main' | 'door' | 'station1' | 'station2' | 'admin';
 
 export const ROLES: Role[] = ['main', 'door', 'station1', 'station2', 'admin'];
 
-/** 固定阶段“剧情时长”（秒）。ENTER_BUFFER 与 CCTV_REVEAL 由 AppConfig 动态决定。 */
-export const PHASE_SECONDS: Record<Exclude<Phase, 'IDLE' | 'ENTER_BUFFER' | 'CCTV_REVEAL'>, number> = {
-  ACTIVE_30S: 30,
-  FLASH_FREEZE: 2.5,
-  REWIND: 3,
-  REPLAY_TRUTH: 30,
-};
-
-/** ACTIVE_30S 内的多人并行档案校准时间窗（秒） */
-export const TIMELINE = {
-  station1P1: [4, 16] as const, // Protocol 01 · Vocal Calibration（多段发声校准）
-  station1P2: [16, 25] as const, // Protocol 02 · Optical Dodging Assist（维持遮挡提示）
-  station1Wait: [25, 30] as const, // 等待西北侧定影
-  station2P2: [8, 21] as const, // Protocol 02 · Optical Dodging（提前唤醒引导群体挡光）
-  station2P3: [21, 30] as const, // Protocol 03 · Fixation（阻尼推杆终止显影）
-  breakerSpoilerGuard: 28.5, // 早于此时间拉到底 → 锁定 FIXING EXPOSURE...
-  breakerDelayedFlash: 29.5, // 锁定后在此时刻触发全局定格
-  maxAudioClips: 4, // 每轮最多录制段数
-  maxClipDurationSec: 6, // 单段最长秒数
-};
-
 export interface AppConfig {
-  /** 入场缓冲秒数（2~10，默认 6） */
+  /** 入场缓冲秒数（2–10，默认 5） */
   enterBufferSec: number;
-  /** CCTV 揭晓秒数（4~15，默认 8） */
-  cctvRevealSec: number;
+  /** 安全红光构图秒数（0–10，默认 5；设为 0 时直接跳过进入 EXPOSURE） */
+  safelightSec: number;
+  /** 放大机白光曝光秒数（8–30，默认 15） */
+  exposureSec: number;
+  /** 最长声控显影秒数（15–45，默认 25） */
+  maxDevelopSec: number;
+  /** 定影后画面展示秒数（6–25，默认 12） */
+  revealSec: number;
+  /** 抗环境底噪阈值（0.00–0.50，默认 0.08） */
+  noiseFloor: number;
+  /** 满能量时每秒显影增量（0.03–0.80，默认 0.18） */
+  devSpeed: number;
+  /** 显影光学模式：classic photogram_negative 或 positive_print */
+  printMode: PrintMode;
   /** 当前胶卷编号（从 1 开始，NEW ROLL 时递增，历史照片按卷归档保留） */
   rollNumber: number;
 }
 
-export const ENTER_BUFFER_MIN = 2;
-export const ENTER_BUFFER_MAX = 10;
-export const CCTV_REVEAL_MIN = 4;
-export const CCTV_REVEAL_MAX = 15;
+export const CONFIG_BOUNDS = {
+  enterBufferSec: { min: 2, max: 10 },
+  safelightSec: { min: 0, max: 10 },
+  exposureSec: { min: 8, max: 30 },
+  maxDevelopSec: { min: 15, max: 45 },
+  revealSec: { min: 6, max: 25 },
+  noiseFloor: { min: 0.0, max: 0.5 },
+  devSpeed: { min: 0.03, max: 0.8 },
+} as const;
 
 export const DEFAULT_CONFIG: AppConfig = {
-  enterBufferSec: 6,
-  cctvRevealSec: 8,
+  enterBufferSec: 5,
+  safelightSec: 5,
+  exposureSec: 15,
+  maxDevelopSec: 25,
+  revealSec: 12,
+  noiseFloor: 0.08,
+  devSpeed: 0.18,
+  printMode: 'photogram_negative',
   rollNumber: 1,
 };
-
-export interface AudioClip {
-  mime: string;
-  dataUrl: string;
-  offsetMs: number;
-}
 
 export interface RoundInfo {
   id: number;
   rollNumber: number;
   frameNumber: number; // 当前卷内的底片序号（1 → 01A）
-  activeStartedAt: number | null;
-  didSpeak: boolean;
-  audioClipCount: number;
-  audioOffsetsMs: number[];
-  didPullBreaker: boolean;
-  breakerPulledAtSec: number | null;
-  breakerLocked: boolean;
+  printMode: PrintMode;
+  devProgress: number; // 初始 0.0，无上限，可超过 1.5
+  finalDevProgress: number | null; // 进入 FIXED_REVEAL 时锁死
+  fixTriggeredBy: 'station2' | 'timeout' | 'admin' | null;
   hasFreeze: boolean;
   trigger: string | null;
 }
@@ -90,6 +84,7 @@ export interface ContactFrame {
   url: string;
   timestamp: number;
   name: string;
+  devPercent?: number;
 }
 
 export interface ContactSheetInfo {
@@ -117,30 +112,32 @@ export type ServerMsg =
       round: RoundInfo;
       doorPhoto: DoorPhotoInfo;
     }
+  | {
+      type: 'dev';
+      devProgress: number;
+      audioLevel: number;
+      effLevel: number;
+      serverTime: number;
+    }
   | { type: 'time'; clientTime: number; serverTime: number }
   | { type: 'config'; config: AppConfig }
   | { type: 'door-photo'; photo: DoorPhotoInfo; serverTime: number }
   | { type: 'contact-sheet'; sheet: ContactSheetInfo; serverTime: number }
   | { type: 'flash'; serverTime: number } // 测试闪白（仅发往 /main）
-  | { type: 'audio'; clip: AudioClip; index: number; roundId: number }
-  | { type: 'audio-sync'; clips: AudioClip[]; roundId: number }
-  | { type: 'cctv'; data: string; serverTime: number }
   | { type: 'clients'; clients: ClientStatus[]; serverTime: number }
-  | { type: 'breaker'; status: 'locked' | 'flash'; atSec: number }
   | { type: 'ack'; what: string; ok: boolean; message?: string }
   | { type: 'error'; message: string };
 
 // ---------------- 客户端 → 服务端 ----------------
 /** 状态机只能由 admin 端发送 START_SESSION 启动 */
-export type AdminAction = 'reset' | 'skipPhase' | 'newRoll' | 'resetDoor' | 'testFlash' | 'setConfig';
+export type AdminAction = 'reset' | 'skipPhase' | 'newRoll' | 'resetDoor' | 'testFlash' | 'testDevelop' | 'setConfig';
 
 export type ClientMsg =
   | { type: 'hello'; role: Role; token?: string }
   | { type: 'time'; clientTime: number }
   | { type: 'hb' }
   | { type: 'START_SESSION'; token?: string }
-  | { type: 'speak'; mime: string; dataUrl: string; offsetMs: number }
-  | { type: 'breaker' }
+  | { type: 'AUDIO_ENERGY'; level: number }
+  | { type: 'TRIGGER_FIX' }
   | { type: 'freeze'; data: string }
-  | { type: 'cctv'; data: string }
   | { type: 'admin'; action: AdminAction; config?: Partial<AppConfig>; token?: string };

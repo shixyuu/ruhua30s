@@ -1,10 +1,10 @@
 /**
- * Minimalist darkroom Web Audio soundscape (v2):
- *  - ACTIVE_30S: 1 Hz mechanical enlarger timer metronome + faint darkroom ambient air floor
- *  - Station phase cue: single short neutral 880 Hz sine beep (120 ms)
- *  - FLASH_FREEZE: crisp single mechanical shutter click
- *  - REWIND: restrained 35 mm motorized transport rewind
- *  - REPLAY_TRUTH: total system silence (only visitor audio clips play back)
+ * Live Darkroom Web Audio Soundscape (v3):
+ *  - SAFELIGHT_COMPOSE: crisp mechanical filter-paddle click
+ *  - EXPOSURE: enlarger relay clack + restrained 1 Hz mechanical darkroom timer metronome
+ *  - DEVELOPING: enlarger relay off clack + subtle chemical bath fluid murmur that shifts subtly
+ *                with devProgress (and adds gentle granular crackle above 1.0, never harsh alarms)
+ *  - FIXED_REVEAL: crisp mechanical shutter / stop-bath click, then total room silence
  */
 let ctx: AudioContext | null = null;
 let master: GainNode | null = null;
@@ -26,7 +26,7 @@ export function out(): GainNode {
   return master!;
 }
 
-/** must run inside a user gesture: unlocks the AudioContext (iOS needs an empty buffer played) */
+/** must run inside a user gesture: unlocks AudioContext (iOS requires a silent buffer played) */
 export async function unlockAudio(): Promise<void> {
   const c = audioCtx();
   try {
@@ -47,7 +47,7 @@ export async function unlockAudio(): Promise<void> {
   }
 }
 
-/** Chrome 110+ supports AudioContext.setSinkId to switch the audio output device */
+/** Chrome 110+ supports AudioContext.setSinkId */
 export async function setAudioSink(deviceId: string): Promise<boolean> {
   const c = audioCtx() as AudioContext & { setSinkId?: (id: string) => Promise<void> };
   if (!deviceId || typeof c.setSinkId !== 'function') return false;
@@ -77,14 +77,76 @@ function env(g: GainNode, t: number, a: number, peak: number, d: number): void {
   g.gain.exponentialRampToValueAtTime(0.0001, t + a + d);
 }
 
-// ---------------------------------------------------------------- shutter
-/** Single crisp mechanical camera shutter release */
-export function shutter(volume = 1): void {
+// ---------------------------------------------------------------- mechanical darkroom switches
+/** Crisp swing-arm red safelight filter paddle click */
+export function safelightClick(volume = 0.65): void {
+  const c = audioCtx();
+  const t = c.currentTime + 0.005;
+  const src = c.createBufferSource();
+  src.buffer = noise();
+  const bp = c.createBiquadFilter();
+  bp.type = 'bandpass';
+  bp.frequency.value = 2400;
+  bp.Q.value = 2.6;
+  const g = c.createGain();
+  env(g, t, 0.0012, 0.48 * volume, 0.025);
+  src.connect(bp).connect(g).connect(out());
+  src.start(t, Math.random());
+  src.stop(t + 0.05);
+
+  const o = c.createOscillator();
+  o.type = 'triangle';
+  o.frequency.setValueAtTime(520, t);
+  o.frequency.exponentialRampToValueAtTime(160, t + 0.025);
+  const og = c.createGain();
+  env(og, t, 0.001, 0.28 * volume, 0.03);
+  o.connect(og).connect(out());
+  o.start(t);
+  o.stop(t + 0.045);
+}
+
+/** Heavy enlarger timer relay switch clack (on = lamp ignite, off = lamp extinguish) */
+export function relayClick(on: boolean, volume = 0.85): void {
+  const c = audioCtx();
+  const t = c.currentTime + 0.005;
+  const f1 = on ? 1650 : 1280;
+  const f2 = on ? 2900 : 2100;
+
+  for (const [dt, freq, peak] of [
+    [0, f1, 0.55],
+    [0.014, f2, 0.36],
+  ] as const) {
+    const src = c.createBufferSource();
+    src.buffer = noise();
+    const bp = c.createBiquadFilter();
+    bp.type = 'bandpass';
+    bp.frequency.value = freq;
+    bp.Q.value = 2.1;
+    const g = c.createGain();
+    env(g, t + dt, 0.001, peak * volume, 0.032);
+    src.connect(bp).connect(g).connect(out());
+    src.start(t + dt, Math.random());
+    src.stop(t + dt + 0.06);
+  }
+
+  const thump = c.createOscillator();
+  thump.type = 'sine';
+  thump.frequency.setValueAtTime(on ? 190 : 145, t);
+  thump.frequency.exponentialRampToValueAtTime(55, t + 0.045);
+  const tg = c.createGain();
+  env(tg, t, 0.001, 0.42 * volume, 0.05);
+  thump.connect(tg).connect(out());
+  thump.start(t);
+  thump.stop(t + 0.07);
+}
+
+/** Single crisp mechanical camera shutter / fixation lock release */
+export function shutter(volume = 0.95): void {
   const c = audioCtx();
   const t = c.currentTime + 0.005;
   for (const [dt, f, peak] of [
-    [0, 3100, 0.85],
-    [0.058, 1750, 0.52],
+    [0, 3150, 0.85],
+    [0.056, 1750, 0.52],
   ] as const) {
     const src = c.createBufferSource();
     src.buffer = noise();
@@ -93,14 +155,14 @@ export function shutter(volume = 1): void {
     bp.frequency.value = f;
     bp.Q.value = 1.4;
     const g = c.createGain();
-    env(g, t + dt, 0.0018, peak * volume, 0.048);
+    env(g, t + dt, 0.0018, peak * volume, 0.046);
     src.connect(bp).connect(g).connect(out());
     src.start(t + dt, Math.random());
     src.stop(t + dt + 0.09);
   }
   const o = c.createOscillator();
   o.type = 'sine';
-  o.frequency.setValueAtTime(165, t);
+  o.frequency.setValueAtTime(170, t);
   o.frequency.exponentialRampToValueAtTime(48, t + 0.065);
   const g = c.createGain();
   env(g, t, 0.002, 0.55 * volume, 0.07);
@@ -109,35 +171,14 @@ export function shutter(volume = 1): void {
   o.stop(t + 0.1);
 }
 
-// ---------------------------------------------------------------- neutral lab instrument cue
-/** Single short neutral laboratory beep (880 Hz sine, 120 ms) on terminal protocol transition */
-export function cueBeep(volume = 0.16): void {
-  const c = audioCtx();
-  const t = c.currentTime + 0.005;
-  const o = c.createOscillator();
-  o.type = 'sine';
-  o.frequency.setValueAtTime(880, t);
-  const g = c.createGain();
-  g.gain.setValueAtTime(0.0001, t);
-  g.gain.linearRampToValueAtTime(volume, t + 0.008);
-  g.gain.setValueAtTime(volume * 0.9, t + 0.055);
-  g.gain.exponentialRampToValueAtTime(0.0001, t + 0.12);
-  o.connect(g).connect(out());
-  o.start(t);
-  o.stop(t + 0.13);
-}
-
-// ---------------------------------------------------------------- 1 Hz enlarger timer metronome + room air
+// ---------------------------------------------------------------- 1 Hz enlarger timer metronome (EXPOSURE)
 let timerInterval: number | null = null;
 let nextTickAt = 0;
 let tickParity = 0;
 let timerBus: GainNode | null = null;
-let roomAirSrc: AudioBufferSourceNode | null = null;
-let roomAirGain: GainNode | null = null;
 
 function playEscapementTick(t: number, bus: GainNode, parity: number): void {
   const c = audioCtx();
-  // subtle mechanical escapement click (alternating tick / tock resonance)
   const src = c.createBufferSource();
   src.buffer = noise();
   const bp = c.createBiquadFilter();
@@ -145,25 +186,24 @@ function playEscapementTick(t: number, bus: GainNode, parity: number): void {
   bp.frequency.value = parity === 0 ? 2150 : 1780;
   bp.Q.value = 3.2;
   const cg = c.createGain();
-  env(cg, t, 0.0012, parity === 0 ? 0.24 : 0.19, 0.016);
+  env(cg, t, 0.0012, parity === 0 ? 0.25 : 0.2, 0.016);
   src.connect(bp).connect(cg).connect(bus);
   src.start(t, (parity * 0.37) % 1.5);
   src.stop(t + 0.03);
 
-  // faint mechanical housing body click
   const body = c.createOscillator();
   body.type = 'triangle';
   body.frequency.setValueAtTime(parity === 0 ? 420 : 360, t);
   body.frequency.exponentialRampToValueAtTime(140, t + 0.018);
   const bg = c.createGain();
-  env(bg, t, 0.001, 0.07, 0.02);
+  env(bg, t, 0.001, 0.075, 0.02);
   body.connect(bg).connect(bus);
   body.start(t);
   body.stop(t + 0.03);
 }
 
 export const enlargerTimer = {
-  start(level = 0.85, fadeSec = 0.35): void {
+  start(level = 0.85, fadeSec = 0.12): void {
     const c = audioCtx();
     if (!timerBus) {
       timerBus = c.createGain();
@@ -173,42 +213,24 @@ export const enlargerTimer = {
     const g = timerBus.gain;
     g.cancelScheduledValues(c.currentTime);
     g.setValueAtTime(Math.max(g.value, 0.0001), c.currentTime);
-    g.linearRampToValueAtTime(level, c.currentTime + Math.max(0.04, fadeSec));
-
-    // whisper-quiet darkroom ambient room-tone floor
-    if (!roomAirSrc) {
-      roomAirSrc = c.createBufferSource();
-      roomAirSrc.buffer = noise();
-      roomAirSrc.loop = true;
-      const hp = c.createBiquadFilter();
-      hp.type = 'highpass';
-      hp.frequency.value = 85;
-      const lp = c.createBiquadFilter();
-      lp.type = 'lowpass';
-      lp.frequency.value = 620;
-      roomAirGain = c.createGain();
-      roomAirGain.gain.setValueAtTime(0.0001, c.currentTime);
-      roomAirGain.gain.linearRampToValueAtTime(0.014, c.currentTime + 0.5);
-      roomAirSrc.connect(hp).connect(lp).connect(roomAirGain).connect(timerBus);
-      roomAirSrc.start(c.currentTime);
-    }
+    g.linearRampToValueAtTime(level, c.currentTime + Math.max(0.02, fadeSec));
 
     if (timerInterval !== null) return;
     tickParity = 0;
-    nextTickAt = c.currentTime + 0.06;
+    nextTickAt = c.currentTime + 0.08;
     const scheduler = () => {
       const now = c.currentTime;
       while (nextTickAt < now + 0.25) {
         playEscapementTick(nextTickAt, timerBus!, tickParity);
         tickParity ^= 1;
-        nextTickAt += 1.0; // exact 1 Hz darkroom timer cadence
+        nextTickAt += 1.0;
       }
     };
     scheduler();
     timerInterval = window.setInterval(scheduler, 80);
   },
 
-  stop(fadeSec = 0.08): void {
+  stop(fadeSec = 0.06): void {
     const c = audioCtx();
     if (timerInterval !== null) {
       clearInterval(timerInterval);
@@ -219,64 +241,121 @@ export const enlargerTimer = {
       timerBus.gain.setValueAtTime(timerBus.gain.value, c.currentTime);
       timerBus.gain.linearRampToValueAtTime(0, c.currentTime + fadeSec);
     }
-    if (roomAirSrc) {
-      const s = roomAirSrc;
-      roomAirSrc = null;
-      roomAirGain = null;
-      window.setTimeout(() => {
-        try {
-          s.stop();
-        } catch {
-          /* ignore */
-        }
-      }, Math.ceil(fadeSec * 1000) + 40);
-    }
   },
 };
 
-// ---------------------------------------------------------------- restrained film transport rewind
-export function rewindSfx(durSec = 3): void {
-  const c = audioCtx();
-  const t = c.currentTime + 0.01;
+// ---------------------------------------------------------------- chemical bath ambient feedback (DEVELOPING)
+let bathSrc: AudioBufferSourceNode | null = null;
+let bathFilter: BiquadFilterNode | null = null;
+let bathGain: GainNode | null = null;
+let bathLfo: OscillatorNode | null = null;
+let overCrackleSrc: AudioBufferSourceNode | null = null;
+let overCrackleGain: GainNode | null = null;
 
-  // soft filtered film-strip transport whir (restrained, non-alarming)
-  const n = c.createBufferSource();
-  n.buffer = noise();
-  n.loop = true;
-  const bp = c.createBiquadFilter();
-  bp.type = 'bandpass';
-  bp.Q.value = 2.2;
-  bp.frequency.setValueAtTime(340, t);
-  bp.frequency.exponentialRampToValueAtTime(1450, t + durSec * 0.65);
-  bp.frequency.exponentialRampToValueAtTime(520, t + durSec);
-  const ng = c.createGain();
-  ng.gain.setValueAtTime(0.0001, t);
-  ng.gain.linearRampToValueAtTime(0.16, t + 0.22);
-  ng.gain.setValueAtTime(0.16, t + Math.max(0.25, durSec - 0.3));
-  ng.gain.exponentialRampToValueAtTime(0.0001, t + durSec);
-  n.connect(bp).connect(ng).connect(out());
-  n.start(t);
-  n.stop(t + durSec + 0.05);
+export const devBathAudio = {
+  start(): void {
+    if (bathSrc) return;
+    const c = audioCtx();
 
-  // gentle low-frequency spool motor hum
-  const motor = c.createOscillator();
-  motor.type = 'triangle';
-  motor.frequency.setValueAtTime(110, t);
-  motor.frequency.linearRampToValueAtTime(210, t + durSec * 0.6);
-  motor.frequency.linearRampToValueAtTime(125, t + durSec);
-  const lp = c.createBiquadFilter();
-  lp.type = 'lowpass';
-  lp.frequency.value = 480;
-  const mg = c.createGain();
-  mg.gain.setValueAtTime(0.0001, t);
-  mg.gain.linearRampToValueAtTime(0.055, t + 0.25);
-  mg.gain.setValueAtTime(0.055, t + Math.max(0.3, durSec - 0.3));
-  mg.gain.exponentialRampToValueAtTime(0.0001, t + durSec);
-  motor.connect(lp).connect(mg).connect(out());
-  motor.start(t);
-  motor.stop(t + durSec + 0.05);
-}
+    // Subtle low-frequency liquid bath murmur (90–380 Hz)
+    bathSrc = c.createBufferSource();
+    bathSrc.buffer = noise();
+    bathSrc.loop = true;
+
+    const hp = c.createBiquadFilter();
+    hp.type = 'highpass';
+    hp.frequency.value = 75;
+
+    bathFilter = c.createBiquadFilter();
+    bathFilter.type = 'lowpass';
+    bathFilter.frequency.value = 240;
+    bathFilter.Q.value = 1.1;
+
+    bathGain = c.createGain();
+    bathGain.gain.setValueAtTime(0.0001, c.currentTime);
+    bathGain.gain.linearRampToValueAtTime(0.045, c.currentTime + 0.45);
+
+    // Slow agitation swell
+    bathLfo = c.createOscillator();
+    bathLfo.frequency.value = 0.28;
+    const lfoGain = c.createGain();
+    lfoGain.gain.value = 55;
+    bathLfo.connect(lfoGain).connect(bathFilter.frequency);
+
+    bathSrc.connect(hp).connect(bathFilter).connect(bathGain).connect(out());
+    bathSrc.start(c.currentTime);
+    bathLfo.start(c.currentTime);
+
+    // Subtle granular overdevelopment crackle channel (silent until devProgress > 1.0)
+    overCrackleSrc = c.createBufferSource();
+    overCrackleSrc.buffer = noise();
+    overCrackleSrc.loop = true;
+
+    const cb = c.createBiquadFilter();
+    cb.type = 'bandpass';
+    cb.frequency.value = 3400;
+    cb.Q.value = 2.8;
+
+    overCrackleGain = c.createGain();
+    overCrackleGain.gain.value = 0.0001;
+
+    overCrackleSrc.connect(cb).connect(overCrackleGain).connect(out());
+    overCrackleSrc.start(c.currentTime);
+  },
+
+  update(devProgress: number): void {
+    if (!bathFilter || !bathGain || !overCrackleGain) return;
+    const c = audioCtx();
+    const t = c.currentTime;
+    const p = Math.max(0, devProgress);
+    const norm = Math.min(1, p);
+    const over = p > 1.0 ? Math.min(1, (p - 1.0) / 0.45) : 0;
+
+    bathFilter.frequency.setTargetAtTime(220 + norm * 320 + over * 260, t, 0.08);
+    bathGain.gain.setTargetAtTime(0.04 + norm * 0.045, t, 0.08);
+    // Restrained granular electrical texture above 100% — tactile warning, never an alarm
+    overCrackleGain.gain.setTargetAtTime(over > 0 ? 0.004 + over * 0.028 : 0.0001, t, 0.08);
+  },
+
+  stop(fadeSec = 0.08): void {
+    const c = audioCtx();
+    const s1 = bathSrc;
+    const s2 = overCrackleSrc;
+    const lfo = bathLfo;
+    const g1 = bathGain;
+    const g2 = overCrackleGain;
+
+    bathSrc = null;
+    overCrackleSrc = null;
+    bathLfo = null;
+    bathFilter = null;
+    bathGain = null;
+    overCrackleGain = null;
+
+    if (g1) {
+      g1.gain.cancelScheduledValues(c.currentTime);
+      g1.gain.setValueAtTime(g1.gain.value, c.currentTime);
+      g1.gain.linearRampToValueAtTime(0.0001, c.currentTime + fadeSec);
+    }
+    if (g2) {
+      g2.gain.cancelScheduledValues(c.currentTime);
+      g2.gain.setValueAtTime(g2.gain.value, c.currentTime);
+      g2.gain.linearRampToValueAtTime(0.0001, c.currentTime + fadeSec);
+    }
+
+    window.setTimeout(() => {
+      for (const n of [s1, s2, lfo]) {
+        try {
+          n?.stop();
+        } catch {
+          /* ignore */
+        }
+      }
+    }, Math.ceil(fadeSec * 1000) + 40);
+  },
+};
 
 export function stopAllLoops(): void {
   enlargerTimer.stop();
+  devBathAudio.stop();
 }

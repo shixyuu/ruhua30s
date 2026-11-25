@@ -1,123 +1,78 @@
 /**
- * /station2 — tablet 3: north-west optical dodging & fixation terminal
- *  t = 08s ~ 21s: PROTOCOL 02 · OPTICAL DODGING (early wake-up guiding companions into the center projection beam)
- *  t = 21s ~ 30s: PROTOCOL 03 · FIXATION (minimalist damped Fixation Fader: DEVELOPING → FIXED)
- *  Early-pull guard: pulled at t < 28.5s → locks at FIXED with "FIXING EXPOSURE..." until 29.5s;
- *                    pulled at t >= 28.5s or reaching 30.0s → enters FLASH_FREEZE naturally.
+ * /station2 — tablet 3: north-west vertical fixation fader
+ * - Pure black (#000000) outside DEVELOPING.
+ * - During DEVELOPING: full-height heavy industrial vertical damped fader (DEVELOPING -> PULL TO FIX).
+ * - Reaching >= 92% sends `{ type: 'TRIGGER_FIX' }` immediately and locks with `FIXED`.
  */
 import { Net, mountNetDot } from '../lib/net';
-import { cueBeep } from '../lib/sfx';
 import { showStartOverlay } from '../lib/unlock';
 import { TITLE_EN } from '../lib/brand';
-import { TIMELINE } from '../../../shared/protocol';
 
-const TITLE_P2 = 'PROTOCOL 02 · OPTICAL DODGING';
-const COPY_P2 =
-  'Highlight overexposure across the projection plane. Step into the light beam together and use your bodies to dodge the center of the frame.';
-
-const TITLE_P3 = 'PROTOCOL 03 · FIXATION';
-const COPY_P3 = 'Development window closing. Pull down steadily to arrest the exposure and fix the negative.';
-
-const RESISTANCE = 0.45;
-const PULL_THRESHOLD = 0.94;
-
-type Seg = 'black' | 'P2' | 'P3';
+const RESISTANCE = 0.55;
+const PULL_THRESHOLD = 0.92;
 
 export default async function station2(app: HTMLElement): Promise<void> {
-  document.title = `North-west terminal · ${TITLE_EN}`;
+  document.title = `Fixation Fader · ${TITLE_EN}`;
   app.innerHTML = `
-    <div class="station black" id="root">
-      <div class="st-band">
-        <span class="id"><span>T-03</span></span>
-        <span class="zone" id="zone">NW fixation terminal</span>
-        <span class="clock" id="clock">--.-</span>
-      </div>
-      <div class="st-body" id="body">
-        <div class="st-copy">
-          <div class="st-kicker" id="kicker"></div>
-          <p class="st-msg" id="msg"></p>
-          <div class="st-lock hidden" id="lock">FIXING EXPOSURE...</div>
-        </div>
-        <div class="st-aside hidden" id="faderAside">
-          <div class="fader-unit" id="breaker">
-            <div class="fader-lbl top">DEVELOPING</div>
-            <div class="fader-body">
-              <div class="fader-scale" aria-hidden="true"></div>
-              <div class="fader-slot">
-                <div class="fader-fill" id="faderFill"></div>
-              </div>
-              <div class="fader-cap" id="handle">
-                <span class="grip"></span>
-                <span class="cap-txt" id="handleTxt">PULL DOWN</span>
-                <span class="grip"></span>
-              </div>
+    <div class="inst-screen black" id="root">
+      <div class="fader-stage">
+        <div class="fader-unit-v3" id="faderBox">
+          <div class="fader-end top">DEVELOPING</div>
+          <div class="fader-well" id="faderWell">
+            <div class="fader-rails" aria-hidden="true"></div>
+            <div class="fader-slot">
+              <div class="fader-fill" id="faderFill"></div>
             </div>
-            <div class="fader-lbl bot">FIXED</div>
+            <div class="fader-handle" id="handle">
+              <span class="bar"></span>
+              <span class="txt" id="handleTxt">SLIDE</span>
+              <span class="bar"></span>
+            </div>
           </div>
-          <div class="st-sub" id="sub">DAMPED TRACK · SLIDE FULL TRAVEL</div>
+          <div class="fader-end bot" id="botLbl">PULL TO FIX</div>
         </div>
-      </div>
-      <div class="st-foot">
-        <span>RH-30 / NW TERMINAL · <span id="foot">STANDBY</span></span>
-        <span class="chem" id="chem">
-          <span data-s="P2"><b>P02</b> 08–21</span>
-          <span data-s="P3"><b>P03</b> 21–30</span>
-        </span>
       </div>
     </div>`;
 
   const root = app.querySelector('#root') as HTMLDivElement;
-  const body = app.querySelector('#body') as HTMLDivElement;
-  const zone = app.querySelector('#zone') as HTMLSpanElement;
-  const clock = app.querySelector('#clock') as HTMLSpanElement;
-  const foot = app.querySelector('#foot') as HTMLSpanElement;
-  const kicker = app.querySelector('#kicker') as HTMLDivElement;
-  const msgEl = app.querySelector('#msg') as HTMLParagraphElement;
-  const lockEl = app.querySelector('#lock') as HTMLDivElement;
-  const faderAside = app.querySelector('#faderAside') as HTMLDivElement;
-  const breaker = app.querySelector('#breaker') as HTMLDivElement;
-  const faderBody = breaker.querySelector('.fader-body') as HTMLDivElement;
+  const faderBox = app.querySelector('#faderBox') as HTMLDivElement;
+  const faderWell = app.querySelector('#faderWell') as HTMLDivElement;
   const faderFill = app.querySelector('#faderFill') as HTMLDivElement;
   const handle = app.querySelector('#handle') as HTMLDivElement;
   const handleTxt = app.querySelector('#handleTxt') as HTMLSpanElement;
-  const subEl = app.querySelector('#sub') as HTMLDivElement;
-  const chem = Array.from(app.querySelectorAll<HTMLSpanElement>('#chem > span'));
+  const botLbl = app.querySelector('#botLbl') as HTMLDivElement;
 
   const net = new Net('station2');
   (window as any).__net = net;
   mountNetDot(net);
 
-  // ---------------- damped fixation fader ----------------
-  let pos = 0; // 0 = top (DEVELOPING), 1 = bottom (FIXED)
+  let pos = 0; // 0 = top (DEVELOPING), 1 = bottom (PULL TO FIX)
   let dragging = false;
   let startY = 0;
   let startPos = 0;
-  let pulled = false;
-  let locked = false;
+  let fixed = false;
+  let roundId = -1;
 
-  const travelRange = () => Math.max(0, faderBody.clientHeight - handle.offsetHeight - 20);
+  const travelRange = () => Math.max(0, faderWell.clientHeight - handle.offsetHeight - 24);
 
   function place(): void {
     const r = travelRange();
-    const y = 10 + pos * r;
-    handle.style.top = `${y}px`;
+    handle.style.top = `${12 + pos * r}px`;
     faderFill.style.height = `${Math.round(pos * 100)}%`;
   }
 
   function resetFader(): void {
     pos = 0;
-    pulled = false;
-    locked = false;
+    fixed = false;
     dragging = false;
-    breaker.classList.remove('locked');
-    lockEl.classList.add('hidden');
-    handleTxt.textContent = 'PULL DOWN';
-    subEl.textContent = 'DAMPED TRACK · SLIDE FULL TRAVEL';
+    faderBox.classList.remove('locked');
+    handleTxt.textContent = 'SLIDE';
+    botLbl.textContent = 'PULL TO FIX';
     place();
   }
 
   handle.addEventListener('pointerdown', (e) => {
-    if (pulled || seg !== 'P3') return;
+    if (fixed || net.phase !== 'DEVELOPING') return;
     e.preventDefault();
     dragging = true;
     startY = e.clientY;
@@ -131,19 +86,19 @@ export default async function station2(app: HTMLElement): Promise<void> {
   });
 
   handle.addEventListener('pointermove', (e) => {
-    if (!dragging || pulled) return;
+    if (!dragging || fixed) return;
     e.preventDefault();
     const r = Math.max(1, travelRange());
     const raw = ((e.clientY - startY) * RESISTANCE) / r;
     pos = Math.max(0, Math.min(1, startPos + raw));
     place();
-    if (pos >= PULL_THRESHOLD) doPull();
+    if (pos >= PULL_THRESHOLD) triggerFix();
   });
 
   const release = () => {
     if (!dragging) return;
     dragging = false;
-    if (!pulled) {
+    if (!fixed) {
       handle.classList.add('snap');
       pos = 0;
       place();
@@ -151,112 +106,44 @@ export default async function station2(app: HTMLElement): Promise<void> {
   };
   handle.addEventListener('pointerup', release);
   handle.addEventListener('pointercancel', release);
-  breaker.addEventListener('touchmove', (e) => e.preventDefault(), { passive: false });
+  faderBox.addEventListener('touchmove', (e) => e.preventDefault(), { passive: false });
 
-  function doPull(): void {
-    if (pulled) return;
-    pulled = true;
+  function triggerFix(): void {
+    if (fixed) return;
+    fixed = true;
     dragging = false;
     pos = 1;
     place();
+    faderBox.classList.add('locked');
     handleTxt.textContent = 'FIXED';
-    navigator.vibrate?.(40);
-    net.send({ type: 'breaker' });
-    const t = net.storySec();
-    if (t < TIMELINE.breakerSpoilerGuard) engageLock();
-    else subEl.textContent = 'FIXATION COMPLETE';
+    botLbl.textContent = 'FIXED';
+    navigator.vibrate?.(60);
+    net.send({ type: 'TRIGGER_FIX' });
   }
 
-  function engageLock(): void {
-    if (locked) return;
-    locked = true;
-    breaker.classList.add('locked');
-    lockEl.classList.remove('hidden');
-    handleTxt.textContent = 'FIXED';
-    subEl.textContent = 'BATH LOCKED · COMPLETING CYCLE';
-  }
-
-  net.on('breaker', (m) => {
-    if (m.status === 'locked') {
-      pulled = true;
-      pos = 1;
-      place();
-      engageLock();
-    }
-  });
-
-  // ---------------- phase rendering ----------------
-  let seg: Seg = 'black';
-  let roundId = -1;
-
-  function setSeg(next: Seg): void {
-    if (next === seg) return;
-    seg = next;
-    chem.forEach((c) => c.classList.toggle('on', c.dataset.s === next));
-
-    if (next === 'P2') {
-      cueBeep();
-      root.className = 'station st-p2';
-      body.classList.add('single');
-      zone.textContent = 'NW terminal · Optical dodging';
-      foot.textContent = 'PROTOCOL 02';
-      kicker.textContent = TITLE_P2;
-      msgEl.textContent = COPY_P2;
-      lockEl.classList.add('hidden');
-      faderAside.classList.add('hidden');
-    } else if (next === 'P3') {
-      cueBeep();
-      if (net.round?.id !== roundId) {
-        roundId = net.round?.id ?? -1;
+  function renderPhase(): void {
+    const active = net.connected && net.phase === 'DEVELOPING';
+    root.classList.toggle('black', !active);
+    if (active) {
+      if (net.round && net.round.id !== roundId) {
+        roundId = net.round.id;
         resetFader();
       }
-      root.className = 'station st-p3';
-      body.classList.remove('single');
-      zone.textContent = 'NW terminal · Fixation fader';
-      foot.textContent = 'PROTOCOL 03';
-      kicker.textContent = TITLE_P3;
-      msgEl.textContent = COPY_P3;
-      faderAside.classList.remove('hidden');
       requestAnimationFrame(place);
-      if (net.round?.breakerLocked) {
-        pulled = true;
-        pos = 1;
-        place();
-        engageLock();
-      }
-    } else {
-      root.className = 'station black';
-      body.classList.remove('single');
-      faderAside.classList.add('hidden');
-      lockEl.classList.add('hidden');
-      kicker.textContent = '';
-      msgEl.textContent = '';
     }
   }
 
-  function tick(): void {
-    let next: Seg = 'black';
-    if (net.connected && net.phase === 'ACTIVE_30S') {
-      const t = net.storySec();
-      if (t >= TIMELINE.station2P2[0] && t < TIMELINE.station2P2[1]) next = 'P2';
-      else if (t >= TIMELINE.station2P3[0] && t <= TIMELINE.station2P3[1] + 0.5) next = 'P3';
-    }
-    setSeg(next);
-    if (next !== 'black') {
-      const end = next === 'P2' ? TIMELINE.station2P2[1] : TIMELINE.station2P3[1];
-      clock.textContent = Math.max(0, end - net.storySec()).toFixed(1).padStart(4, '0');
-    }
-    requestAnimationFrame(tick);
-  }
+  net.on('state', renderPhase);
+  net.on('open', renderPhase);
   window.addEventListener('resize', place);
 
   await showStartOverlay({
     code: 'T-03',
     kicker: '/station2',
-    title: 'North-west fixation terminal',
-    subtitle: 'Tap to go fullscreen and keep the screen awake.',
-    button: 'Tap to start',
+    title: 'FIXATION FADER',
+    subtitle: 'Tap to lock fullscreen',
+    button: 'TAP TO START',
   });
   net.connect();
-  requestAnimationFrame(tick);
+  renderPhase();
 }

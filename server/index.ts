@@ -1,5 +1,5 @@
 /**
- * 《入画三十秒 (RH-30)》v2 统一单端口服务：静态前端 + /assets + /data + /api + /ws
+ * 《入画三十秒 (RH-30)》v3 统一单端口服务：纯现场活体暗房引擎 + /data + /api + /ws
  */
 import http from 'node:http';
 import path from 'node:path';
@@ -9,22 +9,18 @@ import express, { NextFunction, Request, Response } from 'express';
 import { WebSocketServer, WebSocket, RawData } from 'ws';
 import {
   AppConfig,
-  AudioClip,
   ClientMsg,
   ClientStatus,
   ContactSheetInfo,
   Phase,
-  PHASE_SECONDS,
   Role,
   ROLES,
   RoundInfo,
   ServerMsg,
-  TIMELINE,
 } from '../shared/protocol.js';
 import {
   ASSETS_DIR,
   DATA_DIR,
-  assetExists,
   countRollFramesSync,
   decodeJpeg,
   doorPhotoInfo,
@@ -48,6 +44,7 @@ const ADMIN_TOKEN = (process.env.ADMIN_TOKEN || '').trim();
 const TIME_SCALE = Math.min(10, Math.max(0.01, Number(process.env.TIME_SCALE || 1) || 1));
 const MAX_PAYLOAD = 15 * 1024 * 1024;
 const HEARTBEAT_MS = 20_000;
+const DEV_TICK_MS = 50;
 
 ensureDirs();
 let config: AppConfig = loadConfig();
@@ -73,13 +70,12 @@ app.get('/api/health', (_req, res) => {
   res.set('Cache-Control', 'no-store');
   res.json({
     ok: true,
-    version: '2.0.0-archival',
+    version: '3.0.0-live-darkroom',
     state,
     clients: clientCounts(),
     round: round.id,
     rollNumber: config.rollNumber,
     timeScale: TIME_SCALE,
-    assets: { base: assetExists('base.mp4'), rewind: assetExists('rewind.mp4') },
     uptime: Math.round(process.uptime()),
     serverTime: Date.now(),
   });
@@ -114,7 +110,7 @@ app.get('/api/config', (_req, res) => {
   res.json({ ok: true, config });
 });
 
-// /assets：外部挂载目录，运行中覆盖文件即可热更新
+// /assets：保留静态挂载以兼容现有 Docker volume 配置
 const noCache = (res: Response) => res.setHeader('Cache-Control', 'no-cache');
 app.use(
   '/assets',
@@ -122,9 +118,7 @@ app.use(
 );
 app.use('/assets', (_req, res) => res.status(404).type('text/plain').send('asset not found'));
 
-// /data：持久化目录。
-// 注意：/door 需要无需 token 展示当前胶卷（/archive/roll-XX/）的接触印相表；
-// 若设置了 ADMIN_TOKEN，仅保护非当前卷的历史归档。
+// /data：持久化目录（当前卷对 /door 免 token 开放；历史卷可受 ADMIN_TOKEN 保护）
 app.use('/data', (req: Request, res: Response, next: NextFunction) => {
   if (/\.tmp$/i.test(req.path)) return void res.status(404).end();
   if (req.path.startsWith('/archive')) {
@@ -147,7 +141,7 @@ app.use(
 );
 app.use('/data', (_req, res) => res.status(404).type('text/plain').send('not found'));
 
-// 前端构建产物：/static/* 带 hash，长缓存；其余 no-cache
+// 前端构建产物
 app.use(
   express.static(PUBLIC_DIR, {
     index: false,
@@ -209,7 +203,7 @@ function broadcast(msg: ServerMsg, filter?: (p: Peer) => boolean): void {
   }
 }
 
-const toRole = (r: Role) => (p: Peer) => p.role === r;
+const isMainOrAdmin = (p: Peer) => p.role === 'main' || p.role === 'admin';
 
 function clientCounts(): Record<Role, number> {
   const c: Record<Role, number> = { main: 0, door: 0, station1: 0, station2: 0, admin: 0 };
@@ -294,9 +288,14 @@ async function sendFullSync(ws: WebSocket, peer: Peer): Promise<void> {
   currentSheet = await getContactSheet(config.rollNumber);
   send(ws, { type: 'contact-sheet', sheet: currentSheet, serverTime: Date.now() });
   if (peer.role === 'admin') send(ws, { type: 'clients', clients: clientStatuses(), serverTime: Date.now() });
-  // main 中途重连：若本轮已有观众录音片段，补发完整数组
-  if (peer.role === 'main' && audioClips.length > 0 && state !== 'IDLE') {
-    send(ws, { type: 'audio-sync', clips: audioClips, roundId: round.id });
+  if (peer.role === 'main' || peer.role === 'admin') {
+    send(ws, {
+      type: 'dev',
+      devProgress: round.finalDevProgress ?? round.devProgress,
+      audioLevel: latestAudioLevel,
+      effLevel: lastEffLevel,
+      serverTime: Date.now(),
+    });
   }
 }
 
@@ -332,24 +331,15 @@ function handleMessage(ws: WebSocket, peer: Peer, msg: ClientMsg): void {
           : `Current state is ${state}; can only start from IDLE`,
       });
     }
-    case 'speak': {
+    case 'AUDIO_ENERGY':
       if (peer.role !== 'station1') return;
-      const anyMsg = msg as ClientMsg & { data?: string; audioOffsetMs?: number };
-      const dataUrl = msg.dataUrl ?? anyMsg.data ?? '';
-      const offsetMs = msg.offsetMs ?? anyMsg.audioOffsetMs ?? 0;
-      return onSpeak(ws, msg.mime, dataUrl, offsetMs);
-    }
-    case 'breaker':
+      return onAudioEnergy(msg.level);
+    case 'TRIGGER_FIX':
       if (peer.role !== 'station2') return;
-      return onBreaker(ws);
+      return onTriggerFix(ws);
     case 'freeze':
       if (peer.role !== 'main') return;
       return void onFreeze(ws, msg.data);
-    case 'cctv':
-      if (peer.role !== 'door') return;
-      if (state !== 'CCTV_REVEAL' && state !== 'REPLAY_TRUTH') return;
-      if (typeof msg.data !== 'string' || msg.data.length > 2_000_000) return;
-      return broadcast({ type: 'cctv', data: msg.data, serverTime: Date.now() }, toRole('main'));
     case 'admin': {
       if (peer.role !== 'admin' || !(peer.isAdmin || (ADMIN_TOKEN && msg.token === ADMIN_TOKEN))) {
         return send(ws, { type: 'ack', what: msg.action, ok: false, message: 'Not authorised (ADMIN_TOKEN)' });
@@ -362,35 +352,27 @@ function handleMessage(ws: WebSocket, peer: Peer, msg: ClientMsg): void {
 // ======================================================================
 // 状态机（唯一真相源）
 // ======================================================================
-const NEXT: Record<Phase, Phase> = {
-  IDLE: 'IDLE',
-  ENTER_BUFFER: 'ACTIVE_30S',
-  ACTIVE_30S: 'FLASH_FREEZE',
-  FLASH_FREEZE: 'REWIND',
-  REWIND: 'REPLAY_TRUTH',
-  REPLAY_TRUTH: 'CCTV_REVEAL',
-  CCTV_REVEAL: 'IDLE',
-};
-
 let state: Phase = 'IDLE';
 let phaseStartedAt = Date.now();
 let phaseDurationMs = 0;
 let phaseTimer: NodeJS.Timeout | null = null;
+let devTimer: NodeJS.Timeout | null = null;
+let lastDevTick = Date.now();
+let latestAudioLevel = 0;
+let lastEffLevel = 0;
+let lastEnergyAt = 0;
+let lastFixedRoundEndAt = 0;
 let freezeSaving = false;
-let audioClips: AudioClip[] = [];
 
 function freshRound(id: number, rollNumber: number, frameNumber: number): RoundInfo {
   return {
     id,
     rollNumber,
     frameNumber,
-    activeStartedAt: null,
-    didSpeak: false,
-    audioClipCount: 0,
-    audioOffsetsMs: [],
-    didPullBreaker: false,
-    breakerPulledAtSec: null,
-    breakerLocked: false,
+    printMode: config.printMode,
+    devProgress: 0,
+    finalDevProgress: null,
+    fixTriggeredBy: null,
     hasFreeze: false,
     trigger: null,
   };
@@ -398,12 +380,45 @@ function freshRound(id: number, rollNumber: number, frameNumber: number): RoundI
 
 let round: RoundInfo = freshRound(0, config.rollNumber, countRollFramesSync(config.rollNumber) + 1);
 
+function nextPhaseAfter(cur: Phase): Phase {
+  switch (cur) {
+    case 'ENTER_BUFFER':
+      return config.safelightSec <= 0 ? 'EXPOSURE' : 'SAFELIGHT_COMPOSE';
+    case 'SAFELIGHT_COMPOSE':
+      return 'EXPOSURE';
+    case 'EXPOSURE':
+      return 'DEVELOPING';
+    case 'DEVELOPING':
+      return 'FIXED_REVEAL';
+    case 'FIXED_REVEAL':
+      return 'IDLE';
+    case 'IDLE':
+    default:
+      return 'IDLE';
+  }
+}
+
 function durationFor(p: Phase): number {
-  if (p === 'IDLE') return 0;
-  let sec: number;
-  if (p === 'ENTER_BUFFER') sec = config.enterBufferSec;
-  else if (p === 'CCTV_REVEAL') sec = config.cctvRevealSec;
-  else sec = PHASE_SECONDS[p];
+  let sec = 0;
+  switch (p) {
+    case 'IDLE':
+      return 0;
+    case 'ENTER_BUFFER':
+      sec = config.enterBufferSec;
+      break;
+    case 'SAFELIGHT_COMPOSE':
+      sec = config.safelightSec;
+      break;
+    case 'EXPOSURE':
+      sec = config.exposureSec;
+      break;
+    case 'DEVELOPING':
+      sec = config.maxDevelopSec;
+      break;
+    case 'FIXED_REVEAL':
+      sec = config.revealSec;
+      break;
+  }
   return Math.round(sec * 1000 * TIME_SCALE);
 }
 
@@ -420,16 +435,90 @@ function stateMsg(): ServerMsg {
   };
 }
 
-function enter(next: Phase, endAtMs?: number): void {
+function stopDevLoop(): void {
+  if (devTimer) {
+    clearInterval(devTimer);
+    devTimer = null;
+  }
+  latestAudioLevel = 0;
+  lastEffLevel = 0;
+  lastEnergyAt = 0;
+}
+
+function startDevLoop(): void {
+  stopDevLoop();
+  lastDevTick = Date.now();
+  devTimer = setInterval(() => {
+    if (state !== 'DEVELOPING') return stopDevLoop();
+    const now = Date.now();
+    if (now - lastEnergyAt > 400) latestAudioLevel = 0;
+    const storyDt = Math.max(0, (now - lastDevTick) / 1000 / TIME_SCALE);
+    lastDevTick = now;
+
+    const floor = config.noiseFloor;
+    const eff = latestAudioLevel <= floor ? 0 : Math.min(1, (latestAudioLevel - floor) / Math.max(0.05, 1 - floor));
+    lastEffLevel = eff;
+    round.devProgress = Math.round((round.devProgress + eff * config.devSpeed * storyDt) * 10000) / 10000;
+
+    broadcast(
+      {
+        type: 'dev',
+        devProgress: round.devProgress,
+        audioLevel: latestAudioLevel,
+        effLevel: eff,
+        serverTime: now,
+      },
+      isMainOrAdmin,
+    );
+  }, DEV_TICK_MS);
+}
+
+function lockDevelopment(by: 'station2' | 'timeout' | 'admin'): void {
+  stopDevLoop();
+  if (round.finalDevProgress == null) {
+    round.finalDevProgress = round.devProgress;
+    round.fixTriggeredBy = by;
+  }
+}
+
+function enter(next: Phase, fixSource: 'station2' | 'timeout' | 'admin' = 'timeout'): void {
   if (phaseTimer) clearTimeout(phaseTimer);
   phaseTimer = null;
+
+  const prev = state;
+  if (prev === 'DEVELOPING' && next === 'FIXED_REVEAL') {
+    lockDevelopment(fixSource);
+  } else if (prev === 'DEVELOPING') {
+    stopDevLoop();
+  }
+  if (prev === 'FIXED_REVEAL' && next === 'IDLE') {
+    lastFixedRoundEndAt = Date.now();
+  }
+
   state = next;
   phaseStartedAt = Date.now();
   phaseDurationMs = durationFor(next);
 
-  if (next === 'ACTIVE_30S') round.activeStartedAt = phaseStartedAt;
+  if (next === 'DEVELOPING') {
+    round.devProgress = 0;
+    round.finalDevProgress = null;
+    round.fixTriggeredBy = null;
+    startDevLoop();
+    broadcast({ type: 'dev', devProgress: 0, audioLevel: 0, effLevel: 0, serverTime: phaseStartedAt }, isMainOrAdmin);
+  } else if (next === 'FIXED_REVEAL') {
+    broadcast(
+      {
+        type: 'dev',
+        devProgress: round.finalDevProgress ?? round.devProgress,
+        audioLevel: 0,
+        effLevel: 0,
+        serverTime: phaseStartedAt,
+      },
+      isMainOrAdmin,
+    );
+  }
 
-  if (phaseDurationMs > 0) schedule(endAtMs ?? phaseStartedAt + phaseDurationMs);
+  if (phaseDurationMs > 0) schedule(phaseStartedAt + phaseDurationMs);
   console.log(`[state] → ${next} (${phaseDurationMs}ms) roll=${round.rollNumber} frame=${pad(round.frameNumber, 2)}A round=${round.id}`);
   broadcast(stateMsg());
 }
@@ -438,7 +527,7 @@ function schedule(atMs: number): void {
   if (phaseTimer) clearTimeout(phaseTimer);
   const current = state;
   phaseTimer = setTimeout(() => {
-    if (state === current) enter(NEXT[current]);
+    if (state === current) enter(nextPhaseAfter(current), 'timeout');
   }, Math.max(0, atMs - Date.now()));
 }
 
@@ -447,70 +536,26 @@ function tryStart(trigger: string): boolean {
   const nextFrame = countRollFramesSync(config.rollNumber) + 1;
   round = freshRound(round.id + 1, config.rollNumber, nextFrame);
   round.trigger = trigger;
-  audioClips = [];
   enter('ENTER_BUFFER');
   return true;
 }
 
-/** ACTIVE_30S 内的剧情秒数（已按 TIME_SCALE 还原） */
-function activeSec(): number {
-  return (Date.now() - phaseStartedAt) / TIME_SCALE / 1000;
+function onAudioEnergy(rawLevel: number): void {
+  const n = Number(rawLevel);
+  if (!Number.isFinite(n)) return;
+  const level = Math.max(0, Math.min(1, n));
+  if (state !== 'DEVELOPING') return;
+  latestAudioLevel = level;
+  lastEnergyAt = Date.now();
 }
 
-function onSpeak(ws: WebSocket, mime: string, dataUrl: string, offsetMs: number): void {
-  if (state !== 'ACTIVE_30S' && state !== 'FLASH_FREEZE') {
-    return send(ws, { type: 'ack', what: 'speak', ok: false, message: 'Audio clip not accepted in this phase' });
+function onTriggerFix(ws: WebSocket): void {
+  if (state !== 'DEVELOPING') {
+    return send(ws, { type: 'ack', what: 'TRIGGER_FIX', ok: false, message: 'Fixation only active during DEVELOPING' });
   }
-  if (typeof dataUrl !== 'string' || dataUrl.length < 100) {
-    return send(ws, { type: 'ack', what: 'speak', ok: false, message: 'empty' });
-  }
-  if (audioClips.length >= TIMELINE.maxAudioClips) {
-    return send(ws, { type: 'ack', what: 'speak', ok: false, message: `Max ${TIMELINE.maxAudioClips} clips reached this round` });
-  }
-  const offset = Math.max(0, Math.min(PHASE_SECONDS.ACTIVE_30S * 1000 * TIME_SCALE, Math.round(Number(offsetMs) || 0)));
-  // 录音必须开始于 Protocol 01 窗口（04s~16s，容差 0.5s）
-  const offsetSec = offset / 1000 / TIME_SCALE;
-  if (offsetSec < TIMELINE.station1P1[0] - 0.5 || offsetSec > TIMELINE.station1P1[1] + 0.5) {
-    return send(ws, { type: 'ack', what: 'speak', ok: false, message: 'Clip outside the 04s–16s vocal calibration window; ignored' });
-  }
-  const clip: AudioClip = {
-    mime: String(mime || 'audio/webm').slice(0, 80),
-    dataUrl,
-    offsetMs: offset,
-  };
-  audioClips.push(clip);
-  audioClips.sort((a, b) => a.offsetMs - b.offsetMs);
-  round.didSpeak = true;
-  round.audioClipCount = audioClips.length;
-  round.audioOffsetsMs = audioClips.map((c) => c.offsetMs);
-  console.log(
-    `[round ${round.id}] 收到校准语音 #${audioClips.length}/${TIMELINE.maxAudioClips} ${(dataUrl.length / 1024).toFixed(0)}KB @${offset}ms`,
-  );
-  broadcast({ type: 'audio', clip, index: audioClips.length - 1, roundId: round.id }, toRole('main'));
-  send(ws, { type: 'ack', what: 'speak', ok: true, message: `Clip ${audioClips.length}/${TIMELINE.maxAudioClips} logged` });
-  broadcast(stateMsg());
-}
-
-function onBreaker(ws: WebSocket): void {
-  if (state !== 'ACTIVE_30S' || round.didPullBreaker) return;
-  const t = activeSec();
-  if (t < TIMELINE.station2P3[0] - 0.5) {
-    return send(ws, { type: 'ack', what: 'breaker', ok: false, message: 'Fixation phase has not started yet' });
-  }
-  round.didPullBreaker = true;
-  round.breakerPulledAtSec = Math.round(t * 1000) / 1000;
-  if (t < TIMELINE.breakerSpoilerGuard) {
-    // 防提前截断保护：锁定推杆显示 FIXING EXPOSURE...，等到 29.5s 再全局定格
-    round.breakerLocked = true;
-    schedule(phaseStartedAt + TIMELINE.breakerDelayedFlash * 1000 * TIME_SCALE);
-    console.log(`[round ${round.id}] 定影推杆提前拉到底 @${t.toFixed(2)}s → 锁定至 ${TIMELINE.breakerDelayedFlash}s`);
-    broadcast({ type: 'breaker', status: 'locked', atSec: round.breakerPulledAtSec });
-    broadcast(stateMsg());
-  } else {
-    console.log(`[round ${round.id}] 定影推杆完成 @${t.toFixed(2)}s → 立即定格`);
-    broadcast({ type: 'breaker', status: 'flash', atSec: round.breakerPulledAtSec });
-    enter('FLASH_FREEZE');
-  }
+  console.log(`[round ${round.id}] 定影推杆拉到底 → FIXED_REVEAL (dev=${(round.devProgress * 100).toFixed(1)}%)`);
+  enter('FIXED_REVEAL', 'station2');
+  send(ws, { type: 'ack', what: 'TRIGGER_FIX', ok: true, message: 'Fixed' });
 }
 
 async function onFreeze(ws: WebSocket, data: string): Promise<void> {
@@ -519,15 +564,17 @@ async function onFreeze(ws: WebSocket, data: string): Promise<void> {
   if (round.hasFreeze || freezeSaving) {
     return send(ws, { type: 'ack', what: 'freeze', ok: false, message: 'Freeze frame already saved this round' });
   }
-  if (state === 'IDLE' || state === 'ENTER_BUFFER' || state === 'ACTIVE_30S') {
-    return send(ws, { type: 'ack', what: 'freeze', ok: false, message: 'Freeze frame not accepted in this phase' });
+  const justExitedReveal = state === 'IDLE' && round.id > 0 && Date.now() - lastFixedRoundEndAt < 3000;
+  if (state !== 'FIXED_REVEAL' && !justExitedReveal) {
+    return send(ws, { type: 'ack', what: 'freeze', ok: false, message: 'Freeze frame only accepted in FIXED_REVEAL' });
   }
   freezeSaving = true;
   try {
-    const { photo, archiveName, sheet } = await saveFreeze(buf, round.rollNumber, round.frameNumber, round.id);
+    const devPct = (round.finalDevProgress ?? round.devProgress) * 100;
+    const { photo, archiveName, sheet } = await saveFreeze(buf, round.rollNumber, round.frameNumber, round.id, devPct);
     round.hasFreeze = true;
     currentSheet = sheet;
-    console.log(`[round ${round.id}] 底片已入档 ${archiveName} (${(buf.length / 1024).toFixed(0)}KB)`);
+    console.log(`[round ${round.id}] 底片已入档 ${archiveName} (${(buf.length / 1024).toFixed(0)}KB, dev=${Math.round(devPct)}%)`);
     send(ws, { type: 'ack', what: 'freeze', ok: true, message: archiveName });
     broadcast({ type: 'door-photo', photo, serverTime: Date.now() });
     broadcast({ type: 'contact-sheet', sheet, serverTime: Date.now() });
@@ -543,7 +590,7 @@ async function onFreeze(ws: WebSocket, data: string): Promise<void> {
 async function onAdmin(ws: WebSocket, action: string, cfg?: Partial<AppConfig>): Promise<void> {
   switch (action) {
     case 'reset':
-      audioClips = [];
+      stopDevLoop();
       enter('IDLE');
       return send(ws, { type: 'ack', what: 'reset', ok: true, message: 'Reset to IDLE' });
 
@@ -552,8 +599,8 @@ async function onAdmin(ws: WebSocket, action: string, cfg?: Partial<AppConfig>):
         return send(ws, { type: 'ack', what: 'skipPhase', ok: false, message: 'Already in IDLE' });
       }
       const prev = state;
-      const next = NEXT[state];
-      enter(next);
+      const next = nextPhaseAfter(prev);
+      enter(next, 'admin');
       return send(ws, { type: 'ack', what: 'skipPhase', ok: true, message: `Skipped ${prev} → ${next}` });
     }
 
@@ -591,14 +638,27 @@ async function onAdmin(ws: WebSocket, action: string, cfg?: Partial<AppConfig>):
     }
 
     case 'testFlash':
-      broadcast({ type: 'flash', serverTime: Date.now() }, toRole('main'));
+      broadcast({ type: 'flash', serverTime: Date.now() }, (p) => p.role === 'main');
       return send(ws, { type: 'ack', what: 'testFlash', ok: true, message: 'Test flash sent to main screen' });
 
+    case 'testDevelop':
+      if (state !== 'DEVELOPING') {
+        return send(ws, { type: 'ack', what: 'testDevelop', ok: false, message: 'Only available during DEVELOPING' });
+      }
+      latestAudioLevel = 0.72;
+      lastEnergyAt = Date.now() + 1200;
+      return send(ws, { type: 'ack', what: 'testDevelop', ok: true, message: 'Developing pulse (+1.5s)' });
+
     case 'setConfig': {
-      // rollNumber 仅由 newRoll 或显式正整数更新
       const merged: Partial<AppConfig> = {
         enterBufferSec: cfg?.enterBufferSec ?? config.enterBufferSec,
-        cctvRevealSec: cfg?.cctvRevealSec ?? config.cctvRevealSec,
+        safelightSec: cfg?.safelightSec ?? config.safelightSec,
+        exposureSec: cfg?.exposureSec ?? config.exposureSec,
+        maxDevelopSec: cfg?.maxDevelopSec ?? config.maxDevelopSec,
+        revealSec: cfg?.revealSec ?? config.revealSec,
+        noiseFloor: cfg?.noiseFloor ?? config.noiseFloor,
+        devSpeed: cfg?.devSpeed ?? config.devSpeed,
+        printMode: cfg?.printMode ?? config.printMode,
         rollNumber: cfg?.rollNumber ?? config.rollNumber,
       };
       config = sanitizeConfig(merged, config);
@@ -608,11 +668,15 @@ async function onAdmin(ws: WebSocket, action: string, cfg?: Partial<AppConfig>):
         console.error('[config] 保存失败', err);
       }
       broadcast({ type: 'config', config });
+      if (state !== 'FIXED_REVEAL' && round.printMode !== config.printMode) {
+        round.printMode = config.printMode;
+        broadcast(stateMsg());
+      }
       return send(ws, {
         type: 'ack',
         what: 'setConfig',
         ok: true,
-        message: `Saved · Buffer ${config.enterBufferSec}s · CCTV ${config.cctvRevealSec}s`,
+        message: `Config saved (${config.printMode === 'photogram_negative' ? 'NEGATIVE' : 'POSITIVE'})`,
       });
     }
 
@@ -623,8 +687,7 @@ async function onAdmin(ws: WebSocket, action: string, cfg?: Partial<AppConfig>):
 
 // ======================================================================
 server.listen(PORT, HOST, () => {
-  console.log(`《入画三十秒 (RH-30)》v2 服务已启动 http://${HOST}:${PORT}  (TIME_SCALE=${TIME_SCALE}, ROLL=${pad(config.rollNumber, 2)})`);
-  console.log(`  assets: ${ASSETS_DIR}`);
+  console.log(`《入画三十秒 (RH-30)》v3 活体暗房引擎已启动 http://${HOST}:${PORT}  (TIME_SCALE=${TIME_SCALE}, ROLL=${pad(config.rollNumber, 2)})`);
   console.log(`  data:   ${DATA_DIR}`);
   console.log(`  public: ${PUBLIC_DIR}`);
   if (ADMIN_TOKEN) console.log('  ADMIN_TOKEN 已启用：/admin?token=...');
@@ -634,6 +697,7 @@ function shutdown(sig: string): void {
   console.log(`收到 ${sig}，正在关闭...`);
   clearInterval(heartbeat);
   clearInterval(adminStatusTimer);
+  stopDevLoop();
   for (const ws of peers.keys()) ws.close(1001, 'server shutdown');
   wss.close();
   server.close(() => process.exit(0));
