@@ -1,0 +1,10 @@
+node_modules
+build
+dist
+.git
+.env
+*.log
+assets
+data
+README.md
+.DS_Store

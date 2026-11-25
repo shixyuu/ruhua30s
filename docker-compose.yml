@@ -1,0 +1,39 @@
+services:
+  app:
+    build: .
+    image: ruhua30s:latest
+    container_name: ruhua30s-app
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      PORT: "3000" # Caddy 固定反代 app:3000
+      HOST: 0.0.0.0
+    volumes:
+      - ./assets:/app/assets # 实拍视频：base.mp4 / rewind.mp4（scp 覆盖即可热更新）
+      - ./data:/app/data # latest-door.jpg / config.json / archive/
+    expose:
+      - "3000"
+    logging:
+      driver: json-file
+      options: { max-size: "10m", max-file: "3" }
+
+  caddy:
+    image: caddy:2-alpine
+    container_name: ruhua30s-caddy
+    restart: unless-stopped
+    depends_on:
+      - app
+    ports:
+      - "80:80"
+      - "443:443"
+      - "443:443/udp"
+    environment:
+      DOMAIN: ${DOMAIN:?请在 .env 中设置 DOMAIN}
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data # Let's Encrypt 证书持久化
+      - caddy_config:/config
+
+volumes:
+  caddy_data:
+  caddy_config:

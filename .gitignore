@@ -1,0 +1,11 @@
+node_modules/
+build/
+dist/
+.env
+*.log
+.DS_Store
+# 运行数据与实拍素材不入库（保留目录）
+assets/*
+!assets/.gitkeep
+data/*
+!data/.gitkeep
