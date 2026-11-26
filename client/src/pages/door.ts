@@ -1,19 +1,32 @@
 /**
- * /door — tablet 1: entrance 35mm contact sheet + extrapolated FORECAST slot (pure display, zero front camera)
- * - Pure #080706 background, adaptive 3×2 (<=6) or 4×3 (7..12) contact sheet grid.
- * - Shows chronological history frames (00A, 01A, 02A...) with strict `object-fit: contain`.
- * - Immediately after history frames, a dark-red bordered FORECAST cell shows the server-pushed `currentForecast`
- *   labeled `FORECAST · [NEXT FR]`.
- * - ENTER_BUFFER shows centered minimalist safelight-red prompt: SHUTTER RELEASED · LIFT CURTAIN & ENTER.
- * - Fixed opaque dark bottom bar: ROLL XX · HISTORY & EXTRAPOLATED NEXT FRAME.
+ * /door — tablet 1: entrance darkroom display (OBSERVED PAST vs PREDICTED FUTURE)
+ * - Pure #080706 background.
+ * - Left (~62%): OBSERVED PAST — adaptive grid of up to 9 latest frames (00A, 01A...), strict `object-fit: contain`,
+ *   each labeled with frameNo & outcome short code (FIXED / BURNED / UNDER / LEAK).
+ * - Right (~38%): PREDICTED FUTURE · [NEXT FR] — enlarged red-bordered forecast frame with SVG crayon collapseZone
+ *   overlay (or clean empty frame `AWAITING SEED 00A`).
+ * - Bottom independent bar: `Projected from past traces. Step into the light to alter this frame.`
+ * - ENTER_BUFFER: `SHUTTER RELEASED · LIFT CURTAIN & ENTER`.
  */
 import { Net, mountNetDot } from '../lib/net';
 import { escapeHtml, showStartOverlay } from '../lib/unlock';
 import { TITLE_EN } from '../lib/brand';
-import type { ContactSheetInfo, ForecastInfo, Phase } from '../../../shared/protocol';
+import type { CollapseZone, ContactSheetInfo, ForecastInfo, Phase } from '../../../shared/protocol';
 
 function pad2(n: number): string {
   return String(Math.max(0, Math.floor(n))).padStart(2, '0');
+}
+
+function collapseSvg(cz?: CollapseZone | null): string {
+  if (!cz) return '';
+  const cx = (cz.cx * 320).toFixed(1);
+  const cy = (cz.cy * 180).toFixed(1);
+  const rx = (cz.rx * 320).toFixed(1);
+  const ry = (cz.ry * 180).toFixed(1);
+  return `<svg class="door-cz-svg" viewBox="0 0 320 180" preserveAspectRatio="xMidYMid meet" aria-hidden="true">
+    <ellipse cx="${cx}" cy="${cy}" rx="${rx}" ry="${ry}" fill="none" stroke="#e13a2e" stroke-width="2.6" stroke-dasharray="10 3" opacity="0.92" />
+    <ellipse cx="${Number(cx) + 1.5}" cy="${Number(cy) - 1.2}" rx="${Number(rx) - 1.5}" ry="${Number(ry) + 1.2}" fill="none" stroke="#ff6c60" stroke-width="1.2" opacity="0.55" />
+  </svg>`;
 }
 
 export default async function door(app: HTMLElement): Promise<void> {
@@ -21,11 +34,18 @@ export default async function door(app: HTMLElement): Promise<void> {
 
   app.innerHTML = `
     <div class="door-sheet" id="sheetWrap">
-      <main class="cs-stage">
-        <div class="cs-grid cols-3" id="grid"></div>
+      <main class="door-split">
+        <section class="door-past">
+          <div class="zone-head"><span>OBSERVED PAST</span><span class="mono" id="rollTag">ROLL 01</span></div>
+          <div class="past-grid cols-3" id="pastGrid"></div>
+        </section>
+        <section class="door-future">
+          <div class="zone-head future"><span id="futureHead">PREDICTED FUTURE · 00A</span></div>
+          <div class="future-box" id="futureBox"></div>
+        </section>
       </main>
       <footer class="cs-foot">
-        <span id="footText">ROLL 01 · HISTORY &amp; EXTRAPOLATED NEXT FRAME</span>
+        <span>Projected from past traces. Step into the light to alter this frame.</span>
       </footer>
     </div>
     <div class="door-enter" id="enterModal">
@@ -33,8 +53,10 @@ export default async function door(app: HTMLElement): Promise<void> {
     </div>`;
 
   const sheetWrap = app.querySelector('#sheetWrap') as HTMLDivElement;
-  const grid = app.querySelector('#grid') as HTMLDivElement;
-  const footText = app.querySelector('#footText') as HTMLSpanElement;
+  const rollTag = app.querySelector('#rollTag') as HTMLSpanElement;
+  const pastGrid = app.querySelector('#pastGrid') as HTMLDivElement;
+  const futureHead = app.querySelector('#futureHead') as HTMLSpanElement;
+  const futureBox = app.querySelector('#futureBox') as HTMLDivElement;
   const enterModal = app.querySelector('#enterModal') as HTMLDivElement;
 
   const net = new Net('door');
@@ -47,57 +69,57 @@ export default async function door(app: HTMLElement): Promise<void> {
     const allFrames = sheet?.frames ?? [];
     const forecast = sheet?.forecast ?? stateForecast ?? net.state?.forecast ?? null;
     const totalExposed = sheet?.totalInRoll ?? allFrames.length;
-    const fcKey = forecast ? `${forecast.has}:${forecast.version}:${forecast.targetFrameNo}:${forecast.url ?? ''}` : 'none';
-    const key = JSON.stringify([rollNo, totalExposed, allFrames.map((f) => f.url), fcKey]);
-    footText.textContent = `ROLL ${pad2(rollNo)} · HISTORY & EXTRAPOLATED NEXT FRAME`;
+    const cz = forecast?.collapseZone ?? null;
+    const fcKey = forecast
+      ? `${forecast.has}:${forecast.version}:${forecast.targetFrameNo}:${forecast.url ?? ''}:${cz ? `${cz.cx},${cz.cy}` : ''}`
+      : 'none';
+    const key = JSON.stringify([rollNo, totalExposed, allFrames.map((f) => [f.url, f.outcomeCode]), fcKey]);
+    rollTag.textContent = `ROLL ${pad2(rollNo)}`;
 
     if (key === sheetKey) return;
     sheetKey = key;
 
-    // Leave at least 1 slot for the trailing FORECAST cell (up to 11 history + 1 forecast = 12)
-    const visible = allFrames.slice(-11);
-    const totalSlots = visible.length + 1 <= 6 ? 6 : 12;
-    grid.className = `cs-grid ${totalSlots === 6 ? 'cols-3' : 'cols-4'}`;
+    const visible = allFrames.slice(-9);
+    const totalSlots = visible.length <= 4 ? 4 : visible.length <= 6 ? 6 : 9;
+    pastGrid.className = `past-grid ${totalSlots === 4 ? 'cols-2' : 'cols-3'}`;
 
     const cells: string[] = [];
     visible.forEach((f) => {
+      const code = f.outcomeCode || 'FIXED';
       cells.push(`
         <div class="cs-cell filled">
           <div class="cs-imgbox">
             <img src="${escapeHtml(f.url)}" alt="${escapeHtml(f.frameNo)}" loading="eager" />
           </div>
-          <div class="cs-label">${escapeHtml(f.frameNo)}</div>
+          <div class="cs-label">${escapeHtml(f.frameNo)} · ${escapeHtml(code)}</div>
         </div>`);
     });
 
-    // Trailing FORECAST slot highlighted in fine dark-red border
-    const targetNo = forecast?.targetFrameNo || `${pad2(visible.length)}A`;
-    if (forecast?.has && forecast.url) {
-      cells.push(`
-        <div class="cs-cell forecast">
-          <div class="cs-imgbox">
-            <img src="${escapeHtml(forecast.url)}" alt="Forecast ${escapeHtml(targetNo)}" loading="eager" />
-          </div>
-          <div class="cs-label">FORECAST · ${escapeHtml(targetNo)}</div>
-        </div>`);
-    } else {
-      cells.push(`
-        <div class="cs-cell forecast empty">
-          <div class="cs-imgbox"></div>
-          <div class="cs-label">${visible.length === 0 ? 'SEED · 00A' : `FORECAST · ${escapeHtml(targetNo)}`}</div>
-        </div>`);
-    }
-
-    const startIdx = visible.length === 0 ? 1 : (visible[visible.length - 1]?.index ?? visible.length - 1) + 2;
-    for (let k = visible.length + 1; k < totalSlots; k++) {
-      const nextNo = startIdx + (k - (visible.length + 1));
+    const startIdx = visible.length === 0 ? 0 : (visible[visible.length - 1]?.index ?? visible.length - 1) + 1;
+    for (let k = visible.length; k < totalSlots; k++) {
+      const nextNo = startIdx + (k - visible.length);
       cells.push(`
         <div class="cs-cell empty">
           <div class="cs-imgbox"></div>
           <div class="cs-label">${pad2(nextNo)}A</div>
         </div>`);
     }
-    grid.innerHTML = cells.join('');
+    pastGrid.innerHTML = cells.join('');
+
+    const targetNo = forecast?.targetFrameNo || (allFrames.length === 0 ? '00A' : `${pad2(allFrames.length)}A`);
+    if (forecast?.has && forecast.url) {
+      futureHead.textContent = `PREDICTED FUTURE · ${targetNo}`;
+      futureBox.className = 'future-box active';
+      futureBox.innerHTML = `
+        <div class="future-frame">
+          <img src="${escapeHtml(forecast.url)}" alt="Predicted ${escapeHtml(targetNo)}" loading="eager" />
+          ${collapseSvg(cz)}
+        </div>`;
+    } else {
+      futureHead.textContent = `PREDICTED FUTURE · ${targetNo}`;
+      futureBox.className = 'future-box empty';
+      futureBox.innerHTML = `<div class="future-empty">${allFrames.length === 0 ? 'AWAITING SEED 00A' : `FORECASTING ${escapeHtml(targetNo)}`}</div>`;
+    }
   }
 
   async function refreshSheetHttp(): Promise<void> {
@@ -115,7 +137,7 @@ export default async function door(app: HTMLElement): Promise<void> {
 
   function renderPhase(phase: Phase): void {
     const isEnter = phase === 'ENTER_BUFFER';
-    const isDim = phase === 'SAFELIGHT_COMPOSE' || phase === 'EXPOSURE' || phase === 'DEVELOPING';
+    const isDim = phase === 'SAFELIGHT_COMPOSE' || phase === 'EXPOSURE' || phase === 'DEVELOPING' || phase === 'LIGHT_LEAK';
     enterModal.classList.toggle('show', isEnter);
     sheetWrap.classList.toggle('dim-deep', isEnter);
     sheetWrap.classList.toggle('dim', isDim);
@@ -136,7 +158,7 @@ export default async function door(app: HTMLElement): Promise<void> {
   await showStartOverlay({
     code: 'T-01',
     kicker: '/door',
-    title: 'CONTACT SHEET',
+    title: 'OBSERVED PAST · FORECAST',
     subtitle: 'Tap to lock fullscreen',
     button: 'TAP TO START',
   });

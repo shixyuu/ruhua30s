@@ -9,8 +9,10 @@ import express, { NextFunction, Request, Response } from 'express';
 import { WebSocketServer, WebSocket, RawData } from 'ws';
 import {
   AppConfig,
+  ChemicalOutcome,
   ClientMsg,
   ClientStatus,
+  CollapseZone,
   ContactSheetInfo,
   Phase,
   Role,
@@ -22,7 +24,7 @@ import {
   ASSETS_DIR,
   DATA_DIR,
   countRollFramesSync,
-  currentForecastArchiveUrl,
+  currentForecastSnapshot,
   decodeJpeg,
   doorPhotoInfo,
   ensureDirs,
@@ -213,7 +215,7 @@ function broadcast(msg: ServerMsg, filter?: (p: Peer) => boolean): void {
   }
 }
 
-const isMainOrAdmin = (p: Peer) => p.role === 'main' || p.role === 'admin';
+const isDevSubscriber = (p: Peer) => p.role === 'main' || p.role === 'admin' || p.role === 'station2';
 
 function clientCounts(): Record<Role, number> {
   const c: Record<Role, number> = { main: 0, door: 0, station1: 0, station2: 0, admin: 0 };
@@ -298,7 +300,7 @@ async function sendFullSync(ws: WebSocket, peer: Peer): Promise<void> {
   currentSheet = await getContactSheet(config.rollNumber);
   send(ws, { type: 'contact-sheet', sheet: currentSheet, serverTime: Date.now() });
   if (peer.role === 'admin') send(ws, { type: 'clients', clients: clientStatuses(), serverTime: Date.now() });
-  if (peer.role === 'main' || peer.role === 'admin') {
+  if (peer.role === 'main' || peer.role === 'admin' || peer.role === 'station2') {
     send(ws, {
       type: 'dev',
       devProgress: round.finalDevProgress ?? round.devProgress,
@@ -349,7 +351,7 @@ function handleMessage(ws: WebSocket, peer: Peer, msg: ClientMsg): void {
       return onTriggerFix(ws);
     case 'freeze':
       if (peer.role !== 'main') return;
-      return void onFreeze(ws, msg.data, msg.forecastData);
+      return void onFreeze(ws, msg.data, msg.forecastData, msg.collapseZone ?? null, msg.deviationPct ?? null);
     case 'admin': {
       if (peer.role !== 'admin' || !(peer.isAdmin || (ADMIN_TOKEN && msg.token === ADMIN_TOKEN))) {
         return send(ws, { type: 'ack', what: msg.action, ok: false, message: 'Not authorised (ADMIN_TOKEN)' });
@@ -374,7 +376,13 @@ let lastEnergyAt = 0;
 let lastFixedRoundEndAt = 0;
 let freezeSaving = false;
 
-function freshRound(id: number, rollNumber: number, frameNumber: number, predictedUrl: string | null = null): RoundInfo {
+function freshRound(
+  id: number,
+  rollNumber: number,
+  frameNumber: number,
+  predictedUrl: string | null = null,
+  collapseZone: CollapseZone | null = null,
+): RoundInfo {
   return {
     id,
     rollNumber,
@@ -383,8 +391,11 @@ function freshRound(id: number, rollNumber: number, frameNumber: number, predict
     devProgress: 0,
     finalDevProgress: null,
     fixTriggeredBy: null,
+    outcome: null,
+    deviationPct: null,
     hasFreeze: false,
     predictedUrl,
+    collapseZone,
     trigger: null,
   };
 }
@@ -400,6 +411,8 @@ function nextPhaseAfter(cur: Phase): Phase {
     case 'EXPOSURE':
       return 'DEVELOPING';
     case 'DEVELOPING':
+      return round.devProgress >= 0.2 ? 'LIGHT_LEAK' : 'FIXED_REVEAL';
+    case 'LIGHT_LEAK':
       return 'FIXED_REVEAL';
     case 'FIXED_REVEAL':
       return 'IDLE';
@@ -425,6 +438,9 @@ function durationFor(p: Phase): number {
       break;
     case 'DEVELOPING':
       sec = config.maxDevelopSec;
+      break;
+    case 'LIGHT_LEAK':
+      sec = 2.2;
       break;
     case 'FIXED_REVEAL':
       sec = config.revealSec;
@@ -480,9 +496,16 @@ function startDevLoop(): void {
         effLevel: eff,
         serverTime: now,
       },
-      isMainOrAdmin,
+      isDevSubscriber,
     );
   }, DEV_TICK_MS);
+}
+
+function classifyOutcome(dev: number, by: 'station2' | 'timeout' | 'admin'): ChemicalOutcome {
+  if (by === 'timeout' && dev >= 0.2) return 'UNFIXED_LIGHT_LEAK';
+  if (dev < 0.2) return 'UNDERDEVELOPED_TRACE_LOST';
+  if (dev > 1.05) return 'OVERDEVELOPED_BURNED';
+  return 'FIXED_OPTIMAL';
 }
 
 function lockDevelopment(by: 'station2' | 'timeout' | 'admin'): void {
@@ -490,6 +513,7 @@ function lockDevelopment(by: 'station2' | 'timeout' | 'admin'): void {
   if (round.finalDevProgress == null) {
     round.finalDevProgress = round.devProgress;
     round.fixTriggeredBy = by;
+    round.outcome = classifyOutcome(round.devProgress, by);
   }
 }
 
@@ -498,8 +522,8 @@ function enter(next: Phase, fixSource: 'station2' | 'timeout' | 'admin' = 'timeo
   phaseTimer = null;
 
   const prev = state;
-  if (prev === 'DEVELOPING' && next === 'FIXED_REVEAL') {
-    lockDevelopment(fixSource);
+  if (prev === 'DEVELOPING' && (next === 'FIXED_REVEAL' || next === 'LIGHT_LEAK')) {
+    lockDevelopment(next === 'LIGHT_LEAK' ? 'timeout' : fixSource);
   } else if (prev === 'DEVELOPING') {
     stopDevLoop();
   }
@@ -515,9 +539,11 @@ function enter(next: Phase, fixSource: 'station2' | 'timeout' | 'admin' = 'timeo
     round.devProgress = 0;
     round.finalDevProgress = null;
     round.fixTriggeredBy = null;
+    round.outcome = null;
+    round.deviationPct = null;
     startDevLoop();
-    broadcast({ type: 'dev', devProgress: 0, audioLevel: 0, effLevel: 0, serverTime: phaseStartedAt }, isMainOrAdmin);
-  } else if (next === 'FIXED_REVEAL') {
+    broadcast({ type: 'dev', devProgress: 0, audioLevel: 0, effLevel: 0, serverTime: phaseStartedAt }, isDevSubscriber);
+  } else if (next === 'LIGHT_LEAK' || next === 'FIXED_REVEAL') {
     broadcast(
       {
         type: 'dev',
@@ -526,12 +552,12 @@ function enter(next: Phase, fixSource: 'station2' | 'timeout' | 'admin' = 'timeo
         effLevel: 0,
         serverTime: phaseStartedAt,
       },
-      isMainOrAdmin,
+      isDevSubscriber,
     );
   }
 
   if (phaseDurationMs > 0) schedule(phaseStartedAt + phaseDurationMs);
-  console.log(`[state] → ${next} (${phaseDurationMs}ms) roll=${round.rollNumber} frame=${pad(round.frameNumber, 2)}A round=${round.id}`);
+  console.log(`[state] → ${next} (${phaseDurationMs}ms) roll=${round.rollNumber} frame=${pad(round.frameNumber, 2)}A round=${round.id}${round.outcome ? ` outcome=${round.outcome}` : ''}`);
   broadcast(stateMsg());
 }
 
@@ -546,8 +572,8 @@ function schedule(atMs: number): void {
 function tryStart(trigger: string): boolean {
   if (state !== 'IDLE') return false;
   const nextFrame = countRollFramesSync(config.rollNumber);
-  const predictedUrl = nextFrame > 0 ? currentForecastArchiveUrl(config.rollNumber) : null;
-  round = freshRound(round.id + 1, config.rollNumber, nextFrame, predictedUrl);
+  const snap = nextFrame > 0 ? currentForecastSnapshot(config.rollNumber) : { archiveUrl: null, collapseZone: null };
+  round = freshRound(round.id + 1, config.rollNumber, nextFrame, snap.archiveUrl, snap.collapseZone);
   round.trigger = trigger;
   enter('ENTER_BUFFER');
   return true;
@@ -571,7 +597,13 @@ function onTriggerFix(ws: WebSocket): void {
   send(ws, { type: 'ack', what: 'TRIGGER_FIX', ok: true, message: 'Fixed' });
 }
 
-async function onFreeze(ws: WebSocket, data: string, forecastData?: string): Promise<void> {
+async function onFreeze(
+  ws: WebSocket,
+  data: string,
+  forecastData?: string,
+  collapseZone: CollapseZone | null = null,
+  deviationPct: number | null = null,
+): Promise<void> {
   const buf = typeof data === 'string' ? decodeJpeg(data) : null;
   if (!buf) return send(ws, { type: 'ack', what: 'freeze', ok: false, message: 'Not a valid JPEG' });
   if (round.hasFreeze || freezeSaving) {
@@ -584,14 +616,24 @@ async function onFreeze(ws: WebSocket, data: string, forecastData?: string): Pro
   freezeSaving = true;
   try {
     const devPct = (round.finalDevProgress ?? round.devProgress) * 100;
+    if (typeof deviationPct === 'number' && Number.isFinite(deviationPct)) {
+      round.deviationPct = Math.max(0, Math.min(99, Math.round(deviationPct)));
+    }
     const fBuf = typeof forecastData === 'string' ? decodeJpeg(forecastData) : null;
     if (fBuf) {
-      await saveForecast(fBuf, round.rollNumber, round.frameNumber + 1);
+      await saveForecast(fBuf, round.rollNumber, round.frameNumber + 1, collapseZone);
     }
-    const { photo, archiveName, sheet } = await saveFreeze(buf, round.rollNumber, round.frameNumber, round.id, devPct);
+    const { photo, archiveName, sheet } = await saveFreeze(
+      buf,
+      round.rollNumber,
+      round.frameNumber,
+      round.id,
+      devPct,
+      round.outcome ?? 'FIXED_OPTIMAL',
+    );
     round.hasFreeze = true;
     currentSheet = sheet;
-    console.log(`[round ${round.id}] 底片已入档 ${archiveName} (${(buf.length / 1024).toFixed(0)}KB, dev=${Math.round(devPct)}%${fBuf ? ', forecast updated' : ''})`);
+    console.log(`[round ${round.id}] 底片已入档 ${archiveName} (${(buf.length / 1024).toFixed(0)}KB, dev=${Math.round(devPct)}%, outcome=${round.outcome ?? 'FIXED_OPTIMAL'}${fBuf ? ', forecast updated' : ''})`);
     send(ws, { type: 'ack', what: 'freeze', ok: true, message: archiveName });
     broadcast({ type: 'door-photo', photo, serverTime: Date.now() });
     broadcast({ type: 'contact-sheet', sheet, serverTime: Date.now() });

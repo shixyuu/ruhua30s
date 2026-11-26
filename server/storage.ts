@@ -4,12 +4,15 @@ import path from 'node:path';
 import {
   AppConfig,
   CONFIG_BOUNDS,
+  ChemicalOutcome,
+  CollapseZone,
   ContactFrame,
   ContactSheetInfo,
   DEFAULT_CONFIG,
   DoorPhotoInfo,
   ForecastInfo,
   PrintMode,
+  outcomeShortCode,
 } from '../shared/protocol.js';
 
 export const ROOT_DIR = process.cwd();
@@ -180,16 +183,17 @@ export function forecastInfo(rollNumber: number): ForecastInfo {
   try {
     const st = fs.statSync(FORECAST_FILE);
     if (!st.isFile() || st.size === 0) {
-      return { has: false, version: forecastVersion, targetFrameNo: fallbackTarget, url: null };
+      return { has: false, version: forecastVersion, targetFrameNo: fallbackTarget, url: null, collapseZone: null };
     }
     const meta = JSON.parse(fs.readFileSync(FORECAST_META_FILE, 'utf8')) as {
       rollNumber?: number;
       targetFrameNo?: string;
       version?: number;
       archiveUrl?: string;
+      collapseZone?: CollapseZone | null;
     };
     if (meta.rollNumber !== rollNumber) {
-      return { has: false, version: forecastVersion, targetFrameNo: fallbackTarget, url: null };
+      return { has: false, version: forecastVersion, targetFrameNo: fallbackTarget, url: null, collapseZone: null };
     }
     const ver = meta.version || forecastVersion || Math.floor(st.mtimeMs);
     if (forecastVersion === 0) forecastVersion = ver;
@@ -198,9 +202,10 @@ export function forecastInfo(rollNumber: number): ForecastInfo {
       version: ver,
       targetFrameNo: meta.targetFrameNo || fallbackTarget,
       url: `/data/latest-forecast.jpg?v=${ver}`,
+      collapseZone: meta.collapseZone ?? null,
     };
   } catch {
-    return { has: false, version: forecastVersion, targetFrameNo: fallbackTarget, url: null };
+    return { has: false, version: forecastVersion, targetFrameNo: fallbackTarget, url: null, collapseZone: null };
   }
 }
 
@@ -208,6 +213,7 @@ export async function saveForecast(
   buf: Buffer,
   rollNumber: number,
   targetFrameNumber: number,
+  collapseZone: CollapseZone | null = null,
 ): Promise<{ forecast: ForecastInfo; archiveUrl: string }> {
   const rFolder = rollDirName(rollNumber);
   const fDir = path.join(FORECAST_DIR, rFolder);
@@ -224,7 +230,7 @@ export async function saveForecast(
   await fsp.rename(tmpImg, FORECAST_FILE);
 
   const tmpMeta = tmpName(FORECAST_META_FILE);
-  await fsp.writeFile(tmpMeta, JSON.stringify({ rollNumber, targetFrameNo, version: ver, archiveUrl }));
+  await fsp.writeFile(tmpMeta, JSON.stringify({ rollNumber, targetFrameNo, version: ver, archiveUrl, collapseZone }));
   await fsp.rename(tmpMeta, FORECAST_META_FILE);
 
   return {
@@ -233,22 +239,26 @@ export async function saveForecast(
       version: ver,
       targetFrameNo,
       url: `/data/latest-forecast.jpg?v=${ver}`,
+      collapseZone,
     },
     archiveUrl,
   };
 }
 
-export function currentForecastArchiveUrl(rollNumber: number): string | null {
+export function currentForecastSnapshot(rollNumber: number): { archiveUrl: string | null; collapseZone: CollapseZone | null } {
   try {
     const meta = JSON.parse(fs.readFileSync(FORECAST_META_FILE, 'utf8')) as {
       rollNumber?: number;
       archiveUrl?: string;
+      collapseZone?: CollapseZone | null;
     };
-    if (meta.rollNumber === rollNumber && meta.archiveUrl) return meta.archiveUrl;
+    if (meta.rollNumber === rollNumber) {
+      return { archiveUrl: meta.archiveUrl ?? null, collapseZone: meta.collapseZone ?? null };
+    }
   } catch {
     /* ignore */
   }
-  return null;
+  return { archiveUrl: null, collapseZone: null };
 }
 
 export async function resetForecast(): Promise<void> {
@@ -288,6 +298,21 @@ export function countRollFramesSync(rollNumber: number): number {
   }
 }
 
+function codeToOutcome(code?: string): ChemicalOutcome | null {
+  switch (code) {
+    case 'FIXED':
+      return 'FIXED_OPTIMAL';
+    case 'BURNED':
+      return 'OVERDEVELOPED_BURNED';
+    case 'UNDER':
+      return 'UNDERDEVELOPED_TRACE_LOST';
+    case 'LEAK':
+      return 'UNFIXED_LIGHT_LEAK';
+    default:
+      return null;
+  }
+}
+
 /** 读取指定胶卷的完整接触印相表（按时间升序编号 00A, 01A, 02A...） */
 export async function getContactSheet(rollNumber: number): Promise<ContactSheetInfo> {
   const rFolder = rollDirName(rollNumber);
@@ -313,7 +338,9 @@ export async function getContactSheet(rollNumber: number): Promise<ContactSheetI
   const frames: ContactFrame[] = raw.map((it, idx) => {
     const fm = /-f(\d+)/i.exec(it.name);
     const dm = /-d(\d+)/i.exec(it.name);
+    const om = /-o(FIXED|BURNED|UNDER|LEAK)/i.exec(it.name);
     const num = fm ? Number(fm[1]) : idx;
+    const outcomeCode = om ? om[1].toUpperCase() : 'FIXED';
     return {
       frameNo: `${pad(num, 2)}A`,
       index: num,
@@ -321,6 +348,8 @@ export async function getContactSheet(rollNumber: number): Promise<ContactSheetI
       timestamp: it.mtime,
       name: `${rFolder}/${it.name}`,
       devPercent: dm ? Number(dm[1]) : undefined,
+      outcome: codeToOutcome(outcomeCode),
+      outcomeCode,
     };
   });
   return {
@@ -337,12 +366,14 @@ export async function saveFreeze(
   frameNumber: number,
   roundId: number,
   devPercent = 0,
+  outcome: ChemicalOutcome | null = 'FIXED_OPTIMAL',
 ): Promise<{ photo: DoorPhotoInfo; archiveName: string; sheet: ContactSheetInfo }> {
   const rFolder = rollDirName(rollNumber);
   const dir = path.join(ARCHIVE_DIR, rFolder);
   await fsp.mkdir(dir, { recursive: true });
   const dp = Math.max(0, Math.round(devPercent));
-  const fileName = `${timeStamp()}-f${pad(frameNumber, 2)}-d${dp}-r${roundId}.jpg`;
+  const code = outcomeShortCode(outcome);
+  const fileName = `${timeStamp()}-f${pad(frameNumber, 2)}-d${dp}-o${code}-r${roundId}.jpg`;
   await fsp.writeFile(path.join(dir, fileName), buf);
   const tmp = tmpName(DOOR_FILE);
   await fsp.writeFile(tmp, buf);

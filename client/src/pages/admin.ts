@@ -9,7 +9,7 @@
  */
 import { Net } from '../lib/net';
 import type { ContactSheetInfo, PrintMode, Role } from '../../../shared/protocol';
-import { CONFIG_BOUNDS } from '../../../shared/protocol';
+import { CONFIG_BOUNDS, outcomeShortCode } from '../../../shared/protocol';
 import { TITLE_EN } from '../lib/brand';
 import { triggerDownload } from '../lib/media';
 import { escapeHtml } from '../lib/unlock';
@@ -107,8 +107,9 @@ export default function admin(app: HTMLElement): void {
         </div>
 
         <div class="meter-row">
-          <div class="meter-lbl"><span>DEVELOP PROGRESS (85–100% GOLDEN · &gt;100% BURN)</span><span class="mono" id="devPct">0%</span></div>
+          <div class="meter-lbl"><span>DEVELOP (0–20% UNDER · 85–105% GOLD · &gt;105% BURN)</span><span class="mono" id="devPct">0%</span></div>
           <div class="bar-track dev-track">
+            <div class="zone-under"></div>
             <div class="zone-gold"></div>
             <div class="zone-burn"></div>
             <div class="bar-fill dev" id="devBar"></div>
@@ -411,8 +412,8 @@ export default function admin(app: HTMLElement): void {
     micBar.style.width = `${mic}%`;
     devPctEl.textContent = `${dev}%`;
     devBar.style.width = `${Math.min(100, (dev / 150) * 100)}%`;
-    devBar.classList.toggle('gold', dev >= 85 && dev <= 100);
-    devBar.classList.toggle('burn', dev > 100);
+    devBar.classList.toggle('gold', dev >= 85 && dev <= 105);
+    devBar.classList.toggle('burn', dev > 105);
     devReadout.textContent = `DEV ${dev}% · MIC ${mic}%`;
   });
 
@@ -492,21 +493,25 @@ export default function admin(app: HTMLElement): void {
 
     const latestFrame = frames[frames.length - 1];
     const dlName = `RH30_R${pad2(rollNo)}_FR${latestFrame.frameNo}.jpg`;
+    const code = latestFrame.outcomeCode || outcomeShortCode(latestFrame.outcome);
+    const devTxt = latestFrame.devPercent != null ? ` · DEV ${latestFrame.devPercent}%` : '';
+    const devnTxt = net.round?.deviationPct != null && net.round.frameNumber === latestFrame.index ? ` · Δ${net.round.deviationPct}%` : '';
     latestImg.src = latestFrame.url;
     latestImg.classList.remove('hidden');
     latestNone.classList.add('hidden');
-    latestSlug.textContent = `R${pad2(rollNo)} · ${latestFrame.frameNo}${latestFrame.devPercent != null ? ` · DEV ${latestFrame.devPercent}%` : ''}`;
+    latestSlug.textContent = `R${pad2(rollNo)} · ${latestFrame.frameNo} · ${code}${devTxt}${devnTxt}`;
     void cacheLatestForInstax(latestFrame.url, dlName);
 
     const reversed = [...frames].reverse();
     archive.innerHTML = reversed
       .map((f, idx) => {
         const fn = `RH30_R${pad2(rollNo)}_FR${f.frameNo}.jpg`;
+        const fc = f.outcomeCode || outcomeShortCode(f.outcome);
         return `<div class="arch-item${idx === 0 ? ' latest' : ''}">
           <a href="${escapeHtml(f.url)}" download="${escapeHtml(fn)}" title="Download ${escapeHtml(fn)}">
             <img src="${escapeHtml(f.url)}" loading="lazy" alt="${escapeHtml(f.frameNo)}" />
           </a>
-          <div class="arch-fn"><span>${escapeHtml(f.frameNo)}</span><span>${f.devPercent != null ? `${f.devPercent}%` : ''}</span></div>
+          <div class="arch-fn"><span>${escapeHtml(f.frameNo)} · ${escapeHtml(fc)}</span><span>${f.devPercent != null ? `${f.devPercent}%` : ''}</span></div>
         </div>`;
       })
       .join('');

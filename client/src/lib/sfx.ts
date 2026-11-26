@@ -202,8 +202,11 @@ function playEscapementTick(t: number, bus: GainNode, parity: number): void {
   body.stop(t + 0.03);
 }
 
+let timerPeriodSec = 1.0;
+
 export const enlargerTimer = {
-  start(level = 0.85, fadeSec = 0.12): void {
+  start(level = 0.85, fadeSec = 0.12, periodSec = 1.0): void {
+    timerPeriodSec = Math.max(0.25, periodSec);
     const c = audioCtx();
     if (!timerBus) {
       timerBus = c.createGain();
@@ -223,7 +226,7 @@ export const enlargerTimer = {
       while (nextTickAt < now + 0.25) {
         playEscapementTick(nextTickAt, timerBus!, tickParity);
         tickParity ^= 1;
-        nextTickAt += 1.0;
+        nextTickAt += timerPeriodSec;
       }
     };
     scheduler();
@@ -358,4 +361,69 @@ export const devBathAudio = {
 export function stopAllLoops(): void {
   enlargerTimer.stop();
   devBathAudio.stop();
+}
+
+/** Neutral 880Hz 120ms laboratory instrument chime when /station1 & /station2 wake up */
+export function stationWakeChime(): void {
+  const c = audioCtx();
+  const t = c.currentTime + 0.01;
+  const o = c.createOscillator();
+  const g = c.createGain();
+  o.type = 'sine';
+  o.frequency.value = 880;
+  g.gain.setValueAtTime(0.0001, t);
+  g.gain.linearRampToValueAtTime(0.22, t + 0.01);
+  g.gain.exponentialRampToValueAtTime(0.0001, t + 0.12);
+  o.connect(g).connect(out());
+  o.start(t);
+  o.stop(t + 0.14);
+}
+
+/** Low stop-bath thud for OVERDEVELOPED / UNDERDEVELOPED fixation */
+export function stopBathThud(): void {
+  const c = audioCtx();
+  const t = c.currentTime + 0.005;
+  const o = c.createOscillator();
+  const g = c.createGain();
+  o.type = 'triangle';
+  o.frequency.setValueAtTime(160, t);
+  o.frequency.exponentialRampToValueAtTime(52, t + 0.16);
+  g.gain.setValueAtTime(0.32, t);
+  g.gain.exponentialRampToValueAtTime(0.0001, t + 0.18);
+  o.connect(g).connect(out());
+  o.start(t);
+  o.stop(t + 0.2);
+}
+
+/** Harsh brief door-open / light-burst sound for UNFIXED LIGHT LEAK */
+export function lightLeakBurst(): void {
+  const c = audioCtx();
+  const t = c.currentTime + 0.01;
+
+  // Door latch slam + harsh white-light noise sweep
+  const n = c.createBufferSource();
+  n.buffer = noise();
+  const bp = c.createBiquadFilter();
+  bp.type = 'bandpass';
+  bp.frequency.setValueAtTime(1800, t);
+  bp.frequency.exponentialRampToValueAtTime(420, t + 0.55);
+  bp.Q.value = 0.8;
+  const ng = c.createGain();
+  ng.gain.setValueAtTime(0.55, t);
+  ng.gain.exponentialRampToValueAtTime(0.0001, t + 0.6);
+  n.connect(bp).connect(ng).connect(out());
+  n.start(t);
+  n.stop(t + 0.62);
+
+  // Brief high-frequency flash arc
+  const o = c.createOscillator();
+  const og = c.createGain();
+  o.type = 'sawtooth';
+  o.frequency.setValueAtTime(1240, t);
+  o.frequency.exponentialRampToValueAtTime(220, t + 0.35);
+  og.gain.setValueAtTime(0.18, t);
+  og.gain.exponentialRampToValueAtTime(0.0001, t + 0.38);
+  o.connect(og).connect(out());
+  o.start(t);
+  o.stop(t + 0.4);
 }

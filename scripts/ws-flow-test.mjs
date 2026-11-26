@@ -175,7 +175,7 @@ async function main() {
     `station2 定影锁定 finalDevProgress=${reveal.round.finalDevProgress}`,
   );
 
-  // main 上传纯净 JPEG + 下一轮预测 JPEG → 写入磁盘并更新 contact-sheet 与 forecast
+  // main 上传纯净 JPEG + 下一轮预测 JPEG + collapseZone + deviationPct → 写入磁盘并更新 contact-sheet 与 forecast
   const jpeg = Buffer.concat([Buffer.from([0xff, 0xd8, 0xff, 0xe0]), Buffer.alloc(2000, 1), Buffer.from([0xff, 0xd9])]);
   const forecastJpeg = Buffer.concat([Buffer.from([0xff, 0xd8, 0xff, 0xe0]), Buffer.alloc(1200, 2), Buffer.from([0xff, 0xd9])]);
   door.clear();
@@ -183,11 +183,16 @@ async function main() {
     type: 'freeze',
     data: 'data:image/jpeg;base64,' + jpeg.toString('base64'),
     forecastData: 'data:image/jpeg;base64,' + forecastJpeg.toString('base64'),
+    collapseZone: { cx: 0.438, cy: 0.5, rx: 0.095, ry: 0.135 },
+    deviationPct: 38,
   });
   const cs = await door.wait((m) => m.type === 'contact-sheet' && m.sheet.totalInRoll >= 1, 5000, 'contact-sheet');
   ok(
-    cs.sheet.frames.length >= 1 && cs.sheet.forecast?.has === true && !!cs.sheet.forecast?.url,
-    `定格照与下一轮 FORECAST 已加入当前卷接触印相表（ROLL ${cs.sheet.rollNumber}, 共 ${cs.sheet.totalInRoll} 张, forecast=${cs.sheet.forecast?.targetFrameNo}）`,
+    cs.sheet.frames.length >= 1 &&
+      cs.sheet.forecast?.has === true &&
+      !!cs.sheet.forecast?.url &&
+      cs.sheet.forecast?.collapseZone?.cx === 0.438,
+    `定格照与下一轮 FORECAST + collapseZone 已加入当前卷接触印相表（ROLL ${cs.sheet.rollNumber}, 共 ${cs.sheet.totalInRoll} 张, forecast=${cs.sheet.forecast?.targetFrameNo}）`,
   );
 
   await mainC.wait(isState('IDLE'), 10000, 'auto IDLE');
@@ -195,14 +200,25 @@ async function main() {
   const expected = ['ENTER_BUFFER', 'SAFELIGHT_COMPOSE', 'EXPOSURE', 'DEVELOPING', 'FIXED_REVEAL', 'IDLE'];
   ok(JSON.stringify(seen.slice(-6)) === JSON.stringify(expected), `状态序列正确: ${seen.slice(-6).join(' → ')}`);
 
-  // ---- 4. safelightSec = 0 时应直接跳过 SAFELIGHT_COMPOSE ----
+  // ---- 4. DEVELOPING 超时且 devProgress >= 0.20 → 触发 LIGHT_LEAK (2.2s) → FIXED_REVEAL ----
   for (const c of [admin, mainC]) c.clear();
-  admin.send({ type: 'admin', action: 'setConfig', config: { safelightSec: 0 }, token: TOKEN });
+  admin.send({ type: 'admin', action: 'setConfig', config: { safelightSec: 0, exposureSec: 8, maxDevelopSec: 15, revealSec: 6 }, token: TOKEN });
   await admin.wait((m) => m.type === 'config' && m.config.safelightSec === 0, 3000);
   admin.send({ type: 'START_SESSION', token: TOKEN });
   await mainC.wait(isState('ENTER_BUFFER'), 3000);
   const expDirect = await mainC.wait(isState('EXPOSURE'), 5000);
   ok(expDirect.state === 'EXPOSURE' && !mainC.msgs.some(isState('SAFELIGHT_COMPOSE')), 'safelightSec=0 时直接从 ENTER_BUFFER 跳入 EXPOSURE');
+  await mainC.wait(isState('DEVELOPING'), 5000);
+  for (let i = 0; i < 4; i++) {
+    s1.send({ type: 'AUDIO_ENERGY', level: 0.9 });
+    await sleep(60);
+  }
+  const leakState = await mainC.wait(isState('LIGHT_LEAK'), 5000, 'LIGHT_LEAK');
+  const leakReveal = await mainC.wait(isState('FIXED_REVEAL'), 3000, 'FIXED_REVEAL after LIGHT_LEAK');
+  ok(
+    leakState.round.outcome === 'UNFIXED_LIGHT_LEAK' && leakReveal.round.outcome === 'UNFIXED_LIGHT_LEAK',
+    `超时未定影且 dev>=0.20 触发 LIGHT_LEAK → ${leakReveal.round.outcome}`,
+  );
   admin.send({ type: 'admin', action: 'reset', token: TOKEN });
   await mainC.wait(isState('IDLE'), 3000);
 

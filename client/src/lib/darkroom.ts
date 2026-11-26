@@ -7,7 +7,7 @@
  *   in either 'photogram_negative' or 'positive_print' optical mode.
  * - Exports borderless, watermark-free 1280×720 JPEG (q=0.88) optimized for Instax printing.
  */
-import type { PrintMode } from '../../../shared/protocol';
+import type { CollapseZone, PrintMode } from '../../../shared/protocol';
 
 export const DISPLAY_W = 1280;
 export const DISPLAY_H = 720;
@@ -79,15 +79,64 @@ export function drawIdleDarkroom(g: CanvasRenderingContext2D, ms: number): void 
   g.fillRect(0, 0, DISPLAY_W, DISPLAY_H);
 }
 
-/** SAFELIGHT_COMPOSE: pure #9A0A0A safelight field with optional semi-transparent deep-red forecast ghost */
-export function drawSafelightField(g: CanvasRenderingContext2D, forecastImg?: HTMLImageElement | null): void {
+/** Hand-drawn darkroom red wax-crayon ellipse + optional label */
+export function drawCrayonEllipse(
+  g: CanvasRenderingContext2D,
+  cx: number,
+  cy: number,
+  rx: number,
+  ry: number,
+  label?: string,
+): void {
+  g.save();
+  g.strokeStyle = 'rgba(225, 58, 46, 0.9)';
+  g.lineCap = 'round';
+  g.lineJoin = 'round';
+
+  // Two slightly offset organic crayon passes
+  for (let pass = 0; pass < 2; pass++) {
+    g.lineWidth = pass === 0 ? 3.2 : 1.6;
+    g.globalAlpha = pass === 0 ? 0.9 : 0.55;
+    g.beginPath();
+    const steps = 36;
+    for (let i = 0; i <= steps + 2; i++) {
+      const a = (i / steps) * Math.PI * 2;
+      const wobble = 1 + 0.045 * Math.sin(a * 3 + pass * 1.7) + 0.025 * Math.cos(a * 5 - pass);
+      const px = cx + Math.cos(a) * rx * wobble + (pass === 1 ? 2.5 : 0);
+      const py = cy + Math.sin(a) * ry * wobble - (pass === 1 ? 1.8 : 0);
+      if (i === 0) g.moveTo(px, py);
+      else g.lineTo(px, py);
+    }
+    g.stroke();
+  }
+
+  if (label) {
+    g.globalAlpha = 0.92;
+    g.font = '11px "RH Mono", monospace';
+    const tw = g.measureText(label).width;
+    const lx = Math.max(16, Math.min(DISPLAY_W - tw - 20, cx - tw / 2));
+    const ly = cy + ry + 20 > DISPLAY_H - 48 ? cy - ry - 12 : cy + ry + 20;
+    g.fillStyle = 'rgba(10, 4, 4, 0.72)';
+    g.fillRect(lx - 6, ly - 12, tw + 12, 16);
+    g.fillStyle = '#F28B82';
+    g.fillText(label, lx, ly);
+  }
+  g.restore();
+}
+
+/** SAFELIGHT_COMPOSE: pure #9A0A0A safelight field with optional semi-transparent deep-red forecast ghost + collapseZone */
+export function drawSafelightField(
+  g: CanvasRenderingContext2D,
+  forecastImg?: HTMLImageElement | null,
+  collapseZone?: CollapseZone | null,
+): void {
   g.fillStyle = '#9A0A0A';
   g.fillRect(0, 0, DISPLAY_W, DISPLAY_H);
 
   if (forecastImg && forecastImg.complete && forecastImg.naturalWidth > 0) {
     g.save();
     g.globalCompositeOperation = 'multiply';
-    g.globalAlpha = 0.42;
+    g.globalAlpha = 0.44;
     drawContain(g, forecastImg, forecastImg.naturalWidth, forecastImg.naturalHeight, 0, 0, DISPLAY_W, DISPLAY_H);
     g.restore();
   }
@@ -104,6 +153,17 @@ export function drawSafelightField(g: CanvasRenderingContext2D, forecastImg?: HT
   v.addColorStop(1, 'rgba(42, 2, 2, 0.36)');
   g.fillStyle = v;
   g.fillRect(0, 0, DISPLAY_W, DISPLAY_H);
+
+  if (collapseZone) {
+    drawCrayonEllipse(
+      g,
+      collapseZone.cx * DISPLAY_W,
+      collapseZone.cy * DISPLAY_H,
+      collapseZone.rx * DISPLAY_W,
+      collapseZone.ry * DISPLAY_H,
+      'COLLAPSE ZONE · INTERVENE HERE',
+    );
+  }
 }
 
 /** EXPOSURE: bright warm enlarger beam #F6F2E8 with optional Recursive Past video shadow overlay */
@@ -469,54 +529,113 @@ export class DarkroomEngine {
   }
 
   /** Export a 100% clean, borderless, watermark-free 1280×720 JPEG for Instax printing & Contact Sheet */
-  exportCleanJpeg(finalDevProgress: number, printMode: PrintMode): string {
-    this.renderPrint(this.exportCtx, DISPLAY_W, DISPLAY_H, finalDevProgress, printMode, 1.0);
+  exportCleanJpeg(finalDevProgress: number, printMode: PrintMode, lightLeak = false): string {
+    if (lightLeak) {
+      this.renderLightLeak(this.exportCtx, DISPLAY_W, DISPLAY_H, 2.2, finalDevProgress, printMode);
+    } else {
+      this.renderPrint(this.exportCtx, DISPLAY_W, DISPLAY_H, finalDevProgress, printMode, 1.0);
+    }
     return this.exportCanvas.toDataURL('image/jpeg', 0.88);
   }
 
   /**
-   * 320×180 pixel-level Temporal Extrapolation:
-   * - Seed round (00A / no prevGray): directional dark-shadow dilation + contrast boost -> FORECAST 01A
-   * - Subsequent rounds: predicted = clamp(current + (current - prev) * 1.15, 0, 1) + light Gaussian blur + grain
+   * Render 2.2s UNFIXED · LIGHT LEAK animation:
+   * - 0.0–0.4s: blinding white light sweeps left -> right across the developing paper
+   * - 0.4–2.2s: unfixed silver halides rapidly fog, collapse in contrast, and burn into dark ruined streaks
    */
-  computeAndExportForecast(isSeedRound: boolean): string {
-    this.forecastSrcCtx.drawImage(this.exportCanvas, 0, 0, FW, FH);
-    const srcPx = this.forecastSrcCtx.getImageData(0, 0, FW, FH).data;
-    const currentGray = new Float32Array(FN);
-    for (let i = 0, p = 0; i < FN; i++, p += 4) {
-      currentGray[i] = (0.299 * srcPx[p] + 0.587 * srcPx[p + 1] + 0.114 * srcPx[p + 2]) / 255;
+  renderLightLeak(
+    targetCtx: CanvasRenderingContext2D,
+    targetW: number,
+    targetH: number,
+    elapsedStorySec: number,
+    devProgress: number,
+    printMode: PrintMode,
+  ): void {
+    const t = Math.max(0, Math.min(2.2, elapsedStorySec));
+    const sweep = Math.min(1, t / 0.4);
+    const fog = t > 0.4 ? Math.min(1, (t - 0.4) / 1.8) : 0;
+
+    // Base developing image pushed rapidly toward burned/fogged state
+    const effDev = devProgress + fog * 0.95;
+    this.renderPrint(targetCtx, targetW, targetH, effDev, printMode, 1.0 - fog * 0.32);
+
+    // Sweeping white light shaft (0 -> 0.4s, fading into dark chemical fog after)
+    if (t < 0.75) {
+      const bandX = sweep * targetW;
+      const alpha = t <= 0.4 ? 0.92 : Math.max(0, 0.92 * (1 - (t - 0.4) / 0.35));
+      const beam = targetCtx.createLinearGradient(bandX - targetW * 0.45, 0, bandX + targetW * 0.12, 0);
+      beam.addColorStop(0, 'rgba(255, 250, 240, 0)');
+      beam.addColorStop(0.55, `rgba(255, 252, 246, ${alpha.toFixed(3)})`);
+      beam.addColorStop(1, 'rgba(255, 250, 240, 0)');
+      targetCtx.fillStyle = beam;
+      targetCtx.fillRect(0, 0, targetW, targetH);
     }
 
+    // Uneven darkroom fogging & chemical streak collapse (0.4s -> 2.2s)
+    if (fog > 0) {
+      const streak = targetCtx.createLinearGradient(0, 0, targetW, targetH * 0.65);
+      streak.addColorStop(0, `rgba(12, 9, 8, ${(fog * 0.68).toFixed(3)})`);
+      streak.addColorStop(0.42, `rgba(92, 42, 22, ${(fog * 0.42).toFixed(3)})`);
+      streak.addColorStop(0.75, `rgba(14, 10, 9, ${(fog * 0.78).toFixed(3)})`);
+      streak.addColorStop(1, `rgba(8, 7, 6, ${(fog * 0.85).toFixed(3)})`);
+      targetCtx.fillStyle = streak;
+      targetCtx.fillRect(0, 0, targetW, targetH);
+    }
+  }
+
+  /**
+   * 320×180 pixel-level Temporal Extrapolation + 8×5 Collapse Zone detection:
+   * - Seed round (00A / no prevGray): directional dark-shadow dilation + contrast boost -> FORECAST 01A
+   * - UNDERDEVELOPED (< 0.20): keeps prevGray as primary driver + slight drift (unintervened trend continues)
+   * - Regular rounds: predicted = clamp(curr + (curr - prev) * 1.15, 0, 1) + 1 box blur + silver grain
+   */
+  computeAndExportForecast(
+    isSeedRound: boolean,
+    finalDevProgress = 0.85,
+  ): { forecastDataUrl: string; collapseZone: CollapseZone } {
+    this.forecastSrcCtx.drawImage(this.exportCanvas, 0, 0, FW, FH);
+    const srcPx = this.forecastSrcCtx.getImageData(0, 0, FW, FH).data;
+    const currGray = new Float32Array(FN);
+    for (let i = 0, p = 0; i < FN; i++, p += 4) {
+      currGray[i] = (0.299 * srcPx[p] + 0.587 * srcPx[p + 1] + 0.114 * srcPx[p + 2]) / 255;
+    }
+
+    const prevRef = this.prevGray;
+    const isUnderdeveloped = !isSeedRound && finalDevProgress < 0.2 && prevRef != null;
     const rawPred = new Float32Array(FN);
-    if (isSeedRound || !this.prevGray) {
-      // Seed frame 00A: directional dark shadow dilation + contrast boost
+
+    if (isSeedRound || !prevRef) {
       for (let y = 0; y < FH; y++) {
         for (let x = 0; x < FW; x++) {
           const i = y * FW + x;
-          let minVal = currentGray[i];
+          let minVal = currGray[i];
           for (let dy = -1; dy <= 1; dy++) {
             const sy = Math.max(0, Math.min(FH - 1, y - 1 + dy));
             for (let dx = -1; dx <= 1; dx++) {
               const sx = Math.max(0, Math.min(FW - 1, x - 2 + dx));
-              const v = currentGray[sy * FW + sx];
+              const v = currGray[sy * FW + sx];
               if (v < minVal) minVal = v;
             }
           }
-          const dilated = currentGray[i] * 0.42 + minVal * 0.58;
+          const dilated = currGray[i] * 0.42 + minVal * 0.58;
           rawPred[i] = Math.max(0, Math.min(1, (dilated - 0.5) * 1.28 + 0.5));
         }
       }
-    } else {
-      const prev = this.prevGray;
+    } else if (isUnderdeveloped) {
+      // Intervention too weak: keep prevGray as primary trend and continue slight drift
       for (let i = 0; i < FN; i++) {
-        const v = currentGray[i] + (currentGray[i] - prev[i]) * 1.15;
+        const v = prevRef[i] * 0.92 + currGray[i] * 0.08 + (prevRef[i] - 0.5) * 0.06;
+        rawPred[i] = v < 0 ? 0 : v > 1 ? 1 : v;
+      }
+    } else {
+      for (let i = 0; i < FN; i++) {
+        const v = currGray[i] + (currGray[i] - prevRef[i]) * 1.15;
         rawPred[i] = v < 0 ? 0 : v > 1 ? 1 : v;
       }
     }
 
-    this.prevGray = currentGray;
-
-    // Light 3×3 Gaussian smoothing + subtle darkroom fog grain
+    // 1 lightweight 3×3 box blur + subtle silver-halide grain
+    const blurred = new Float32Array(FN);
     const out = this.forecastImg.data;
     for (let y = 0; y < FH; y++) {
       const y0 = Math.max(0, y - 1) * FW;
@@ -526,20 +645,22 @@ export class DarkroomEngine {
         const x0 = Math.max(0, x - 1);
         const x1 = x;
         const x2 = Math.min(FW - 1, x + 1);
-        const blur =
+        const box =
           (rawPred[y0 + x0] +
-            rawPred[y0 + x1] * 2 +
+            rawPred[y0 + x1] +
             rawPred[y0 + x2] +
-            rawPred[y1 + x0] * 2 +
-            rawPred[y1 + x1] * 4 +
-            rawPred[y1 + x2] * 2 +
+            rawPred[y1 + x0] +
+            rawPred[y1 + x1] +
+            rawPred[y1 + x2] +
             rawPred[y2 + x0] +
-            rawPred[y2 + x1] * 2 +
+            rawPred[y2 + x1] +
             rawPred[y2 + x2]) /
-          16;
-        const fog = blur + (Math.random() - 0.5) * 0.04;
+          9;
+        const fog = box + (Math.random() - 0.5) * 0.036;
         const v = fog < 0 ? 0 : fog > 1 ? 1 : fog;
-        const q = (y1 + x1) * 4;
+        const idx = y1 + x1;
+        blurred[idx] = v;
+        const q = idx * 4;
         out[q] = 9 + 231 * v;
         out[q + 1] = 8 + 226 * v;
         out[q + 2] = 8 + 212 * v;
@@ -547,18 +668,105 @@ export class DarkroomEngine {
       }
     }
     this.forecastOutCtx.putImageData(this.forecastImg, 0, 0);
-    return this.forecastOutCanvas.toDataURL('image/jpeg', 0.86);
+
+    // 8×5 grid Collapse Zone search (exclude outer border cols 0,7 & rows 0,4)
+    const COLS = 8;
+    const ROWS = 5;
+    const cellW = FW / COLS;
+    const cellH = FH / ROWS;
+    let bestCol = 3;
+    let bestRow = 2;
+    let bestScore = -Infinity;
+
+    for (let r = 1; r < ROWS - 1; r++) {
+      const yStart = Math.floor(r * cellH);
+      const yEnd = Math.floor((r + 1) * cellH);
+      for (let c = 1; c < COLS - 1; c++) {
+        const xStart = Math.floor(c * cellW);
+        const xEnd = Math.floor((c + 1) * cellW);
+        let sumPred = 0;
+        let sumBase = 0;
+        let count = 0;
+        for (let y = yStart; y < yEnd; y++) {
+          const rowOff = y * FW;
+          for (let x = xStart; x < xEnd; x++) {
+            const idx = rowOff + x;
+            sumPred += blurred[idx];
+            sumBase += prevRef ? prevRef[idx] : currGray[idx];
+            count++;
+          }
+        }
+        const avgPred = sumPred / Math.max(1, count);
+        const avgBase = sumBase / Math.max(1, count);
+        const absDark = 1 - avgPred;
+        const deltaDark = Math.max(0, avgBase - avgPred);
+        const score = deltaDark * 1.65 + absDark * 0.65;
+        if (score > bestScore) {
+          bestScore = score;
+          bestCol = c;
+          bestRow = r;
+        }
+      }
+    }
+
+    if (isUnderdeveloped && prevRef) {
+      const nextPrev = new Float32Array(FN);
+      for (let i = 0; i < FN; i++) nextPrev[i] = prevRef[i] * 0.9 + currGray[i] * 0.1;
+      this.prevGray = nextPrev;
+    } else {
+      this.prevGray = currGray;
+    }
+
+    const collapseZone: CollapseZone = {
+      cx: Number(((bestCol + 0.5) / COLS).toFixed(3)),
+      cy: Number(((bestRow + 0.5) / ROWS).toFixed(3)),
+      rx: 0.095,
+      ry: 0.135,
+    };
+
+    return {
+      forecastDataUrl: this.forecastOutCanvas.toDataURL('image/jpeg', 0.86),
+      collapseZone,
+    };
+  }
+
+  /**
+   * Compute Timeline Deviation % via 320×180 pixel-wise MAE:
+   * deviationPct = Math.round(clamp(meanAbsDiff * 240, 0, 99))
+   */
+  computeDeviationPct(predictedImg: HTMLImageElement | null): number | null {
+    if (!predictedImg || !predictedImg.complete || predictedImg.naturalWidth <= 0) return null;
+    this.forecastSrcCtx.drawImage(this.exportCanvas, 0, 0, FW, FH);
+    const actualPx = this.forecastSrcCtx.getImageData(0, 0, FW, FH).data;
+
+    this.forecastOutCtx.fillStyle = '#080706';
+    this.forecastOutCtx.fillRect(0, 0, FW, FH);
+    drawContain(this.forecastOutCtx, predictedImg, predictedImg.naturalWidth, predictedImg.naturalHeight, 0, 0, FW, FH);
+    const predPx = this.forecastOutCtx.getImageData(0, 0, FW, FH).data;
+
+    let absSum = 0;
+    for (let i = 0, p = 0; i < FN; i++, p += 4) {
+      const a = (0.299 * actualPx[p] + 0.587 * actualPx[p + 1] + 0.114 * actualPx[p + 2]) / 255;
+      const b = (0.299 * predPx[p] + 0.587 * predPx[p + 1] + 0.114 * predPx[p + 2]) / 255;
+      absSum += Math.abs(a - b);
+    }
+    const meanAbsDiff = absSum / FN;
+    return Math.round(Math.max(0, Math.min(99, meanAbsDiff * 240)));
   }
 
   /**
    * Side-by-side West Wall Reveal for regular rounds (01A+):
-   * Left = PREDICTED [FR], Right = ACTUAL [FR] (from exportCanvas)
+   * Left = PREDICTED [FR] · UNTOUCHED, Right = ACTUAL [FR] · [OUTCOME] · DEV [XX]%
+   * Bottom center = TIMELINE DEVIATION: [XX]%
    */
   drawSideBySideReveal(
     g: CanvasRenderingContext2D,
     predictedImg: HTMLImageElement | null,
     frameNo: string,
+    outcomeLabel: string,
     devPct: number,
+    deviationPct: number | null,
+    isUnderdeveloped: boolean,
   ): void {
     g.fillStyle = '#080706';
     g.fillRect(0, 0, DISPLAY_W, DISPLAY_H);
@@ -567,12 +775,11 @@ export class DarkroomEngine {
     const gap = 32;
     const cardW = (DISPLAY_W - padX * 2 - gap) / 2;
     const cardH = Math.round((cardW * 9) / 16);
-    const topY = Math.round((DISPLAY_H - cardH) / 2) - 18;
+    const topY = Math.round((DISPLAY_H - cardH) / 2) - 28;
 
     const leftX = padX;
     const rightX = padX + cardW + gap;
 
-    // Frame borders
     g.strokeStyle = 'rgba(184, 50, 40, 0.72)';
     g.lineWidth = 1.5;
     g.strokeRect(leftX - 1, topY - 1, cardW + 2, cardH + 2);
@@ -580,7 +787,6 @@ export class DarkroomEngine {
     g.strokeStyle = 'rgba(232, 226, 213, 0.35)';
     g.strokeRect(rightX - 1, topY - 1, cardW + 2, cardH + 2);
 
-    // Left: PREDICTED
     if (predictedImg && predictedImg.complete && predictedImg.naturalWidth > 0) {
       drawContain(g, predictedImg, predictedImg.naturalWidth, predictedImg.naturalHeight, leftX, topY, cardW, cardH);
     } else {
@@ -591,15 +797,26 @@ export class DarkroomEngine {
       g.fillText('NO PRIOR FORECAST', leftX + 20, topY + cardH / 2);
     }
 
-    // Right: ACTUAL (frozen exportCanvas)
     g.drawImage(this.exportCanvas, rightX, topY, cardW, cardH);
 
-    // Minimalist labels below frames
-    g.font = '13px "RH Mono", monospace';
+    g.font = '12.5px "RH Mono", monospace';
     g.fillStyle = '#B83228';
-    g.fillText(`PREDICTED · ${frameNo}`, leftX, topY + cardH + 26);
+    g.fillText(`PREDICTED ${frameNo} · UNTOUCHED`, leftX, topY + cardH + 26);
 
     g.fillStyle = '#E8E2D5';
-    g.fillText(`ACTUAL · ${frameNo} · DEV ${devPct}% · FIXED`, rightX, topY + cardH + 26);
+    g.fillText(`ACTUAL ${frameNo} · ${outcomeLabel} · DEV ${devPct}%`, rightX, topY + cardH + 26);
+
+    if (deviationPct != null || isUnderdeveloped) {
+      const devLine =
+        deviationPct != null
+          ? `TIMELINE DEVIATION: ${deviationPct}%${isUnderdeveloped ? ' · INTERVENTION TOO WEAK — DRIFT CONTINUES' : ''}`
+          : 'INTERVENTION TOO WEAK — DRIFT CONTINUES';
+      g.save();
+      g.font = '15px "RH Mono", monospace';
+      g.textAlign = 'center';
+      g.fillStyle = isUnderdeveloped ? '#C48A3A' : '#E8E2D5';
+      g.fillText(devLine, DISPLAY_W / 2, topY + cardH + 74);
+      g.restore();
+    }
   }
 }

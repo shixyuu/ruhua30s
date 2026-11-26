@@ -5,6 +5,7 @@
  * - Reaching >= 92% sends `{ type: 'TRIGGER_FIX' }` immediately and locks with `FIXED`.
  */
 import { Net, mountNetDot } from '../lib/net';
+import { stationWakeChime } from '../lib/sfx';
 import { showStartOverlay } from '../lib/unlock';
 import { TITLE_EN } from '../lib/brand';
 
@@ -29,7 +30,8 @@ export default async function station2(app: HTMLElement): Promise<void> {
               <span class="bar"></span>
             </div>
           </div>
-          <div class="fader-end bot" id="botLbl">PULL TO FIX</div>
+          <div class="fader-end bot" id="botLbl">PULL DOWN TO FIX</div>
+          <div class="fader-sub" id="botSub">Lock exposure before time runs out or burns black</div>
         </div>
       </div>
     </div>`;
@@ -41,6 +43,7 @@ export default async function station2(app: HTMLElement): Promise<void> {
   const handle = app.querySelector('#handle') as HTMLDivElement;
   const handleTxt = app.querySelector('#handleTxt') as HTMLSpanElement;
   const botLbl = app.querySelector('#botLbl') as HTMLDivElement;
+  const botSub = app.querySelector('#botSub') as HTMLDivElement;
 
   const net = new Net('station2');
   (window as any).__net = net;
@@ -65,9 +68,10 @@ export default async function station2(app: HTMLElement): Promise<void> {
     pos = 0;
     fixed = false;
     dragging = false;
-    faderBox.classList.remove('locked');
+    faderBox.classList.remove('locked', 'optimal', 'over');
     handleTxt.textContent = 'SLIDE';
-    botLbl.textContent = 'PULL TO FIX';
+    botLbl.textContent = 'PULL DOWN TO FIX';
+    botSub.textContent = 'Lock exposure before time runs out or burns black';
     place();
   }
 
@@ -121,9 +125,13 @@ export default async function station2(app: HTMLElement): Promise<void> {
     net.send({ type: 'TRIGGER_FIX' });
   }
 
+  let wasActive = false;
+
   function renderPhase(): void {
     const active = net.connected && net.phase === 'DEVELOPING';
     root.classList.toggle('black', !active);
+    if (active && !wasActive) stationWakeChime();
+    wasActive = active;
     if (active) {
       if (net.round && net.round.id !== roundId) {
         roundId = net.round.id;
@@ -132,6 +140,22 @@ export default async function station2(app: HTMLElement): Promise<void> {
       requestAnimationFrame(place);
     }
   }
+
+  net.on('dev', (m) => {
+    if (fixed || net.phase !== 'DEVELOPING') return;
+    const p = m.devProgress;
+    const isOver = p > 1.05;
+    const isOpt = p >= 0.85 && p <= 1.05;
+    faderBox.classList.toggle('optimal', isOpt);
+    faderBox.classList.toggle('over', isOver);
+    if (isOver) {
+      botLbl.textContent = 'OVERDEVELOPING — PULL NOW';
+    } else if (isOpt) {
+      botLbl.textContent = 'OPTIMAL — PULL NOW';
+    } else {
+      botLbl.textContent = 'PULL DOWN TO FIX';
+    }
+  });
 
   net.on('state', renderPhase);
   net.on('open', renderPhase);

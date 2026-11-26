@@ -6,7 +6,7 @@
  * - Streams normalized energy (0.0–1.0) at 12 Hz via WebSocket `{ type: 'AUDIO_ENERGY', level }`.
  */
 import { Net, mountNetDot } from '../lib/net';
-import { audioCtx } from '../lib/sfx';
+import { audioCtx, stationWakeChime } from '../lib/sfx';
 import { showStartOverlay } from '../lib/unlock';
 import { TITLE_EN } from '../lib/brand';
 
@@ -56,6 +56,7 @@ export default async function station1(app: HTMLElement): Promise<void> {
           </g>
         </svg>
         <div class="inst-caption">MAKE NOISE TO DEVELOP</div>
+        <div class="inst-sub">Watch the wall — stop before it turns black</div>
       </div>
     </div>`;
 
@@ -116,10 +117,13 @@ export default async function station1(app: HTMLElement): Promise<void> {
 
   let smoothed = 0;
   let lastSentAt = 0;
+  let wasActive = false;
 
   function renderPhase(): void {
     const active = net.connected && net.phase === 'DEVELOPING';
     root.classList.toggle('black', !active);
+    if (active && !wasActive) stationWakeChime();
+    wasActive = active;
     if (active) void ensureMic();
   }
   net.on('state', renderPhase);

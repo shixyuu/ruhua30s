@@ -1,5 +1,5 @@
 /**
- * 《入画三十秒 (RH-30)》v3 — 纯现场活体暗房与时间预言引擎（Zero Pre-recorded Media）前后端共享协议。
+ * 《入画三十秒 (RH-30)》v3 — 活体暗房时间预言引擎（完整终版）前后端共享协议。
  * 服务端是唯一真相源：所有终端根据 state / dev 包里的 serverTime / phaseStartedAt 校准本地时钟。
  */
 
@@ -9,13 +9,27 @@ export type Phase =
   | 'SAFELIGHT_COMPOSE'
   | 'EXPOSURE'
   | 'DEVELOPING'
+  | 'LIGHT_LEAK'
   | 'FIXED_REVEAL';
 
 export type PrintMode = 'photogram_negative' | 'positive_print';
 
+export type ChemicalOutcome =
+  | 'FIXED_OPTIMAL'
+  | 'OVERDEVELOPED_BURNED'
+  | 'UNDERDEVELOPED_TRACE_LOST'
+  | 'UNFIXED_LIGHT_LEAK';
+
 export type Role = 'main' | 'door' | 'station1' | 'station2' | 'admin';
 
 export const ROLES: Role[] = ['main', 'door', 'station1', 'station2', 'admin'];
+
+export interface CollapseZone {
+  cx: number; // 0..1 normalized
+  cy: number; // 0..1 normalized
+  rx: number; // 0..1 normalized
+  ry: number; // 0..1 normalized
+}
 
 export interface AppConfig {
   /** 入场缓冲秒数（2–10，默认 5） */
@@ -69,6 +83,7 @@ export interface ForecastInfo {
   version: number;
   targetFrameNo: string; // e.g. "01A"
   url: string | null;
+  collapseZone?: CollapseZone | null;
 }
 
 export interface RoundInfo {
@@ -77,10 +92,13 @@ export interface RoundInfo {
   frameNumber: number; // 当前卷内的底片序号（0 → 00A 种子轮，1 → 01A...）
   printMode: PrintMode;
   devProgress: number; // 初始 0.0，无上限，可超过 1.5
-  finalDevProgress: number | null; // 进入 FIXED_REVEAL 时锁死
+  finalDevProgress: number | null; // 进入 LIGHT_LEAK / FIXED_REVEAL 时锁死
   fixTriggeredBy: 'station2' | 'timeout' | 'admin' | null;
+  outcome: ChemicalOutcome | null;
+  deviationPct: number | null;
   hasFreeze: boolean;
-  predictedUrl: string | null; // 本轮开始前锁定的预测未来图 URL（供 /main 双屏对照与 /admin 对比）
+  predictedUrl: string | null; // 本轮开始前锁定的预测未来图 URL
+  collapseZone: CollapseZone | null; // 本轮开始前锁定的坍缩区
   trigger: string | null;
 }
 
@@ -97,6 +115,8 @@ export interface ContactFrame {
   timestamp: number;
   name: string;
   devPercent?: number;
+  outcome?: ChemicalOutcome | null;
+  outcomeCode?: string; // "FIXED" | "BURNED" | "UNDER" | "LEAK"
 }
 
 export interface ContactSheetInfo {
@@ -153,5 +173,41 @@ export type ClientMsg =
   | { type: 'START_SESSION'; token?: string }
   | { type: 'AUDIO_ENERGY'; level: number }
   | { type: 'TRIGGER_FIX' }
-  | { type: 'freeze'; data: string; forecastData?: string }
+  | {
+      type: 'freeze';
+      data: string;
+      forecastData?: string;
+      collapseZone?: CollapseZone | null;
+      deviationPct?: number | null;
+    }
   | { type: 'admin'; action: AdminAction; config?: Partial<AppConfig>; token?: string };
+
+export function outcomeShortCode(o?: ChemicalOutcome | null): string {
+  switch (o) {
+    case 'FIXED_OPTIMAL':
+      return 'FIXED';
+    case 'OVERDEVELOPED_BURNED':
+      return 'BURNED';
+    case 'UNDERDEVELOPED_TRACE_LOST':
+      return 'UNDER';
+    case 'UNFIXED_LIGHT_LEAK':
+      return 'LEAK';
+    default:
+      return 'FIXED';
+  }
+}
+
+export function outcomeFullLabel(o?: ChemicalOutcome | null): string {
+  switch (o) {
+    case 'FIXED_OPTIMAL':
+      return 'FIXED · OPTIMAL';
+    case 'OVERDEVELOPED_BURNED':
+      return 'OVERDEVELOPED · BURNED';
+    case 'UNDERDEVELOPED_TRACE_LOST':
+      return 'UNDERDEVELOPED · TRACE LOST';
+    case 'UNFIXED_LIGHT_LEAK':
+      return 'UNFIXED · LIGHT LEAK';
+    default:
+      return 'FIXED';
+  }
+}
