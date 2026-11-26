@@ -1,69 +1,59 @@
 /**
- * Live Silver-Gelatin Photogram & Optical Enlarger Engine (/main)
- * - Zero pre-recorded video: samples live external USB camera (or procedural fallback when no camera is attached)
- *   during EXPOSURE at 15–20 FPS into 960×540 dual float accumulators (avgAccum + minAccum).
- * - Synthesizes normalized latentMap (0.72 * avg + 0.28 * min + 2%–98% histogram stretch + static silver grain).
- * - Renders live developing paper in real time driven by server devProgress (0.0 → 0.85 → 1.0 → 1.45+ burned black)
- *   in either 'photogram_negative' or 'positive_print' optical mode.
- * - Exports borderless, watermark-free 1280×720 JPEG (q=0.88) optimized for Instax printing.
+ * RA-4 Color Darkroom & Physical Dodging Engine (/main)
+ * - Zero AI / OpenCV dependencies: pure TypeScript 3x3 homography + Canvas pixel arithmetic.
+ * - Supports:
+ *   1. High-contrast Calibration Target (TL / TR / BR / BL) with adjustable Easel Margin (0–30%).
+ *   2. Shadow-lifted original color projection (RGB >= 38/255) for physical dodging detection.
+ *   3. Anti-AE drift normalization (median ratio of lowest-20% diff pixels) + dodgeMap integration.
+ *   4. Home Mouse Dodge Simulator (paint directly onto canvas during EXPOSE).
+ *   5. RA-4 subtractive color darkroom developing curve (E <= 1.0 soft dodge, E > 1.0 overdeveloped burn).
+ *   6. Side-by-side ORIGINAL vs ALTERED PRINT reveal + clean border-framed Instax export.
  */
-import type { CollapseZone, PrintMode } from '../../../shared/protocol';
+import { GRID_H, GRID_W, warpCameraToGridGray } from './homography';
 
 export const DISPLAY_W = 1280;
 export const DISPLAY_H = 720;
-const LW = 960;
-const LH = 540;
-const N = LW * LH;
-const FW = 320;
-const FH = 180;
-const FN = FW * FH;
+const CAM_W = 640;
+const CAM_H = 360;
+const GRID_N = GRID_W * GRID_H;
 
-function drawContain(
-  g: CanvasRenderingContext2D,
-  src: CanvasImageSource,
-  sw: number,
-  sh: number,
-  dx: number,
-  dy: number,
-  dw: number,
-  dh: number,
-): void {
-  if (sw <= 0 || sh <= 0) return;
-  const scale = Math.min(dw / sw, dh / sh);
-  const w = sw * scale;
-  const h = sh * scale;
-  g.drawImage(src, dx + (dw - w) / 2, dy + (dh - h) / 2, w, h);
-}
-
-function drawCover(
-  g: CanvasRenderingContext2D,
-  src: CanvasImageSource,
-  sw: number,
-  sh: number,
-  dw: number,
-  dh: number,
-): void {
-  if (sw <= 0 || sh <= 0) return;
-  const targetRatio = dw / dh;
-  const srcRatio = sw / sh;
-  let sx = 0;
-  let sy = 0;
-  let cw = sw;
-  let ch = sh;
-  if (srcRatio > targetRatio) {
-    cw = sh * targetRatio;
-    sx = (sw - cw) / 2;
-  } else {
-    ch = sw / targetRatio;
-    sy = (sh - ch) / 2;
-  }
-  g.drawImage(src, sx, sy, cw, ch, 0, 0, dw, dh);
+export interface EaselRect {
+  x: number;
+  y: number;
+  w: number;
+  h: number;
 }
 
 export function setupCanvas(c: HTMLCanvasElement): CanvasRenderingContext2D {
   c.width = DISPLAY_W;
   c.height = DISPLAY_H;
   return c.getContext('2d')!;
+}
+
+/** Compute centered photo rect inside easel margin (0..30%) preserving aspect ratio */
+export function computeEaselRect(
+  canvasW: number,
+  canvasH: number,
+  marginPct: number,
+  imgW: number,
+  imgH: number,
+): EaselRect {
+  const m = Math.max(0, Math.min(30, marginPct)) / 100;
+  const availW = canvasW * (1 - 2 * m);
+  const availH = canvasH * (1 - 2 * m);
+  const aspect = imgW > 0 && imgH > 0 ? imgW / imgH : 16 / 9;
+  let w = availW;
+  let h = w / aspect;
+  if (h > availH) {
+    h = availH;
+    w = h * aspect;
+  }
+  return {
+    x: (canvasW - w) / 2,
+    y: (canvasH - h) / 2,
+    w,
+    h,
+  };
 }
 
 /** IDLE: very dim darkroom safelight standby */
@@ -79,857 +69,635 @@ export function drawIdleDarkroom(g: CanvasRenderingContext2D, ms: number): void 
   g.fillRect(0, 0, DISPLAY_W, DISPLAY_H);
 }
 
-/** Hand-drawn darkroom red wax-crayon ellipse + optional label */
-export function drawCrayonEllipse(
-  g: CanvasRenderingContext2D,
-  cx: number,
-  cy: number,
-  rx: number,
-  ry: number,
-  label?: string,
-): void {
-  g.save();
-  g.strokeStyle = 'rgba(225, 58, 46, 0.9)';
-  g.lineCap = 'round';
-  g.lineJoin = 'round';
+/** CALIBRATING: pure high-contrast target with TL / TR / BR / BL markers inside easel margin */
+export function drawCalibrationTarget(g: CanvasRenderingContext2D, marginPct: number): void {
+  g.fillStyle = '#000000';
+  g.fillRect(0, 0, DISPLAY_W, DISPLAY_H);
 
-  // Two slightly offset organic crayon passes
-  for (let pass = 0; pass < 2; pass++) {
-    g.lineWidth = pass === 0 ? 3.2 : 1.6;
-    g.globalAlpha = pass === 0 ? 0.9 : 0.55;
+  const rect = computeEaselRect(DISPLAY_W, DISPLAY_H, marginPct, 16, 9);
+  g.strokeStyle = '#FFFFFF';
+  g.lineWidth = 3;
+  g.strokeRect(rect.x, rect.y, rect.w, rect.h);
+
+  // Inner crosshairs
+  g.strokeStyle = 'rgba(255, 255, 255, 0.22)';
+  g.lineWidth = 1;
+  g.beginPath();
+  g.moveTo(rect.x + rect.w / 2, rect.y);
+  g.lineTo(rect.x + rect.w / 2, rect.y + rect.h);
+  g.moveTo(rect.x, rect.y + rect.h / 2);
+  g.lineTo(rect.x + rect.w, rect.y + rect.h / 2);
+  g.stroke();
+
+  const corners: Array<{ label: string; x: number; y: number; dx: number; dy: number }> = [
+    { label: 'TL', x: rect.x, y: rect.y, dx: 1, dy: 1 },
+    { label: 'TR', x: rect.x + rect.w, y: rect.y, dx: -1, dy: 1 },
+    { label: 'BR', x: rect.x + rect.w, y: rect.y + rect.h, dx: -1, dy: -1 },
+    { label: 'BL', x: rect.x, y: rect.y + rect.h, dx: 1, dy: -1 },
+  ];
+
+  const arm = 32;
+  g.font = 'bold 20px "RH Mono", monospace';
+  for (const c of corners) {
+    g.strokeStyle = '#FFFFFF';
+    g.lineWidth = 5;
     g.beginPath();
-    const steps = 36;
-    for (let i = 0; i <= steps + 2; i++) {
-      const a = (i / steps) * Math.PI * 2;
-      const wobble = 1 + 0.045 * Math.sin(a * 3 + pass * 1.7) + 0.025 * Math.cos(a * 5 - pass);
-      const px = cx + Math.cos(a) * rx * wobble + (pass === 1 ? 2.5 : 0);
-      const py = cy + Math.sin(a) * ry * wobble - (pass === 1 ? 1.8 : 0);
-      if (i === 0) g.moveTo(px, py);
-      else g.lineTo(px, py);
-    }
+    g.moveTo(c.x, c.y + c.dy * arm);
+    g.lineTo(c.x, c.y);
+    g.lineTo(c.x + c.dx * arm, c.y);
     g.stroke();
+
+    g.fillStyle = '#FFFFFF';
+    const tx = c.dx > 0 ? c.x + 12 : c.x - 40;
+    const ty = c.dy > 0 ? c.y + 28 : c.y - 14;
+    g.fillText(c.label, tx, ty);
   }
 
-  if (label) {
-    g.globalAlpha = 0.92;
-    g.font = '11px "RH Mono", monospace';
-    const tw = g.measureText(label).width;
-    const lx = Math.max(16, Math.min(DISPLAY_W - tw - 20, cx - tw / 2));
-    const ly = cy + ry + 20 > DISPLAY_H - 48 ? cy - ry - 12 : cy + ry + 20;
-    g.fillStyle = 'rgba(10, 4, 4, 0.72)';
-    g.fillRect(lx - 6, ly - 12, tw + 12, 16);
-    g.fillStyle = '#F28B82';
-    g.fillText(label, lx, ly);
-  }
-  g.restore();
-}
-
-/** SAFELIGHT_COMPOSE: pure #9A0A0A safelight field with optional semi-transparent deep-red forecast ghost + collapseZone */
-export function drawSafelightField(
-  g: CanvasRenderingContext2D,
-  forecastImg?: HTMLImageElement | null,
-  collapseZone?: CollapseZone | null,
-): void {
-  g.fillStyle = '#9A0A0A';
-  g.fillRect(0, 0, DISPLAY_W, DISPLAY_H);
-
-  if (forecastImg && forecastImg.complete && forecastImg.naturalWidth > 0) {
-    g.save();
-    g.globalCompositeOperation = 'multiply';
-    g.globalAlpha = 0.44;
-    drawContain(g, forecastImg, forecastImg.naturalWidth, forecastImg.naturalHeight, 0, 0, DISPLAY_W, DISPLAY_H);
-    g.restore();
-  }
-
-  const v = g.createRadialGradient(
-    DISPLAY_W * 0.5,
-    DISPLAY_H * 0.5,
-    DISPLAY_H * 0.28,
-    DISPLAY_W * 0.5,
-    DISPLAY_H * 0.5,
-    DISPLAY_W * 0.72,
-  );
-  v.addColorStop(0, 'rgba(154, 10, 10, 0)');
-  v.addColorStop(1, 'rgba(42, 2, 2, 0.36)');
-  g.fillStyle = v;
-  g.fillRect(0, 0, DISPLAY_W, DISPLAY_H);
-
-  if (collapseZone) {
-    drawCrayonEllipse(
-      g,
-      collapseZone.cx * DISPLAY_W,
-      collapseZone.cy * DISPLAY_H,
-      collapseZone.rx * DISPLAY_W,
-      collapseZone.ry * DISPLAY_H,
-      'COLLAPSE ZONE · INTERVENE HERE',
-    );
-  }
-}
-
-/** EXPOSURE: bright warm enlarger beam #F6F2E8 with optional Recursive Past video or cached ghost frame overlay */
-export function drawExposureBeam(
-  g: CanvasRenderingContext2D,
-  pastMedia?: HTMLVideoElement | HTMLImageElement | null,
-  pastOpacity = 0.48,
-): void {
-  g.fillStyle = '#F6F2E8';
-  g.fillRect(0, 0, DISPLAY_W, DISPLAY_H);
-
-  if (pastMedia) {
-    let ready = false;
-    let sw = 0;
-    let sh = 0;
-    if (pastMedia instanceof HTMLVideoElement) {
-      ready = pastMedia.readyState >= 2 && pastMedia.videoWidth > 0 && pastMedia.videoHeight > 0 && !pastMedia.ended;
-      sw = pastMedia.videoWidth;
-      sh = pastMedia.videoHeight;
-    } else {
-      ready = pastMedia.complete && pastMedia.naturalWidth > 0;
-      sw = pastMedia.naturalWidth;
-      sh = pastMedia.naturalHeight;
-    }
-    if (ready) {
-      g.save();
-      g.globalCompositeOperation = 'multiply';
-      g.globalAlpha = Math.max(0.15, Math.min(0.85, pastOpacity));
-      drawCover(g, pastMedia, sw, sh, DISPLAY_W, DISPLAY_H);
-      g.restore();
-    }
-  }
-
-  const v = g.createRadialGradient(
-    DISPLAY_W * 0.5,
-    DISPLAY_H * 0.5,
-    DISPLAY_H * 0.34,
-    DISPLAY_W * 0.5,
-    DISPLAY_H * 0.5,
-    DISPLAY_W * 0.74,
-  );
-  v.addColorStop(0, 'rgba(246, 242, 232, 0)');
-  v.addColorStop(1, 'rgba(220, 212, 194, 0.42)');
-  g.fillStyle = v;
-  g.fillRect(0, 0, DISPLAY_W, DISPLAY_H);
+  g.fillStyle = 'rgba(255,255,255,0.65)';
+  g.font = '13px "RH Mono", monospace';
+  g.textAlign = 'center';
+  g.fillText(`HOMOGRAPHY TARGET · MARGIN ${marginPct}% · CLICK TL → TR → BR → BL ON /admin`, DISPLAY_W / 2, DISPLAY_H - 18);
+  g.textAlign = 'left';
 }
 
 export class DarkroomEngine {
-  private sampleCanvas: HTMLCanvasElement;
-  private sampleCtx: CanvasRenderingContext2D;
+  private origCanvas: HTMLCanvasElement;
+  private origCtx: CanvasRenderingContext2D;
+  private liftedCanvas: HTMLCanvasElement;
+  private liftedCtx: CanvasRenderingContext2D;
+  private redCanvas: HTMLCanvasElement;
+  private redCtx: CanvasRenderingContext2D;
   private devCanvas: HTMLCanvasElement;
   private devCtx: CanvasRenderingContext2D;
-  private devImg: ImageData;
+  private camCanvas: HTMLCanvasElement;
+  private camCtx: CanvasRenderingContext2D;
   private exportCanvas: HTMLCanvasElement;
   private exportCtx: CanvasRenderingContext2D;
-  private forecastSrcCanvas: HTMLCanvasElement;
-  private forecastSrcCtx: CanvasRenderingContext2D;
-  private forecastOutCanvas: HTMLCanvasElement;
-  private forecastOutCtx: CanvasRenderingContext2D;
-  private forecastImg: ImageData;
-  private ghostCanvas: HTMLCanvasElement;
-  private ghostCtx: CanvasRenderingContext2D;
 
-  private avgAccum = new Float32Array(N);
-  private minAccum = new Float32Array(N);
-  private rawBuf = new Float32Array(N);
-  private latentMap = new Float32Array(N);
-  private grainMap = new Float32Array(N);
-  private hist = new Uint32Array(1024);
-  private prevGray: Float32Array | null = null;
+  private origW = 1280;
+  private origH = 720;
+  private origData: Uint8ClampedArray = new Uint8ClampedArray(0);
+  private devImgData: ImageData | null = null;
+  private upsampledDodge: Float32Array = new Float32Array(0);
 
-  private sampleCount = 0;
-  private latentReady = false;
-  private roundSeed = 0;
+  private cleanAccum = new Float32Array(GRID_N);
+  private cleanCount = 0;
+  private camClean = new Float32Array(GRID_N);
+  private currGray = new Float32Array(GRID_N);
+  private dodgeMap = new Float32Array(GRID_N);
+  private dodgeBlurA = new Float32Array(GRID_N);
+  private dodgeBlurB = new Float32Array(GRID_N);
+  private diffScratch = new Float32Array(Math.ceil(GRID_N / 4));
+  private ratioScratch = new Float32Array(Math.ceil(GRID_N / 4));
+  private dodgeFinalized = false;
 
   constructor() {
-    this.sampleCanvas = document.createElement('canvas');
-    this.sampleCanvas.width = LW;
-    this.sampleCanvas.height = LH;
-    this.sampleCtx = this.sampleCanvas.getContext('2d', { willReadFrequently: true })!;
-
+    this.origCanvas = document.createElement('canvas');
+    this.origCtx = this.origCanvas.getContext('2d', { willReadFrequently: true })!;
+    this.liftedCanvas = document.createElement('canvas');
+    this.liftedCtx = this.liftedCanvas.getContext('2d')!;
+    this.redCanvas = document.createElement('canvas');
+    this.redCtx = this.redCanvas.getContext('2d')!;
     this.devCanvas = document.createElement('canvas');
-    this.devCanvas.width = LW;
-    this.devCanvas.height = LH;
     this.devCtx = this.devCanvas.getContext('2d')!;
-    this.devImg = this.devCtx.createImageData(LW, LH);
-
+    this.camCanvas = document.createElement('canvas');
+    this.camCanvas.width = CAM_W;
+    this.camCanvas.height = CAM_H;
+    this.camCtx = this.camCanvas.getContext('2d', { willReadFrequently: true })!;
     this.exportCanvas = document.createElement('canvas');
-    this.exportCanvas.width = DISPLAY_W;
-    this.exportCanvas.height = DISPLAY_H;
     this.exportCtx = this.exportCanvas.getContext('2d')!;
 
-    this.forecastSrcCanvas = document.createElement('canvas');
-    this.forecastSrcCanvas.width = FW;
-    this.forecastSrcCanvas.height = FH;
-    this.forecastSrcCtx = this.forecastSrcCanvas.getContext('2d', { willReadFrequently: true })!;
-
-    this.forecastOutCanvas = document.createElement('canvas');
-    this.forecastOutCanvas.width = FW;
-    this.forecastOutCanvas.height = FH;
-    this.forecastOutCtx = this.forecastOutCanvas.getContext('2d')!;
-    this.forecastImg = this.forecastOutCtx.createImageData(FW, FH);
-
-    this.ghostCanvas = document.createElement('canvas');
-    this.ghostCanvas.width = 480;
-    this.ghostCanvas.height = 270;
-    this.ghostCtx = this.ghostCanvas.getContext('2d', { willReadFrequently: true })!;
-
-    this.regenerateGrain();
+    this.generateBuiltInSample(1);
   }
 
-  /** Generate static spatially smoothed silver-halide paper grain (-1..+1) anchored to the sheet */
-  private regenerateGrain(): void {
-    const tmp = new Float32Array(N);
-    for (let i = 0; i < N; i++) {
-      tmp[i] = (Math.random() + Math.random() - 1); // triangular distribution -1..+1
+  getSourceSize(): { w: number; h: number } {
+    return { w: this.origW, h: this.origH };
+  }
+
+  /** Load user uploaded photo URL (or built-in sample if url is null) */
+  async loadSource(url: string | null, sampleIndex = 1): Promise<void> {
+    if (!url) {
+      this.generateBuiltInSample(sampleIndex || 1);
+      return;
     }
-    for (let y = 0; y < LH; y++) {
-      const row = y * LW;
-      for (let x = 0; x < LW; x++) {
-        const i = row + x;
-        const left = x > 0 ? tmp[i - 1] : tmp[i];
-        const up = y > 0 ? tmp[i - LW] : tmp[i];
-        this.grainMap[i] = tmp[i] * 0.56 + left * 0.22 + up * 0.22;
+    try {
+      const img = await new Promise<HTMLImageElement>((resolve, reject) => {
+        const im = new Image();
+        im.crossOrigin = 'anonymous';
+        im.onload = () => resolve(im);
+        im.onerror = () => reject(new Error('Image load failed'));
+        im.src = url;
+      });
+      const maxWork = 1280;
+      const scale = Math.min(1, maxWork / Math.max(img.naturalWidth, img.naturalHeight));
+      const w = Math.max(16, Math.round(img.naturalWidth * scale));
+      const h = Math.max(16, Math.round(img.naturalHeight * scale));
+      this.origCanvas.width = w;
+      this.origCanvas.height = h;
+      this.origCtx.drawImage(img, 0, 0, w, h);
+      this.prepareDerivedCanvases();
+    } catch {
+      this.generateBuiltInSample(sampleIndex || 1);
+    }
+  }
+
+  /** Built-in high-contrast color test photographs when no phone upload is queued */
+  private generateBuiltInSample(idx: number): void {
+    const w = 1280;
+    const h = 720;
+    this.origCanvas.width = w;
+    this.origCanvas.height = h;
+    const c = this.origCtx;
+
+    if (idx === 2) {
+      // Sample 2: Botanical Crimson & Cobalt Still Life
+      const bg = c.createLinearGradient(0, 0, w, h);
+      bg.addColorStop(0, '#10243E');
+      bg.addColorStop(0.55, '#1B3A5C');
+      bg.addColorStop(1, '#09111E');
+      c.fillStyle = bg;
+      c.fillRect(0, 0, w, h);
+
+      c.fillStyle = '#D94B38';
+      c.beginPath();
+      c.arc(w * 0.48, h * 0.48, 175, 0, Math.PI * 2);
+      c.fill();
+
+      c.fillStyle = '#F2C14E';
+      c.beginPath();
+      c.arc(w * 0.62, h * 0.36, 78, 0, Math.PI * 2);
+      c.fill();
+
+      c.fillStyle = '#0F1814';
+      c.fillRect(w * 0.14, h * 0.68, w * 0.72, h * 0.22);
+      c.fillStyle = '#E8DFCC';
+      c.fillRect(w * 0.25, h * 0.28, 36, 320);
+    } else if (idx === 3) {
+      // Sample 3: Architectural Warm Beam & Indigo Shadows
+      c.fillStyle = '#141B29';
+      c.fillRect(0, 0, w, h);
+      const beam = c.createLinearGradient(w * 0.18, 0, w * 0.85, h);
+      beam.addColorStop(0, '#FCE6B4');
+      beam.addColorStop(0.5, '#D97B48');
+      beam.addColorStop(1, '#1A2639');
+      c.fillStyle = beam;
+      c.beginPath();
+      c.moveTo(w * 0.22, 0);
+      c.lineTo(w * 0.68, 0);
+      c.lineTo(w * 0.88, h);
+      c.lineTo(w * 0.12, h);
+      c.closePath();
+      c.fill();
+
+      c.fillStyle = '#0B0F17';
+      c.fillRect(w * 0.38, h * 0.32, 110, 360);
+      c.fillStyle = '#477998';
+      c.beginPath();
+      c.arc(w * 0.62, h * 0.52, 92, 0, Math.PI * 2);
+      c.fill();
+    } else {
+      // Sample 1: Coastal Sunset & Pier Silhouette
+      const sky = c.createLinearGradient(0, 0, 0, h * 0.65);
+      sky.addColorStop(0, '#1A2D4F');
+      sky.addColorStop(0.55, '#B84A39');
+      sky.addColorStop(1, '#F2AE52');
+      c.fillStyle = sky;
+      c.fillRect(0, 0, w, h * 0.65);
+
+      c.fillStyle = '#FFF0C2';
+      c.beginPath();
+      c.arc(w * 0.52, h * 0.44, 96, 0, Math.PI * 2);
+      c.fill();
+
+      const sea = c.createLinearGradient(0, h * 0.65, 0, h);
+      sea.addColorStop(0, '#2C4257');
+      sea.addColorStop(1, '#0C131C');
+      c.fillStyle = sea;
+      c.fillRect(0, h * 0.65, w, h * 0.35);
+
+      // Reflection + Pier silhouette
+      c.fillStyle = 'rgba(255, 200, 110, 0.45)';
+      c.fillRect(w * 0.47, h * 0.65, 130, h * 0.35);
+      c.fillStyle = '#0D0C0B';
+      c.fillRect(0, h * 0.63, w * 0.42, 24);
+      for (let px = 60; px < w * 0.42; px += 95) {
+        c.fillRect(px, h * 0.63, 18, h * 0.37);
+      }
+    }
+
+    this.prepareDerivedCanvases();
+  }
+
+  /** Build shadow-lifted (RGB >= 38/255) & safelight-red preview canvases */
+  private prepareDerivedCanvases(): void {
+    const w = this.origCanvas.width;
+    const h = this.origCanvas.height;
+    this.origW = w;
+    this.origH = h;
+
+    const src = this.origCtx.getImageData(0, 0, w, h);
+    this.origData = src.data;
+
+    this.liftedCanvas.width = w;
+    this.liftedCanvas.height = h;
+    const liftedImg = this.liftedCtx.createImageData(w, h);
+    const ld = liftedImg.data;
+
+    this.redCanvas.width = w;
+    this.redCanvas.height = h;
+    const redImg = this.redCtx.createImageData(w, h);
+    const rd = redImg.data;
+
+    const minFloor = 38;
+    const scale = (255 - minFloor) / 255;
+
+    for (let i = 0; i < this.origData.length; i += 4) {
+      const r = this.origData[i];
+      const g = this.origData[i + 1];
+      const b = this.origData[i + 2];
+
+      // Shadow lift for physical dodging visibility even in deep shadows
+      ld[i] = Math.round(minFloor + r * scale);
+      ld[i + 1] = Math.round(minFloor + g * scale);
+      ld[i + 2] = Math.round(minFloor + b * scale);
+      ld[i + 3] = 255;
+
+      // Safelight red monochrome projection for OBSERVE
+      const lum = (0.299 * r + 0.587 * g + 0.114 * b) / 255;
+      rd[i] = Math.round(28 + lum * 172);
+      rd[i + 1] = Math.round(4 + lum * 16);
+      rd[i + 2] = Math.round(4 + lum * 14);
+      rd[i + 3] = 255;
+    }
+
+    this.liftedCtx.putImageData(liftedImg, 0, 0);
+    this.redCtx.putImageData(redImg, 0, 0);
+
+    this.devCanvas.width = w;
+    this.devCanvas.height = h;
+    this.devImgData = this.devCtx.createImageData(w, h);
+    this.upsampledDodge = new Float32Array(w * h);
+  }
+
+  /** Draw photo during OBSERVE (darkroom safelight red filter inside easel margin) */
+  drawObserve(g: CanvasRenderingContext2D, marginPct: number): void {
+    g.fillStyle = '#070202';
+    g.fillRect(0, 0, DISPLAY_W, DISPLAY_H);
+    const rect = computeEaselRect(DISPLAY_W, DISPLAY_H, marginPct, this.origW, this.origH);
+    g.drawImage(this.redCanvas, rect.x, rect.y, rect.w, rect.h);
+  }
+
+  /** Draw shadow-lifted color photo during CAPTURE_CLEAN and EXPOSE */
+  drawExpose(g: CanvasRenderingContext2D, marginPct: number): void {
+    g.fillStyle = '#000000';
+    g.fillRect(0, 0, DISPLAY_W, DISPLAY_H);
+    const rect = computeEaselRect(DISPLAY_W, DISPLAY_H, marginPct, this.origW, this.origH);
+    g.drawImage(this.liftedCanvas, rect.x, rect.y, rect.w, rect.h);
+  }
+
+  /** Reset dodge buffers for a new round */
+  beginRound(): void {
+    this.cleanAccum.fill(0);
+    this.cleanCount = 0;
+    this.camClean.fill(0.5);
+    this.dodgeMap.fill(0);
+    this.upsampledDodge.fill(0);
+    this.dodgeFinalized = false;
+  }
+
+  /** Grab 1 camera snapshot (640x360) for remote 4-corner calibration on /admin */
+  grabCameraSnapshot(videoEl: HTMLVideoElement | null, marginPct: number): string {
+    if (videoEl && videoEl.readyState >= 2 && videoEl.videoWidth > 0 && videoEl.videoHeight > 0) {
+      this.camCtx.drawImage(videoEl, 0, 0, CAM_W, CAM_H);
+    } else {
+      // Simulated angled camera view of the calibration target when no camera attached
+      this.camCtx.fillStyle = '#060606';
+      this.camCtx.fillRect(0, 0, CAM_W, CAM_H);
+      const r = computeEaselRect(CAM_W, CAM_H, marginPct, 16, 9);
+      this.camCtx.strokeStyle = '#E8E2D5';
+      this.camCtx.lineWidth = 2;
+      this.camCtx.strokeRect(r.x, r.y, r.w, r.h);
+      this.camCtx.fillStyle = '#E8E2D5';
+      this.camCtx.font = '12px monospace';
+      this.camCtx.fillText('TL', r.x + 6, r.y + 16);
+      this.camCtx.fillText('TR', r.x + r.w - 22, r.y + 16);
+      this.camCtx.fillText('BR', r.x + r.w - 22, r.y + r.h - 8);
+      this.camCtx.fillText('BL', r.x + 6, r.y + r.h - 8);
+    }
+    return this.camCanvas.toDataURL('image/jpeg', 0.85);
+  }
+
+  private sampleCameraToGrid(videoEl: HTMLVideoElement | null, hInv: number[] | null): boolean {
+    if (!videoEl || videoEl.readyState < 2 || videoEl.videoWidth <= 0) return false;
+    this.camCtx.drawImage(videoEl, 0, 0, CAM_W, CAM_H);
+    const rgba = this.camCtx.getImageData(0, 0, CAM_W, CAM_H).data;
+    warpCameraToGridGray(rgba, CAM_W, CAM_H, hInv, this.currGray);
+    return true;
+  }
+
+  /** CAPTURE_CLEAN (0.8s): average 4+ warped frames into camClean */
+  sampleCleanFrame(videoEl: HTMLVideoElement | null, hInv: number[] | null): void {
+    if (!this.sampleCameraToGrid(videoEl, hInv)) return;
+    this.cleanCount++;
+    for (let i = 0; i < GRID_N; i++) this.cleanAccum[i] += this.currGray[i];
+  }
+
+  finalizeClean(): void {
+    if (this.cleanCount === 0) return;
+    const inv = 1 / this.cleanCount;
+    for (let i = 0; i < GRID_N; i++) this.camClean[i] = this.cleanAccum[i] * inv;
+  }
+
+  /** EXPOSE (30s): anti-AE drift normalization + dodgeMap integration */
+  sampleExposeFrame(videoEl: HTMLVideoElement | null, dtSec: number, hInv: number[] | null, diffSensitivity: number): void {
+    if (this.cleanCount === 0) return;
+    if (!this.sampleCameraToGrid(videoEl, hInv)) return;
+
+    // 1. Anti-AE drift normalization: median ratio of lowest-20% diff pixels (sampled 1/4 for speed)
+    let k = 0;
+    for (let i = 0; i < GRID_N; i += 4) {
+      const c = this.camClean[i];
+      const v = this.currGray[i];
+      this.diffScratch[k] = Math.abs(v - c);
+      this.ratioScratch[k] = c > 0.04 ? v / c : 1.0;
+      k++;
+    }
+    // Quick partial selection via sorted indices on every 16th pixel (~3600 samples -> <0.3ms)
+    const idxList: number[] = [];
+    for (let j = 0; j < k; j += 4) idxList.push(j);
+    idxList.sort((a, b) => this.diffScratch[a] - this.diffScratch[b]);
+    const take = Math.max(1, Math.floor(idxList.length * 0.2));
+    const ratios = idxList.slice(0, take).map((j) => this.ratioScratch[j]).sort((a, b) => a - b);
+    const aeScale = Math.max(0.65, Math.min(1.55, ratios[Math.floor(ratios.length / 2)] || 1.0));
+
+    // 2. Dodge integration
+    const rate = Math.max(0, dtSec) / 18.0; // ~5s -> 0.28, ~18s -> 1.0
+    for (let i = 0; i < GRID_N; i++) {
+      const currNorm = this.currGray[i] / aeScale;
+      const diff = Math.abs(currNorm - this.camClean[i]);
+      if (diff > diffSensitivity) {
+        const next = this.dodgeMap[i] + rate;
+        this.dodgeMap[i] = next > 1 ? 1 : next;
       }
     }
   }
 
-  /** Reset in-memory temporal prediction baseline (called on NEW ROLL) */
-  resetMemory(): void {
-    this.prevGray = null;
+  /** HOME MOUSE SIMULATOR: paint soft dodge brush directly onto dodgeMap */
+  applyMouseDodge(normX: number, normY: number, dtSec: number): void {
+    if (normX < 0 || normX > 1 || normY < 0 || normY > 1) return;
+    const gx = normX * GRID_W;
+    const gy = normY * GRID_H;
+    const radius = 24;
+    const r2 = radius * radius;
+    const x0 = Math.max(0, Math.floor(gx - radius));
+    const x1 = Math.min(GRID_W - 1, Math.ceil(gx + radius));
+    const y0 = Math.max(0, Math.floor(gy - radius));
+    const y1 = Math.min(GRID_H - 1, Math.ceil(gy + radius));
+    const strength = Math.min(0.18, Math.max(0.02, dtSec * 1.1));
+
+    for (let y = y0; y <= y1; y++) {
+      const dy = y - gy;
+      const row = y * GRID_W;
+      for (let x = x0; x <= x1; x++) {
+        const dx = x - gx;
+        const d2 = dx * dx + dy * dy;
+        if (d2 >= r2) continue;
+        const falloff = 1 - d2 / r2;
+        const idx = row + x;
+        const next = this.dodgeMap[idx] + strength * falloff * falloff;
+        this.dodgeMap[idx] = next > 1 ? 1 : next;
+      }
+    }
   }
 
-  /** Restore prevGray from persisted VPS frame URL on browser refresh */
-  async restoreBaselineFromUrl(url: string | null | undefined): Promise<void> {
-    if (!url) return;
-    await new Promise<void>((resolve) => {
-      const img = new Image();
-      img.onload = () => {
-        try {
-          this.forecastSrcCtx.fillStyle = '#080706';
-          this.forecastSrcCtx.fillRect(0, 0, FW, FH);
-          drawContain(this.forecastSrcCtx, img, img.naturalWidth, img.naturalHeight, 0, 0, FW, FH);
-          const px = this.forecastSrcCtx.getImageData(0, 0, FW, FH).data;
-          const gray = new Float32Array(FN);
-          for (let i = 0, p = 0; i < FN; i++, p += 4) {
-            gray[i] = (0.299 * px[p] + 0.587 * px[p + 1] + 0.114 * px[p + 2]) / 255;
+  /** Large-radius feather blur on dodgeMap + bilinear upsample to origW × origH */
+  finalizeDodgeMap(): void {
+    if (this.dodgeFinalized) return;
+    this.dodgeFinalized = true;
+
+    const blurPass = (src: Float32Array, dst: Float32Array, rad: number) => {
+      // Horizontal
+      for (let y = 0; y < GRID_H; y++) {
+        const row = y * GRID_W;
+        for (let x = 0; x < GRID_W; x++) {
+          let sum = 0;
+          let cnt = 0;
+          const x0 = Math.max(0, x - rad);
+          const x1 = Math.min(GRID_W - 1, x + rad);
+          for (let k = x0; k <= x1; k++) {
+            sum += src[row + k];
+            cnt++;
           }
-          this.prevGray = gray;
-        } catch {
-          /* ignore */
+          this.dodgeBlurB[row + x] = sum / cnt;
         }
-        resolve();
-      };
-      img.onerror = () => resolve();
-      img.src = url;
-    });
-  }
-
-  /** Capture one 480×270 grayscale JPEG ghost frame (~10-15KB) for VPS cache persistence */
-  captureGhostFrame(videoEl: HTMLVideoElement | null, elapsedSec: number, totalSec: number): string {
-    if (videoEl && videoEl.readyState >= 2 && videoEl.videoWidth > 0 && videoEl.videoHeight > 0) {
-      drawCover(this.ghostCtx, videoEl, videoEl.videoWidth, videoEl.videoHeight, 480, 270);
-    } else {
-      this.drawSimulatedExposureInput(this.sampleCtx, elapsedSec, Math.max(1, totalSec));
-      this.ghostCtx.drawImage(this.sampleCanvas, 0, 0, 480, 270);
-    }
-    const img = this.ghostCtx.getImageData(0, 0, 480, 270);
-    const d = img.data;
-    for (let i = 0; i < d.length; i += 4) {
-      const lum = Math.round(0.299 * d[i] + 0.587 * d[i + 1] + 0.114 * d[i + 2]);
-      d[i] = lum;
-      d[i + 1] = lum;
-      d[i + 2] = lum;
-    }
-    this.ghostCtx.putImageData(img, 0, 0);
-    return this.ghostCanvas.toDataURL('image/jpeg', 0.62);
-  }
-
-  /** Sample 1 frame for 00A empty-beam base capture (averages clean frames to denoise) */
-  sampleBaseFrame(videoEl: HTMLVideoElement | null): void {
-    const ctx = this.sampleCtx;
-    if (videoEl && videoEl.readyState >= 2 && videoEl.videoWidth > 0 && videoEl.videoHeight > 0) {
-      drawCover(ctx, videoEl, videoEl.videoWidth, videoEl.videoHeight, LW, LH);
-    } else {
-      // Clean empty warm-white enlarger beam wall (no moving people)
-      const bg = ctx.createRadialGradient(LW * 0.5, LH * 0.5, 40, LW * 0.5, LH * 0.5, LW * 0.68);
-      bg.addColorStop(0, '#F3EFE4');
-      bg.addColorStop(1, '#DCD5C5');
-      ctx.fillStyle = bg;
-      ctx.fillRect(0, 0, LW, LH);
-      // Subtle static wall texture / calibration corner mark
-      ctx.fillStyle = 'rgba(28, 25, 22, 0.18)';
-      ctx.fillRect(LW * 0.44, LH * 0.46, LW * 0.12, LH * 0.08);
-    }
-    const px = ctx.getImageData(0, 0, LW, LH).data;
-    this.sampleCount++;
-    for (let i = 0, p = 0; i < N; i++, p += 4) {
-      const lum = (0.299 * px[p] + 0.587 * px[p + 1] + 0.114 * px[p + 2]) / 255;
-      this.avgAccum[i] += lum;
-    }
-  }
-
-  /** Finalize multi-frame averaged 00A BASE image + initial FORECAST 01A + collapseZone */
-  finalizeBaseAndForecast(): { baseDataUrl: string; forecastDataUrl: string; collapseZone: CollapseZone } {
-    if (this.sampleCount === 0) this.sampleBaseFrame(null);
-    const invN = 1 / Math.max(1, this.sampleCount);
-    const out = this.devImg.data;
-    for (let i = 0, q = 0; i < N; i++, q += 4) {
-      const v = Math.max(0, Math.min(1, this.avgAccum[i] * invN));
-      const g = Math.max(0, Math.min(1, v + this.grainMap[i] * 0.015));
-      out[q] = Math.round(9 + 231 * g);
-      out[q + 1] = Math.round(8 + 226 * g);
-      out[q + 2] = Math.round(8 + 212 * g);
-      out[q + 3] = 255;
-    }
-    this.devCtx.putImageData(this.devImg, 0, 0);
-    this.exportCtx.imageSmoothingEnabled = true;
-    this.exportCtx.imageSmoothingQuality = 'high';
-    this.exportCtx.drawImage(this.devCanvas, 0, 0, DISPLAY_W, DISPLAY_H);
-    const baseDataUrl = this.exportCanvas.toDataURL('image/jpeg', 0.88);
-    const { forecastDataUrl, collapseZone } = this.computeAndExportForecast(true, 0.85);
-    return { baseDataUrl, forecastDataUrl, collapseZone };
-  }
-
-  /** Capture stream of sampleCanvas for local MediaRecorder fallback when no USB camera is attached */
-  getSimulatedStream(fps = 20): MediaStream | null {
-    const fn = (this.sampleCanvas as HTMLCanvasElement & { captureStream?: (f?: number) => MediaStream }).captureStream;
-    return typeof fn === 'function' ? fn.call(this.sampleCanvas, fps) : null;
-  }
-
-  /** Reset accumulators at the start of each EXPOSURE round */
-  beginExposure(roundId = 0): void {
-    this.avgAccum.fill(0);
-    this.minAccum.fill(1);
-    this.latentMap.fill(0.5);
-    this.sampleCount = 0;
-    this.latentReady = false;
-    this.roundSeed = roundId;
-    this.regenerateGrain();
-  }
-
-  /** Sample 1 frame from live camera (or simulated moving photogram objects when no camera is available) */
-  sampleExposureFrame(videoEl: HTMLVideoElement | null, elapsedSec: number, totalSec: number): void {
-    const ctx = this.sampleCtx;
-    if (videoEl && videoEl.readyState >= 2 && videoEl.videoWidth > 0 && videoEl.videoHeight > 0) {
-      // 16:9 cover crop from camera
-      const vw = videoEl.videoWidth;
-      const vh = videoEl.videoHeight;
-      const targetRatio = LW / LH;
-      const srcRatio = vw / vh;
-      let sx = 0;
-      let sy = 0;
-      let sw = vw;
-      let sh = vh;
-      if (srcRatio > targetRatio) {
-        sw = vh * targetRatio;
-        sx = (vw - sw) / 2;
-      } else {
-        sh = vw / targetRatio;
-        sy = (vh - sh) / 2;
       }
-      ctx.drawImage(videoEl, sx, sy, sw, sh, 0, 0, LW, LH);
-    } else {
-      this.drawSimulatedExposureInput(ctx, elapsedSec, Math.max(1, totalSec));
-    }
+      // Vertical
+      for (let y = 0; y < GRID_H; y++) {
+        const y0 = Math.max(0, y - rad);
+        const y1 = Math.min(GRID_H - 1, y + rad);
+        const cnt = y1 - y0 + 1;
+        for (let x = 0; x < GRID_W; x++) {
+          let sum = 0;
+          for (let k = y0; k <= y1; k++) sum += this.dodgeBlurB[k * GRID_W + x];
+          dst[y * GRID_W + x] = sum / cnt;
+        }
+      }
+    };
 
-    const px = ctx.getImageData(0, 0, LW, LH).data;
-    const first = this.sampleCount === 0;
-    this.sampleCount++;
+    blurPass(this.dodgeMap, this.dodgeBlurA, 9);
+    blurPass(this.dodgeBlurA, this.dodgeBlurB, 7);
 
-    for (let i = 0, p = 0; i < N; i++, p += 4) {
-      const lum = (0.299 * px[p] + 0.587 * px[p + 1] + 0.114 * px[p + 2]) / 255;
-      this.avgAccum[i] += lum;
-      if (first) {
-        this.minAccum[i] = lum;
-      } else {
-        const cur = this.minAccum[i];
-        // Fast attack on dark shadows, slow leaky release for crisp stationary edges
-        this.minAccum[i] = lum < cur ? cur + (lum - cur) * 0.38 : cur + (lum - cur) * 0.018;
+    // Bilinear upsample to origW × origH
+    const w = this.origW;
+    const h = this.origH;
+    const out = this.upsampledDodge;
+    if (out.length !== w * h) this.upsampledDodge = new Float32Array(w * h);
+    const dst = this.upsampledDodge;
+
+    for (let y = 0; y < h; y++) {
+      const sy = (y / Math.max(1, h - 1)) * (GRID_H - 1);
+      const y0 = Math.floor(sy);
+      const y1 = Math.min(GRID_H - 1, y0 + 1);
+      const fy = sy - y0;
+      const row = y * w;
+      for (let x = 0; x < w; x++) {
+        const sx = (x / Math.max(1, w - 1)) * (GRID_W - 1);
+        const x0 = Math.floor(sx);
+        const x1 = Math.min(GRID_W - 1, x0 + 1);
+        const fx = sx - x0;
+
+        const d00 = this.dodgeBlurB[y0 * GRID_W + x0];
+        const d10 = this.dodgeBlurB[y0 * GRID_W + x1];
+        const d01 = this.dodgeBlurB[y1 * GRID_W + x0];
+        const d11 = this.dodgeBlurB[y1 * GRID_W + x1];
+        const top = d00 + (d10 - d00) * fx;
+        const bot = d01 + (d11 - d01) * fx;
+        dst[row + x] = Math.max(0, Math.min(1, top + (bot - top) * fy));
       }
     }
   }
 
-  /** Procedural simulation when debugging without a USB camera: held perforated board + transparency lines + moving shadows */
-  private drawSimulatedExposureInput(ctx: CanvasRenderingContext2D, elapsedSec: number, totalSec: number): void {
-    const u = Math.max(0, Math.min(1, elapsedSec / totalSec));
+  /** Render RA-4 Color Darkroom developing print onto devCanvas */
+  private renderToDevCanvas(devProgress: number): void {
+    if (!this.dodgeFinalized) this.finalizeDodgeMap();
+    if (!this.devImgData) return;
 
-    // Bright enlarger-lit wall with subtle vignette
-    const bg = ctx.createRadialGradient(LW * 0.5, LH * 0.5, 40, LW * 0.5, LH * 0.5, LW * 0.65);
-    bg.addColorStop(0, '#F3EFE4');
-    bg.addColorStop(1, '#DCD5C5');
-    ctx.fillStyle = bg;
-    ctx.fillRect(0, 0, LW, LH);
-
-    // 1. Held perforated board with crisp square aperture & transparency film lines (shifts subtly per round)
-    const phaseShift = (this.roundSeed % 5) * 18;
-    const bx = LW * 0.32 + phaseShift + Math.sin(elapsedSec * 1.4) * 2.5;
-    const by = LH * 0.24 + Math.cos(elapsedSec * 1.1) * 2.2;
-    const bw = 200;
-    const bh = 250;
-    const hx = bx + 54;
-    const hy = by + 62;
-    const hw = 92;
-    const hh = 92;
-
-    ctx.save();
-    ctx.fillStyle = '#181614';
-    ctx.beginPath();
-    ctx.rect(bx, by, bw, bh);
-    ctx.rect(hx + hw, hy, -hw, hh); // square cutout window (counter-clockwise hole)
-    ctx.fill();
-
-    // Fine botanical / optical grid lines printed on acetate across the aperture
-    ctx.strokeStyle = 'rgba(28, 25, 22, 0.65)';
-    ctx.lineWidth = 1.6;
-    for (let k = 1; k <= 4; k++) {
-      const gx = hx + (hw * k) / 5;
-      ctx.beginPath();
-      ctx.moveTo(gx, hy);
-      ctx.lineTo(gx, hy + hh);
-      ctx.stroke();
-    }
-    ctx.beginPath();
-    ctx.arc(hx + hw * 0.5, hy + hh * 0.5, 24, 0, Math.PI * 2);
-    ctx.stroke();
-    ctx.restore();
-
-    // 2. Stationary small object silhouette (sharp in minAccum)
-    ctx.fillStyle = '#161412';
-    ctx.beginPath();
-    ctx.ellipse(LW * 0.72, LH * 0.66, 32, 68, -0.18, 0, Math.PI * 2);
-    ctx.fill();
-
-    // 3. Moving geometric shadows sweeping across the beam (ghosting trail in avgAccum)
-    ctx.save();
-    ctx.fillStyle = 'rgba(20, 18, 16, 0.88)';
-    const mx1 = LW * (0.14 + u * 0.66);
-    const my1 = LH * (0.56 - Math.sin(u * Math.PI) * 0.18);
-    ctx.beginPath();
-    ctx.ellipse(mx1, my1, 46, 130, 0.08, 0, Math.PI * 2);
-    ctx.fill();
-
-    const mx2 = LW * (0.82 - u * 0.42);
-    const my2 = LH * 0.36;
-    ctx.beginPath();
-    ctx.rect(mx2 - 28, my2 - 74, 56, 148);
-    ctx.fill();
-    ctx.restore();
-  }
-
-  /** Synthesize final latentMap at end of EXPOSURE: 0.72*avg + 0.28*min + 2%–98% histogram stretch */
-  finalizeLatent(): void {
-    if (this.latentReady) return;
-    if (this.sampleCount === 0) {
-      this.sampleExposureFrame(null, 7.5, 15);
-    }
-
-    const invN = 1 / Math.max(1, this.sampleCount);
-    this.hist.fill(0);
-
-    for (let i = 0; i < N; i++) {
-      const avg = this.avgAccum[i] * invN;
-      const min = this.minAccum[i];
-      const v = Math.max(0, Math.min(1, 0.72 * avg + 0.28 * min));
-      this.rawBuf[i] = v;
-      const bin = Math.min(1023, Math.max(0, Math.floor(v * 1023)));
-      this.hist[bin]++;
-    }
-
-    const lowTarget = Math.floor(N * 0.02);
-    const highTarget = Math.floor(N * 0.98);
-    let acc = 0;
-    let p02Bin = 0;
-    let p98Bin = 1023;
-    let foundLow = false;
-    for (let b = 0; b < 1024; b++) {
-      acc += this.hist[b];
-      if (!foundLow && acc >= lowTarget) {
-        p02Bin = b;
-        foundLow = true;
-      }
-      if (acc >= highTarget) {
-        p98Bin = b;
-        break;
-      }
-    }
-
-    const p02 = p02Bin / 1023;
-    const p98 = p98Bin / 1023;
-    const span = Math.max(0.06, p98 - p02);
-
-    for (let i = 0; i < N; i++) {
-      let x = (this.rawBuf[i] - p02) / span;
-      if (x < 0) x = 0;
-      else if (x > 1) x = 1;
-      // Gentle S-curve toe/shoulder characteristic of silver-gelatin paper
-      const s = x * x * (3 - 2 * x);
-      let g = x * 0.55 + s * 0.45 + this.grainMap[i] * 0.024;
-      if (g < 0) g = 0;
-      else if (g > 1) g = 1;
-      this.latentMap[i] = g;
-    }
-
-    this.latentReady = true;
-  }
-
-  /**
-   * Render developing paper at `devProgress` (0.0 -> 0.85 -> 1.0 -> 1.45+ fogged/burned black).
-   * `ambientDim` dims output slightly during live darkroom tray viewing (e.g. 0.93) vs 1.0 for FIXED_REVEAL/export.
-   */
-  renderPrint(
-    targetCtx: CanvasRenderingContext2D,
-    targetW: number,
-    targetH: number,
-    devProgress: number,
-    printMode: PrintMode,
-    ambientDim = 1.0,
-  ): void {
-    if (!this.latentReady) this.finalizeLatent();
-
+    const out = this.devImgData.data;
+    const orig = this.origData;
+    const dodge = this.upsampledDodge;
     const p = Math.max(0, devProgress);
-    const k = Math.min(1, p / 0.85);
-    const boost = p > 0.85 ? Math.min(1, (p - 0.85) / 0.15) : 0;
-    const over = p > 1.0 ? Math.min(1, (p - 1.0) / 0.45) : 0;
+    const n = this.origW * this.origH;
 
-    const gamma = 1.38 - 0.22 * k;
-    const kPow = Math.pow(k, 1.15);
-    const gain = 0.88 + 0.12 * boost;
-    const baseFog = over > 0 ? Math.pow(over, 1.18) * 0.985 : 0;
-    const negMode = printMode === 'photogram_negative';
+    const PR = 245;
+    const PG = 242;
+    const PB = 235;
 
-    const out = this.devImg.data;
-    const latent = this.latentMap;
-    const grain = this.grainMap;
+    for (let i = 0, q = 0; i < n; i++, q += 4) {
+      const eff = p * (1.0 - dodge[i] * 0.94);
+      const or = orig[q];
+      const og = orig[q + 1];
+      const ob = orig[q + 2];
 
-    // Warm fiber paper white -> deep archival silver black
-    const paperR = 240 * ambientDim;
-    const paperG = 234 * ambientDim;
-    const paperB = 220 * ambientDim;
-    const dmaxR = 9;
-    const dmaxG = 8;
-    const dmaxB = 8;
-
-    for (let i = 0, q = 0; i < N; i++, q += 4) {
-      const u = latent[i];
-      const exposure = negMode ? u : 1 - u;
-
-      let density = Math.pow(exposure, gamma) * kPow * gain;
-      if (over > 0) {
-        let fog = baseFog + over * 0.045 * grain[i];
-        if (fog < 0) fog = 0;
-        else if (fog > 1) fog = 1;
-        density = density + (1 - density) * fog;
+      if (eff <= 1.0) {
+        const k = Math.pow(Math.max(0, eff), 0.9);
+        out[q] = PR - (PR - or) * k;
+        out[q + 1] = PG - (PG - og) * k;
+        out[q + 2] = PB - (PB - ob) * k;
+      } else {
+        const excess = eff - 1.0;
+        const scale = Math.max(0, 1.0 - excess * 1.15);
+        const burn = excess * 0.12 * 255;
+        out[q] = Math.max(0, Math.min(255, or * scale - burn));
+        out[q + 1] = Math.max(0, Math.min(255, og * scale - burn));
+        out[q + 2] = Math.max(0, Math.min(255, ob * scale - burn));
       }
-
-      // Subtle paper grain modulation in midtones
-      const midWeight = density * (1 - density) * 4;
-      let d = density + grain[i] * 0.022 * midWeight;
-      if (d < 0) d = 0;
-      else if (d > 1) d = 1;
-
-      const inv = 1 - d;
-      // Slight warm-amber chemical fog tint in early/mid overdevelopment
-      const stain = over > 0 ? over * (1 - over) * 26 : 0;
-      out[q] = dmaxR + (paperR - dmaxR) * inv + stain * 0.8;
-      out[q + 1] = dmaxG + (paperG - dmaxG) * inv + stain * 0.35;
-      out[q + 2] = dmaxB + (paperB - dmaxB) * inv;
       out[q + 3] = 255;
     }
 
-    this.devCtx.putImageData(this.devImg, 0, 0);
-    targetCtx.imageSmoothingEnabled = true;
-    targetCtx.imageSmoothingQuality = 'high';
-    targetCtx.drawImage(this.devCanvas, 0, 0, targetW, targetH);
+    this.devCtx.putImageData(this.devImgData, 0, 0);
   }
 
-  /** Export a 100% clean, borderless, watermark-free 1280×720 JPEG for Instax printing & Contact Sheet */
-  exportCleanJpeg(finalDevProgress: number, printMode: PrintMode, lightLeak = false): string {
-    if (lightLeak) {
-      this.renderLightLeak(this.exportCtx, DISPLAY_W, DISPLAY_H, 2.2, finalDevProgress, printMode);
-    } else {
-      this.renderPrint(this.exportCtx, DISPLAY_W, DISPLAY_H, finalDevProgress, printMode, 1.0);
-    }
-    return this.exportCanvas.toDataURL('image/jpeg', 0.88);
+  /** DEVELOP phase on /main */
+  drawDevelop(g: CanvasRenderingContext2D, devProgress: number, marginPct: number): void {
+    this.renderToDevCanvas(devProgress);
+    g.fillStyle = '#070504';
+    g.fillRect(0, 0, DISPLAY_W, DISPLAY_H);
+    const rect = computeEaselRect(DISPLAY_W, DISPLAY_H, marginPct, this.origW, this.origH);
+    g.drawImage(this.devCanvas, rect.x, rect.y, rect.w, rect.h);
   }
 
-  /**
-   * Render 2.2s UNFIXED · LIGHT LEAK animation:
-   * - 0.0–0.4s: blinding white light sweeps left -> right across the developing paper
-   * - 0.4–2.2s: unfixed silver halides rapidly fog, collapse in contrast, and burn into dark ruined streaks
-   */
-  renderLightLeak(
-    targetCtx: CanvasRenderingContext2D,
-    targetW: number,
-    targetH: number,
-    elapsedStorySec: number,
-    devProgress: number,
-    printMode: PrintMode,
-  ): void {
-    const t = Math.max(0, Math.min(2.2, elapsedStorySec));
+  /** LIGHT_LEAK (2.2s): white light sweep + rapid color fog collapse */
+  drawLightLeak(g: CanvasRenderingContext2D, elapsedSec: number, devProgress: number, marginPct: number): void {
+    const t = Math.max(0, Math.min(2.2, elapsedSec));
     const sweep = Math.min(1, t / 0.4);
     const fog = t > 0.4 ? Math.min(1, (t - 0.4) / 1.8) : 0;
 
-    // Base developing image pushed rapidly toward burned/fogged state
-    const effDev = devProgress + fog * 0.95;
-    this.renderPrint(targetCtx, targetW, targetH, effDev, printMode, 1.0 - fog * 0.32);
+    this.renderToDevCanvas(devProgress + fog * 1.1);
+    g.fillStyle = '#070504';
+    g.fillRect(0, 0, DISPLAY_W, DISPLAY_H);
+    const rect = computeEaselRect(DISPLAY_W, DISPLAY_H, marginPct, this.origW, this.origH);
+    g.drawImage(this.devCanvas, rect.x, rect.y, rect.w, rect.h);
 
-    // Sweeping white light shaft (0 -> 0.4s, fading into dark chemical fog after)
     if (t < 0.75) {
-      const bandX = sweep * targetW;
+      const bx = rect.x + sweep * rect.w;
       const alpha = t <= 0.4 ? 0.92 : Math.max(0, 0.92 * (1 - (t - 0.4) / 0.35));
-      const beam = targetCtx.createLinearGradient(bandX - targetW * 0.45, 0, bandX + targetW * 0.12, 0);
-      beam.addColorStop(0, 'rgba(255, 250, 240, 0)');
-      beam.addColorStop(0.55, `rgba(255, 252, 246, ${alpha.toFixed(3)})`);
-      beam.addColorStop(1, 'rgba(255, 250, 240, 0)');
-      targetCtx.fillStyle = beam;
-      targetCtx.fillRect(0, 0, targetW, targetH);
+      const beam = g.createLinearGradient(bx - rect.w * 0.4, 0, bx + rect.w * 0.12, 0);
+      beam.addColorStop(0, 'rgba(255,252,245,0)');
+      beam.addColorStop(0.5, `rgba(255,252,245,${alpha.toFixed(3)})`);
+      beam.addColorStop(1, 'rgba(255,252,245,0)');
+      g.fillStyle = beam;
+      g.fillRect(rect.x, rect.y, rect.w, rect.h);
     }
-
-    // Uneven darkroom fogging & chemical streak collapse (0.4s -> 2.2s)
     if (fog > 0) {
-      const streak = targetCtx.createLinearGradient(0, 0, targetW, targetH * 0.65);
-      streak.addColorStop(0, `rgba(12, 9, 8, ${(fog * 0.68).toFixed(3)})`);
-      streak.addColorStop(0.42, `rgba(92, 42, 22, ${(fog * 0.42).toFixed(3)})`);
-      streak.addColorStop(0.75, `rgba(14, 10, 9, ${(fog * 0.78).toFixed(3)})`);
-      streak.addColorStop(1, `rgba(8, 7, 6, ${(fog * 0.85).toFixed(3)})`);
-      targetCtx.fillStyle = streak;
-      targetCtx.fillRect(0, 0, targetW, targetH);
+      const grad = g.createLinearGradient(rect.x, rect.y, rect.x + rect.w, rect.y + rect.h);
+      grad.addColorStop(0, `rgba(28, 18, 14, ${(fog * 0.65).toFixed(3)})`);
+      grad.addColorStop(0.5, `rgba(110, 48, 28, ${(fog * 0.48).toFixed(3)})`);
+      grad.addColorStop(1, `rgba(14, 10, 9, ${(fog * 0.82).toFixed(3)})`);
+      g.fillStyle = grad;
+      g.fillRect(rect.x, rect.y, rect.w, rect.h);
     }
   }
 
-  /**
-   * 320×180 pixel-level Temporal Extrapolation + 8×5 Collapse Zone detection:
-   * - Seed round (00A / no prevGray): directional dark-shadow dilation + contrast boost -> FORECAST 01A
-   * - UNDERDEVELOPED (< 0.20): keeps prevGray as primary driver + slight drift (unintervened trend continues)
-   * - Regular rounds: predicted = clamp(curr + (curr - prev) * 1.15, 0, 1) + 1 box blur + silver grain
-   */
-  computeAndExportForecast(
-    isSeedRound: boolean,
-    finalDevProgress = 0.85,
-  ): { forecastDataUrl: string; collapseZone: CollapseZone } {
-    this.forecastSrcCtx.drawImage(this.exportCanvas, 0, 0, FW, FH);
-    const srcPx = this.forecastSrcCtx.getImageData(0, 0, FW, FH).data;
-    const currGray = new Float32Array(FN);
-    for (let i = 0, p = 0; i < FN; i++, p += 4) {
-      currGray[i] = (0.299 * srcPx[p] + 0.587 * srcPx[p + 1] + 0.114 * srcPx[p + 2]) / 255;
-    }
-
-    const prevRef = this.prevGray;
-    const isUnderdeveloped = !isSeedRound && finalDevProgress < 0.2 && prevRef != null;
-    const rawPred = new Float32Array(FN);
-
-    if (isSeedRound || !prevRef) {
-      for (let y = 0; y < FH; y++) {
-        for (let x = 0; x < FW; x++) {
-          const i = y * FW + x;
-          let minVal = currGray[i];
-          for (let dy = -1; dy <= 1; dy++) {
-            const sy = Math.max(0, Math.min(FH - 1, y - 1 + dy));
-            for (let dx = -1; dx <= 1; dx++) {
-              const sx = Math.max(0, Math.min(FW - 1, x - 2 + dx));
-              const v = currGray[sy * FW + sx];
-              if (v < minVal) minVal = v;
-            }
-          }
-          const dilated = currGray[i] * 0.42 + minVal * 0.58;
-          rawPred[i] = Math.max(0, Math.min(1, (dilated - 0.5) * 1.28 + 0.5));
-        }
-      }
-    } else if (isUnderdeveloped) {
-      // Intervention too weak: keep prevGray as primary trend and continue slight drift
-      for (let i = 0; i < FN; i++) {
-        const v = prevRef[i] * 0.92 + currGray[i] * 0.08 + (prevRef[i] - 0.5) * 0.06;
-        rawPred[i] = v < 0 ? 0 : v > 1 ? 1 : v;
-      }
+  /** REVEAL phase: crisp side-by-side ORIGINAL vs ALTERED PRINT */
+  drawSideBySideReveal(g: CanvasRenderingContext2D, finalDev: number, outcomeLabel: string, isLeak: boolean): void {
+    if (isLeak) {
+      this.renderToDevCanvas(finalDev + 1.1);
     } else {
-      for (let i = 0; i < FN; i++) {
-        const v = currGray[i] + (currGray[i] - prevRef[i]) * 1.15;
-        rawPred[i] = v < 0 ? 0 : v > 1 ? 1 : v;
-      }
+      this.renderToDevCanvas(finalDev);
     }
 
-    // 1 lightweight 3×3 box blur + subtle silver-halide grain
-    const blurred = new Float32Array(FN);
-    const out = this.forecastImg.data;
-    for (let y = 0; y < FH; y++) {
-      const y0 = Math.max(0, y - 1) * FW;
-      const y1 = y * FW;
-      const y2 = Math.min(FH - 1, y + 1) * FW;
-      for (let x = 0; x < FW; x++) {
-        const x0 = Math.max(0, x - 1);
-        const x1 = x;
-        const x2 = Math.min(FW - 1, x + 1);
-        const box =
-          (rawPred[y0 + x0] +
-            rawPred[y0 + x1] +
-            rawPred[y0 + x2] +
-            rawPred[y1 + x0] +
-            rawPred[y1 + x1] +
-            rawPred[y1 + x2] +
-            rawPred[y2 + x0] +
-            rawPred[y2 + x1] +
-            rawPred[y2 + x2]) /
-          9;
-        const fog = box + (Math.random() - 0.5) * 0.036;
-        const v = fog < 0 ? 0 : fog > 1 ? 1 : fog;
-        const idx = y1 + x1;
-        blurred[idx] = v;
-        const q = idx * 4;
-        out[q] = 9 + 231 * v;
-        out[q + 1] = 8 + 226 * v;
-        out[q + 2] = 8 + 212 * v;
-        out[q + 3] = 255;
-      }
-    }
-    this.forecastOutCtx.putImageData(this.forecastImg, 0, 0);
-
-    // 8×5 grid Collapse Zone search (exclude outer border cols 0,7 & rows 0,4)
-    const COLS = 8;
-    const ROWS = 5;
-    const cellW = FW / COLS;
-    const cellH = FH / ROWS;
-    let bestCol = 3;
-    let bestRow = 2;
-    let bestScore = -Infinity;
-
-    for (let r = 1; r < ROWS - 1; r++) {
-      const yStart = Math.floor(r * cellH);
-      const yEnd = Math.floor((r + 1) * cellH);
-      for (let c = 1; c < COLS - 1; c++) {
-        const xStart = Math.floor(c * cellW);
-        const xEnd = Math.floor((c + 1) * cellW);
-        let sumPred = 0;
-        let sumBase = 0;
-        let count = 0;
-        for (let y = yStart; y < yEnd; y++) {
-          const rowOff = y * FW;
-          for (let x = xStart; x < xEnd; x++) {
-            const idx = rowOff + x;
-            sumPred += blurred[idx];
-            sumBase += prevRef ? prevRef[idx] : currGray[idx];
-            count++;
-          }
-        }
-        const avgPred = sumPred / Math.max(1, count);
-        const avgBase = sumBase / Math.max(1, count);
-        const absDark = 1 - avgPred;
-        const deltaDark = Math.max(0, avgBase - avgPred);
-        const score = deltaDark * 1.65 + absDark * 0.65;
-        if (score > bestScore) {
-          bestScore = score;
-          bestCol = c;
-          bestRow = r;
-        }
-      }
-    }
-
-    if (isUnderdeveloped && prevRef) {
-      const nextPrev = new Float32Array(FN);
-      for (let i = 0; i < FN; i++) nextPrev[i] = prevRef[i] * 0.9 + currGray[i] * 0.1;
-      this.prevGray = nextPrev;
-    } else {
-      this.prevGray = currGray;
-    }
-
-    const collapseZone: CollapseZone = {
-      cx: Number(((bestCol + 0.5) / COLS).toFixed(3)),
-      cy: Number(((bestRow + 0.5) / ROWS).toFixed(3)),
-      rx: 0.095,
-      ry: 0.135,
-    };
-
-    return {
-      forecastDataUrl: this.forecastOutCanvas.toDataURL('image/jpeg', 0.86),
-      collapseZone,
-    };
-  }
-
-  /**
-   * Compute Timeline Deviation % via 320×180 pixel-wise MAE:
-   * deviationPct = Math.round(clamp(meanAbsDiff * 240, 0, 99))
-   */
-  computeDeviationPct(predictedImg: HTMLImageElement | null): number | null {
-    if (!predictedImg || !predictedImg.complete || predictedImg.naturalWidth <= 0) return null;
-    this.forecastSrcCtx.drawImage(this.exportCanvas, 0, 0, FW, FH);
-    const actualPx = this.forecastSrcCtx.getImageData(0, 0, FW, FH).data;
-
-    this.forecastOutCtx.fillStyle = '#080706';
-    this.forecastOutCtx.fillRect(0, 0, FW, FH);
-    drawContain(this.forecastOutCtx, predictedImg, predictedImg.naturalWidth, predictedImg.naturalHeight, 0, 0, FW, FH);
-    const predPx = this.forecastOutCtx.getImageData(0, 0, FW, FH).data;
-
-    let absSum = 0;
-    for (let i = 0, p = 0; i < FN; i++, p += 4) {
-      const a = (0.299 * actualPx[p] + 0.587 * actualPx[p + 1] + 0.114 * actualPx[p + 2]) / 255;
-      const b = (0.299 * predPx[p] + 0.587 * predPx[p + 1] + 0.114 * predPx[p + 2]) / 255;
-      absSum += Math.abs(a - b);
-    }
-    const meanAbsDiff = absSum / FN;
-    return Math.round(Math.max(0, Math.min(99, meanAbsDiff * 240)));
-  }
-
-  /**
-   * Side-by-side West Wall Reveal for regular rounds (01A+):
-   * Left = PREDICTED [FR] · UNTOUCHED, Right = ACTUAL [FR] · [OUTCOME] · DEV [XX]%
-   * Bottom center = TIMELINE DEVIATION: [XX]%
-   */
-  drawSideBySideReveal(
-    g: CanvasRenderingContext2D,
-    predictedImg: HTMLImageElement | null,
-    frameNo: string,
-    outcomeLabel: string,
-    devPct: number,
-    deviationPct: number | null,
-    isUnderdeveloped: boolean,
-  ): void {
     g.fillStyle = '#080706';
     g.fillRect(0, 0, DISPLAY_W, DISPLAY_H);
 
     const padX = 48;
-    const gap = 32;
-    const cardW = (DISPLAY_W - padX * 2 - gap) / 2;
-    const cardH = Math.round((cardW * 9) / 16);
-    const topY = Math.round((DISPLAY_H - cardH) / 2) - 28;
+    const gap = 36;
+    const boxW = (DISPLAY_W - padX * 2 - gap) / 2;
+    const boxH = DISPLAY_H - 140;
+    const topY = 42;
 
-    const leftX = padX;
-    const rightX = padX + cardW + gap;
+    const fit = (srcW: number, srcH: number, bx: number, by: number, bw: number, bh: number): EaselRect => {
+      const s = Math.min(bw / srcW, bh / srcH);
+      const w = srcW * s;
+      const h = srcH * s;
+      return { x: bx + (bw - w) / 2, y: by + (bh - h) / 2, w, h };
+    };
 
-    g.strokeStyle = 'rgba(184, 50, 40, 0.72)';
-    g.lineWidth = 1.5;
-    g.strokeRect(leftX - 1, topY - 1, cardW + 2, cardH + 2);
+    const leftBox = fit(this.origW, this.origH, padX, topY, boxW, boxH);
+    const rightBox = fit(this.origW, this.origH, padX + boxW + gap, topY, boxW, boxH);
 
-    g.strokeStyle = 'rgba(232, 226, 213, 0.35)';
-    g.strokeRect(rightX - 1, topY - 1, cardW + 2, cardH + 2);
+    g.drawImage(this.origCanvas, leftBox.x, leftBox.y, leftBox.w, leftBox.h);
+    g.strokeStyle = 'rgba(232, 226, 213, 0.25)';
+    g.lineWidth = 1;
+    g.strokeRect(leftBox.x, leftBox.y, leftBox.w, leftBox.h);
 
-    if (predictedImg && predictedImg.complete && predictedImg.naturalWidth > 0) {
-      drawContain(g, predictedImg, predictedImg.naturalWidth, predictedImg.naturalHeight, leftX, topY, cardW, cardH);
-    } else {
-      g.fillStyle = '#12100E';
-      g.fillRect(leftX, topY, cardW, cardH);
-      g.fillStyle = 'rgba(232, 226, 213, 0.4)';
-      g.font = '14px "RH Mono", monospace';
-      g.fillText('NO PRIOR FORECAST', leftX + 20, topY + cardH / 2);
+    g.drawImage(this.devCanvas, rightBox.x, rightBox.y, rightBox.w, rightBox.h);
+    if (isLeak) {
+      const grad = g.createLinearGradient(rightBox.x, rightBox.y, rightBox.x + rightBox.w, rightBox.y + rightBox.h);
+      grad.addColorStop(0, 'rgba(28, 18, 14, 0.65)');
+      grad.addColorStop(0.5, 'rgba(110, 48, 28, 0.48)');
+      grad.addColorStop(1, 'rgba(14, 10, 9, 0.82)');
+      g.fillStyle = grad;
+      g.fillRect(rightBox.x, rightBox.y, rightBox.w, rightBox.h);
     }
+    g.strokeStyle = 'rgba(232, 226, 213, 0.45)';
+    g.strokeRect(rightBox.x, rightBox.y, rightBox.w, rightBox.h);
 
-    g.drawImage(this.exportCanvas, rightX, topY, cardW, cardH);
-
-    g.font = '12.5px "RH Mono", monospace';
-    g.fillStyle = '#B83228';
-    g.fillText(`PREDICTED ${frameNo} · UNTOUCHED`, leftX, topY + cardH + 26);
+    g.font = '13px "RH Mono", monospace';
+    g.fillStyle = '#9A9387';
+    g.fillText('ORIGINAL', leftBox.x, leftBox.y + leftBox.h + 26);
 
     g.fillStyle = '#E8E2D5';
-    g.fillText(`ACTUAL ${frameNo} · ${outcomeLabel} · DEV ${devPct}%`, rightX, topY + cardH + 26);
+    g.fillText(`ALTERED PRINT · ${outcomeLabel}`, rightBox.x, rightBox.y + rightBox.h + 26);
+  }
 
-    if (deviationPct != null || isUnderdeveloped) {
-      const devLine =
-        deviationPct != null
-          ? `TIMELINE DEVIATION: ${deviationPct}%${isUnderdeveloped ? ' · INTERVENTION TOO WEAK — DRIFT CONTINUES' : ''}`
-          : 'INTERVENTION TOO WEAK — DRIFT CONTINUES';
-      g.save();
-      g.font = '15px "RH Mono", monospace';
-      g.textAlign = 'center';
-      g.fillStyle = isUnderdeveloped ? '#C48A3A' : '#E8E2D5';
-      g.fillText(devLine, DISPLAY_W / 2, topY + cardH + 74);
-      g.restore();
+  /** Export ONLY the finished high-res color print with restrained darkroom white border for Instax */
+  exportCleanInstaxPrint(finalDev: number, isLeak: boolean): string {
+    this.renderToDevCanvas(isLeak ? finalDev + 1.1 : finalDev);
+    const border = 28;
+    const maxW = 1280;
+    const scale = Math.min(1, (maxW - border * 2) / this.origW);
+    const pw = Math.round(this.origW * scale);
+    const ph = Math.round(this.origH * scale);
+
+    this.exportCanvas.width = pw + border * 2;
+    this.exportCanvas.height = ph + border * 2;
+    const ctx = this.exportCtx;
+
+    ctx.fillStyle = '#F5F2EB';
+    ctx.fillRect(0, 0, this.exportCanvas.width, this.exportCanvas.height);
+    ctx.imageSmoothingEnabled = true;
+    ctx.imageSmoothingQuality = 'high';
+    ctx.drawImage(this.devCanvas, border, border, pw, ph);
+
+    if (isLeak) {
+      const grad = ctx.createLinearGradient(border, border, border + pw, border + ph);
+      grad.addColorStop(0, 'rgba(28, 18, 14, 0.65)');
+      grad.addColorStop(0.5, 'rgba(110, 48, 28, 0.48)');
+      grad.addColorStop(1, 'rgba(14, 10, 9, 0.82)');
+      ctx.fillStyle = grad;
+      ctx.fillRect(border, border, pw, ph);
     }
+
+    return this.exportCanvas.toDataURL('image/jpeg', 0.9);
   }
 }

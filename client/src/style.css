@@ -486,3 +486,37 @@ button { font: inherit; color: inherit; cursor: pointer; }
 
 .toast { position: fixed; left: 14px; right: 14px; bottom: 14px; max-width: 480px; background: var(--paper); color: var(--ink); padding: 11px 14px; border-left: 5px solid var(--safelight); z-index: 9999; font-family: var(--f-mono); font-size: 12.5px; opacity: 0; transform: translateY(8px); transition: opacity .2s, transform .2s; pointer-events: none; }
 .toast.show { opacity: 1; transform: none; }
+
+/* =====================================================================
+   /door QR Panel + /upload Page + /admin Calibration UI
+   ===================================================================== */
+.door-qr-split { grid-template-columns: minmax(0, 40fr) minmax(0, 60fr); }
+.door-qr-panel { display: grid; grid-template-rows: auto minmax(0, 1fr); gap: 12px; min-height: 0; }
+.qr-stage { display: grid; place-items: center; align-content: center; gap: 16px; padding: 16px; background: #0B0A09; border: 1px solid var(--hair); }
+.qr-frame { width: min(100%, 260px); aspect-ratio: 1; padding: 12px; background: #080706; border: 1px solid var(--safelight-hi); }
+.qr-frame svg { width: 100%; height: 100%; display: block; }
+.qr-prompt { font-family: var(--f-grot); font-weight: 800; font-size: clamp(16px, 2.2vw, 22px); letter-spacing: .14em; color: var(--paper); text-align: center; }
+.qr-url { font-size: 11px; color: var(--silver); word-break: break-all; text-align: center; }
+.q-ready { color: var(--lamp-on) !important; }
+.q-wait { color: var(--amber) !important; }
+
+.upload-page { min-height: 100dvh; display: grid; place-items: center; padding: 24px 18px; background: var(--ink); }
+.up-card { width: min(100%, 480px); background: var(--ink-2); border: 1px solid var(--hair-2); padding: 26px 22px; display: grid; gap: 18px; }
+.up-kicker { font-size: 10.5px; letter-spacing: .16em; color: var(--amber); }
+.up-title { margin: 0; font-family: var(--f-grot); font-weight: 800; font-size: clamp(22px, 5vw, 30px); line-height: 1.12; letter-spacing: .04em; color: var(--paper); }
+.up-sub { margin: 0; font-size: 13.5px; line-height: 1.55; color: var(--silver); }
+.up-preview { background: #050504; border: 1px solid var(--hair); aspect-ratio: 16 / 10; display: grid; place-items: center; overflow: hidden; }
+.up-preview img { width: 100%; height: 100%; object-fit: contain; display: block; }
+.up-pick { display: grid; place-items: center; min-height: 56px; padding: 14px; background: var(--safelight); color: var(--paper); font-family: var(--f-grot); font-weight: 800; font-size: 16px; letter-spacing: .14em; cursor: pointer; text-align: center; }
+.up-pick input { display: none; }
+.up-status { display: grid; gap: 6px; padding: 12px; background: #090807; border: 1px solid rgba(111, 166, 88, 0.45); }
+.up-badge { font-family: var(--f-grot); font-weight: 800; font-size: 14px; letter-spacing: .12em; color: var(--lamp-on); }
+.up-meta { font-size: 11px; color: var(--silver); }
+.up-err { font-family: var(--f-mono); font-size: 12px; color: #ff786c; }
+
+.queue-strip { display: flex; justify-content: space-between; align-items: center; gap: 8px; padding: 8px 10px; background: #090807; border: 1px solid var(--hair); font-size: 11px; color: var(--silver); }
+.cal-btn-row { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
+.btn-act.primary-act { background: var(--safelight); border-color: var(--paper-2); color: #fff; }
+.cal-snap-wrap { display: grid; gap: 6px; }
+#calCanvas { width: 100%; aspect-ratio: 16 / 9; background: #050504; border: 1px solid var(--hair-2); touch-action: none; cursor: crosshair; display: block; }
+.cal-hint { font-size: 10.5px; color: var(--silver); line-height: 1.4; }

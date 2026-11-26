@@ -7,9 +7,10 @@ export default function home(app: HTMLElement): void {
 
   const routes: [string, string, string][] = [
     ['/main', 'Enlarger projector · Mac + USB wide-angle camera', 'PROJ'],
-    ['/door', 'Entrance screen · Live 35mm contact sheet', 'T-01'],
+    ['/door', 'Entrance screen · Upload QR & contact sheet', 'T-01'],
     ['/station1', 'SW terminal · Acoustic developer needle gauge', 'T-02'],
     ['/station2', 'NW terminal · Vertical fixation fader', 'T-03'],
+    ['/upload', 'Audience phone · Upload photograph for next exposure', 'U-01'],
     ['/admin', 'Mobile control desk · Shutter, calibration & Instax print', 'DESK'],
   ];
 
@@ -32,7 +33,7 @@ export default function home(app: HTMLElement): void {
         .join('')}
     </nav>
     <footer class="hv3-foot mono">
-      <span>ENTER_BUFFER → SAFELIGHT_COMPOSE → EXPOSURE → DEVELOPING → FIXED_REVEAL</span>
+      <span>CAPTURE_CLEAN → 01 OBSERVE → 02 EXPOSE → 03 DEVELOP → 04 REVEAL</span>
     </footer>
   </div>`;
 }

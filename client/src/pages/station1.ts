@@ -120,7 +120,7 @@ export default async function station1(app: HTMLElement): Promise<void> {
   let wasActive = false;
 
   function renderPhase(): void {
-    const active = net.connected && net.phase === 'DEVELOPING';
+    const active = net.connected && net.phase === 'DEVELOP';
     root.classList.toggle('black', !active);
     if (active && !wasActive) stationWakeChime();
     wasActive = active;
@@ -130,7 +130,7 @@ export default async function station1(app: HTMLElement): Promise<void> {
   net.on('open', renderPhase);
 
   function tick(): void {
-    const active = net.connected && net.phase === 'DEVELOPING';
+    const active = net.connected && net.phase === 'DEVELOP';
     if (active) {
       const raw = readEnergy();
       // Fast needle attack, calm physical ballistic decay

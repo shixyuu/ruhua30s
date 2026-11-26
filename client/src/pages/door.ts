@@ -1,80 +1,77 @@
 /**
- * /door — tablet 1: entrance darkroom display (OBSERVED PAST vs PREDICTED FUTURE)
- * - Pure #080706 background.
- * - Left (~62%): OBSERVED PAST — adaptive grid of up to 9 latest frames (00A, 01A...), strict `object-fit: contain`,
- *   each labeled with frameNo & outcome short code (FIXED / BURNED / UNDER / LEAK).
- * - Right (~38%): PREDICTED FUTURE · [NEXT FR] — enlarged red-bordered forecast frame with SVG crayon collapseZone
- *   overlay (or clean empty frame `AWAITING SEED 00A`).
- * - Bottom independent bar: `Projected from past traces. Step into the light to alter this frame.`
- * - ENTER_BUFFER: `SHUTTER RELEASED · LIFT CURTAIN & ENTER`.
+ * /door — tablet 1: entrance darkroom display
+ * - Prominent pure-JS QR code pointing to `${location.origin}/upload` + `SCAN TO LOAD A MEMORY FOR THE NEXT EXPOSURE`
+ * - Queue status indicator: `NEXT PHOTO: READY (UPLOADED)` or `WAITING FOR UPLOAD` (or `BUILT-IN SAMPLE READY`)
+ * - Contact sheet grid of recent finished prints
  */
 import { Net, mountNetDot } from '../lib/net';
+import { generateQrSvg } from '../lib/qr';
 import { escapeHtml, showStartOverlay } from '../lib/unlock';
 import { TITLE_EN } from '../lib/brand';
-import type { CollapseZone, ContactSheetInfo, ForecastInfo, Phase } from '../../../shared/protocol';
+import type { ContactSheetInfo, PersistedState, Phase } from '../../../shared/protocol';
 
 function pad2(n: number): string {
   return String(Math.max(0, Math.floor(n))).padStart(2, '0');
 }
 
-function collapseSvg(cz?: CollapseZone | null): string {
-  if (!cz) return '';
-  const cx = (cz.cx * 320).toFixed(1);
-  const cy = (cz.cy * 180).toFixed(1);
-  const rx = (cz.rx * 320).toFixed(1);
-  const ry = (cz.ry * 180).toFixed(1);
-  return `<svg class="door-cz-svg" viewBox="0 0 320 180" preserveAspectRatio="xMidYMid meet" aria-hidden="true">
-    <ellipse cx="${cx}" cy="${cy}" rx="${rx}" ry="${ry}" fill="none" stroke="#e13a2e" stroke-width="2.6" stroke-dasharray="10 3" opacity="0.92" />
-    <ellipse cx="${Number(cx) + 1.5}" cy="${Number(cy) - 1.2}" rx="${Number(rx) - 1.5}" ry="${Number(ry) + 1.2}" fill="none" stroke="#ff6c60" stroke-width="1.2" opacity="0.55" />
-  </svg>`;
-}
-
 export default async function door(app: HTMLElement): Promise<void> {
-  document.title = `Contact sheet · ${TITLE_EN}`;
+  document.title = `Entrance & Upload QR · ${TITLE_EN}`;
+
+  const uploadUrl = `${location.origin}/upload`;
+  const qrSvg = generateQrSvg(uploadUrl, '#E8E2D5', '#080706');
 
   app.innerHTML = `
     <div class="door-sheet" id="sheetWrap">
-      <main class="door-split">
-        <section class="door-past">
-          <div class="zone-head"><span>OBSERVED PAST</span><span class="mono" id="rollTag">ROLL 01</span></div>
-          <div class="past-grid cols-3" id="pastGrid"></div>
+      <main class="door-split door-qr-split">
+        <section class="door-qr-panel">
+          <div class="zone-head future"><span>NEXT EXPOSURE QUEUE</span><span class="mono" id="queuePill">WAITING FOR UPLOAD</span></div>
+          <div class="qr-stage">
+            <div class="qr-frame">${qrSvg}</div>
+            <div class="qr-prompt">SCAN TO LOAD A MEMORY FOR THE NEXT EXPOSURE</div>
+            <div class="qr-url mono">${escapeHtml(uploadUrl)}</div>
+          </div>
         </section>
-        <section class="door-future">
-          <div class="zone-head future"><span id="futureHead">PREDICTED FUTURE · 00A</span></div>
-          <div class="future-box" id="futureBox"></div>
+        <section class="door-past">
+          <div class="zone-head"><span>CONTACT SHEET · ARCHIVED PRINTS</span><span class="mono" id="rollTag">ROLL 01</span></div>
+          <div class="past-grid cols-3" id="pastGrid"></div>
         </section>
       </main>
       <footer class="cs-foot">
-        <span>Projected from past traces. Step into the light to alter this frame.</span>
+        <span>Your uploaded photograph is used only for this live exposure and permanently deleted afterward.</span>
       </footer>
-    </div>
-    <div class="door-enter" id="enterModal">
-      <div class="door-enter-txt">SHUTTER RELEASED · LIFT CURTAIN &amp; ENTER</div>
     </div>`;
 
   const sheetWrap = app.querySelector('#sheetWrap') as HTMLDivElement;
+  const queuePill = app.querySelector('#queuePill') as HTMLSpanElement;
   const rollTag = app.querySelector('#rollTag') as HTMLSpanElement;
   const pastGrid = app.querySelector('#pastGrid') as HTMLDivElement;
-  const futureHead = app.querySelector('#futureHead') as HTMLSpanElement;
-  const futureBox = app.querySelector('#futureBox') as HTMLDivElement;
-  const enterModal = app.querySelector('#enterModal') as HTMLDivElement;
 
   const net = new Net('door');
   (window as any).__net = net;
 
   let sheetKey = '';
 
-  function renderSheet(sheet?: ContactSheetInfo | null, stateForecast?: ForecastInfo | null): void {
+  function updateQueueStatus(st?: PersistedState | null): void {
+    const sampleIdx = net.config?.sampleFallback ?? 0;
+    if (st?.hasQueuedPhoto) {
+      queuePill.textContent = 'NEXT PHOTO: READY (UPLOADED)';
+      queuePill.className = 'mono q-ready';
+    } else if (sampleIdx > 0) {
+      queuePill.textContent = `NEXT PHOTO: BUILT-IN SAMPLE #${sampleIdx}`;
+      queuePill.className = 'mono q-ready';
+    } else {
+      queuePill.textContent = 'WAITING FOR UPLOAD';
+      queuePill.className = 'mono q-wait';
+    }
+  }
+
+  function renderSheet(sheet?: ContactSheetInfo | null): void {
     const rollNo = sheet?.rollNumber ?? net.config?.rollNumber ?? net.round?.rollNumber ?? 1;
     const allFrames = sheet?.frames ?? [];
-    const forecast = sheet?.forecast ?? stateForecast ?? net.state?.forecast ?? null;
     const totalExposed = sheet?.totalInRoll ?? allFrames.length;
-    const cz = forecast?.collapseZone ?? null;
-    const fcKey = forecast
-      ? `${forecast.has}:${forecast.version}:${forecast.targetFrameNo}:${forecast.url ?? ''}:${cz ? `${cz.cx},${cz.cy}` : ''}`
-      : 'none';
-    const key = JSON.stringify([rollNo, totalExposed, allFrames.map((f) => [f.url, f.outcomeCode]), fcKey]);
+    const key = JSON.stringify([rollNo, totalExposed, allFrames.map((f) => [f.url, f.outcomeCode])]);
     rollTag.textContent = `ROLL ${pad2(rollNo)}`;
+    updateQueueStatus(net.persisted);
 
     if (key === sheetKey) return;
     sheetKey = key;
@@ -85,7 +82,7 @@ export default async function door(app: HTMLElement): Promise<void> {
 
     const cells: string[] = [];
     visible.forEach((f) => {
-      const code = f.index === 0 ? 'BASELINE' : f.outcomeCode || 'FIXED';
+      const code = f.outcomeCode || 'FIXED';
       cells.push(`
         <div class="cs-cell filled">
           <div class="cs-imgbox">
@@ -95,7 +92,7 @@ export default async function door(app: HTMLElement): Promise<void> {
         </div>`);
     });
 
-    const startIdx = visible.length === 0 ? 0 : (visible[visible.length - 1]?.index ?? visible.length - 1) + 1;
+    const startIdx = visible.length === 0 ? 1 : (visible[visible.length - 1]?.index ?? visible.length) + 1;
     for (let k = visible.length; k < totalSlots; k++) {
       const nextNo = startIdx + (k - visible.length);
       cells.push(`
@@ -105,21 +102,6 @@ export default async function door(app: HTMLElement): Promise<void> {
         </div>`);
     }
     pastGrid.innerHTML = cells.join('');
-
-    const targetNo = forecast?.targetFrameNo || (allFrames.length === 0 ? '00A' : `${pad2(allFrames.filter((f) => f.index >= 1).length + 1)}A`);
-    if (forecast?.has && forecast.url) {
-      futureHead.textContent = `PREDICTED FUTURE · ${targetNo}`;
-      futureBox.className = 'future-box active';
-      futureBox.innerHTML = `
-        <div class="future-frame">
-          <img src="${escapeHtml(forecast.url)}" alt="Predicted ${escapeHtml(targetNo)}" loading="eager" />
-          ${collapseSvg(cz)}
-        </div>`;
-    } else {
-      futureHead.textContent = `PREDICTED FUTURE · ${targetNo}`;
-      futureBox.className = 'future-box empty';
-      futureBox.innerHTML = `<div class="future-empty">${allFrames.length === 0 ? 'AWAITING SEED 00A' : `FORECASTING ${escapeHtml(targetNo)}`}</div>`;
-    }
   }
 
   async function refreshStateHttp(): Promise<void> {
@@ -127,20 +109,11 @@ export default async function door(app: HTMLElement): Promise<void> {
       const r = await fetch('/api/state', { cache: 'no-store' });
       const j = await r.json();
       if (j?.ok && j.state) {
-        const st = j.state;
+        net.persisted = j.state;
         const sheet: ContactSheetInfo = {
-          rollNumber: st.rollNumber,
-          totalInRoll: st.frames?.length ?? 0,
-          frames: st.frames ?? [],
-          forecast: st.forecastUrl
-            ? {
-                has: true,
-                version: st.baseCapturedAt || Date.now(),
-                targetFrameNo: `${pad2((st.frames?.filter((f: any) => f.index >= 1).length ?? 0) + 1)}A`,
-                url: st.forecastUrl,
-                collapseZone: st.collapseZone ?? null,
-              }
-            : undefined,
+          rollNumber: j.state.rollNumber,
+          totalInRoll: j.state.frames?.length ?? 0,
+          frames: j.state.frames ?? [],
         };
         net.contactSheet = sheet;
         renderSheet(sheet);
@@ -151,25 +124,20 @@ export default async function door(app: HTMLElement): Promise<void> {
   }
 
   function renderPhase(phase: Phase): void {
-    const isEnter = phase === 'ENTER_BUFFER';
-    const isDim =
-      phase === 'CAPTURING_BASE' ||
-      phase === 'SAFELIGHT_COMPOSE' ||
-      phase === 'EXPOSURE' ||
-      phase === 'DEVELOPING' ||
-      phase === 'LIGHT_LEAK';
-    enterModal.classList.toggle('show', isEnter);
-    sheetWrap.classList.toggle('dim-deep', isEnter);
+    const isDim = phase === 'OBSERVE' || phase === 'EXPOSE' || phase === 'DEVELOP' || phase === 'LIGHT_LEAK';
     sheetWrap.classList.toggle('dim', isDim);
-    renderSheet(net.contactSheet, net.state?.forecast ?? null);
+    renderSheet(net.contactSheet);
   }
 
   net.on('state', (m) => renderPhase(m.state));
   net.on('contact-sheet', (m) => renderSheet(m.sheet));
-  net.on('STATE_SYNC', () => void refreshStateHttp());
+  net.on('STATE_SYNC', (m) => {
+    updateQueueStatus(m.persisted);
+    void refreshStateHttp();
+  });
   net.on('config', () => renderSheet(net.contactSheet));
   net.on('open', () => {
-    renderSheet(net.contactSheet, net.state?.forecast ?? null);
+    renderSheet(net.contactSheet);
     void refreshStateHttp();
   });
 
@@ -179,7 +147,7 @@ export default async function door(app: HTMLElement): Promise<void> {
   await showStartOverlay({
     code: 'T-01',
     kicker: '/door',
-    title: 'OBSERVED PAST · FORECAST',
+    title: 'ENTRANCE & UPLOAD QR',
     subtitle: 'Tap to lock fullscreen',
     button: 'TAP TO START',
   });

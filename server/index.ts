@@ -1,5 +1,5 @@
 /**
- * 《入画三十秒 (RH-30)》v3 统一单端口服务：活体暗房时间预言引擎 + VPS 磁盘持久化 + /data + /api + /ws
+ * 《入画三十秒 (RH-30)》v3 统一单端口服务：扫码传图彩色暗房精修 + 远程透视标定 + /data + /api + /ws
  */
 import http from 'node:http';
 import path from 'node:path';
@@ -9,10 +9,10 @@ import express, { NextFunction, Request, Response } from 'express';
 import { WebSocketServer, WebSocket, RawData } from 'ws';
 import {
   AppConfig,
+  CalibrationData,
   ChemicalOutcome,
   ClientMsg,
   ClientStatus,
-  CollapseZone,
   PersistedState,
   Phase,
   Role,
@@ -22,7 +22,6 @@ import {
 } from '../shared/protocol.js';
 import {
   ASSETS_DIR,
-  CACHE_DIR,
   DATA_DIR,
   clearCache,
   computeStorageStats,
@@ -31,21 +30,21 @@ import {
   doorPhotoInfo,
   emptyPersistedState,
   ensureDirs,
-  forecastInfoFromState,
   listArchive,
+  loadCalibration,
   loadConfig,
-  loadGhostSequence,
   loadPersistedState,
-  nextAudienceFrameNumber,
+  nextFrameNumber,
   pad,
+  purgeQueuedPhoto,
   resetDoorPhoto,
   rollDirName,
   sanitizeConfig,
-  saveAudienceFrame,
-  saveBaseFrame,
+  saveArchivedFrame,
+  saveCalibration,
   saveConfig,
-  saveGhostSequence,
   savePersistedState,
+  saveQueuedPhoto,
 } from './storage.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -53,7 +52,6 @@ const PUBLIC_DIR = path.resolve(process.env.PUBLIC_DIR || path.join(__dirname, '
 const PORT = Number(process.env.PORT || 3000);
 const HOST = process.env.HOST || '0.0.0.0';
 const ADMIN_TOKEN = (process.env.ADMIN_TOKEN || '').trim();
-/** 仅用于开发联调：把所有阶段时长按比例缩短，例如 TIME_SCALE=0.1。生产环境保持 1。 */
 const TIME_SCALE = Math.min(10, Math.max(0.01, Number(process.env.TIME_SCALE || 1) || 1));
 const MAX_PAYLOAD = 15 * 1024 * 1024;
 const HEARTBEAT_MS = 20_000;
@@ -62,6 +60,7 @@ const DEV_TICK_MS = 50;
 ensureDirs();
 let config: AppConfig = loadConfig();
 let persisted: PersistedState = loadPersistedState(config.rollNumber);
+let calibration: CalibrationData = loadCalibration();
 if (persisted.rollNumber !== config.rollNumber) {
   config = sanitizeConfig({ ...config, rollNumber: persisted.rollNumber }, config);
   void saveConfig(config);
@@ -85,12 +84,12 @@ app.get('/api/health', (_req, res) => {
   res.set('Cache-Control', 'no-store');
   res.json({
     ok: true,
-    version: '3.0.0-live-darkroom',
+    version: '3.2.0-color-dodge',
     state,
     clients: clientCounts(),
     round: round.id,
     rollNumber: config.rollNumber,
-    hasBase: persisted.hasBase,
+    hasQueuedPhoto: persisted.hasQueuedPhoto,
     timeScale: TIME_SCALE,
     uptime: Math.round(process.uptime()),
     serverTime: Date.now(),
@@ -104,6 +103,7 @@ app.get('/api/state', async (_req, res) => {
     ok: true,
     config,
     state: persisted,
+    calibration,
     storage,
     phase: state,
     serverTime: Date.now(),
@@ -115,84 +115,42 @@ app.get('/api/contact-sheet', (_req, res) => {
   res.json({ ok: true, sheet: contactSheetFromState(persisted) });
 });
 
+app.get('/api/calibration', (_req, res) => {
+  res.set('Cache-Control', 'no-store');
+  res.json({ ok: true, calibration });
+});
+
+app.post('/api/calibration', async (req, res) => {
+  if (!tokenOk(req)) return void res.status(401).json({ ok: false, error: 'unauthorized' });
+  const { corners, hInv } = req.body || {};
+  calibration = await saveCalibration({ corners: corners ?? null, hInv: hInv ?? null, updatedAt: Date.now() });
+  broadcast({ type: 'calibration', calibration });
+  console.log('[calibration] 透视标定矩阵已保存');
+  res.json({ ok: true, calibration });
+});
+
+app.post('/api/upload', async (req, res) => {
+  const { imageData } = req.body || {};
+  const buf = decodeJpeg(imageData);
+  if (!buf) return void res.status(400).json({ ok: false, error: 'Invalid JPEG photo' });
+  persisted = await saveQueuedPhoto(persisted, buf);
+  await broadcastSync();
+  console.log(`[upload] 观众已上传照片至队列 (${(buf.length / 1024).toFixed(0)}KB)`);
+  res.json({ ok: true, queuedPhotoUrl: persisted.queuedPhotoUrl });
+});
+
 app.get('/api/archive', async (req, res) => {
   if (!tokenOk(req)) return void res.status(401).json({ ok: false, error: 'unauthorized' });
   const rollParam = req.query.roll === 'current' ? config.rollNumber : req.query.roll ? Number(req.query.roll) : null;
   const rollFilter = rollParam != null && Number.isFinite(rollParam) ? rollParam : null;
   const items = await listArchive(rollFilter);
   res.set('Cache-Control', 'no-store');
-  res.json({
-    ok: true,
-    rollNumber: config.rollNumber,
-    count: items.length,
-    items,
-  });
+  res.json({ ok: true, rollNumber: config.rollNumber, count: items.length, items });
 });
 
 app.get('/api/config', (_req, res) => {
   res.set('Cache-Control', 'no-store');
   res.json({ ok: true, config });
-});
-
-app.post('/api/archive/base', async (req, res) => {
-  const { imageData, forecastData, collapseZone } = req.body || {};
-  const buf = decodeJpeg(imageData);
-  if (!buf) return void res.status(400).json({ ok: false, error: 'invalid base JPEG' });
-  const fBuf = typeof forecastData === 'string' ? decodeJpeg(forecastData) : null;
-  persisted = await saveBaseFrame(persisted, buf, fBuf, (collapseZone as CollapseZone | null) ?? null);
-  round.hasFreeze = true;
-  await broadcastSync();
-  const storage = await computeStorageStats(persisted);
-  console.log(`[archive] 基准底片 00A 已保存 (roll=${persisted.rollNumber}, ${(buf.length / 1024).toFixed(0)}KB)`);
-  res.json({ ok: true, state: persisted, storage });
-});
-
-app.post('/api/archive/frame', async (req, res) => {
-  const { imageData, forecastData, collapseZone, frameNumber, devPercent, outcome, deviationPct } = req.body || {};
-  const buf = decodeJpeg(imageData);
-  if (!buf) return void res.status(400).json({ ok: false, error: 'invalid frame JPEG' });
-  const fNo = Number.isFinite(Number(frameNumber)) ? Number(frameNumber) : round.frameNumber || nextAudienceFrameNumber(persisted);
-  const devPct = Number.isFinite(Number(devPercent)) ? Number(devPercent) : (round.finalDevProgress ?? round.devProgress) * 100;
-  const out: ChemicalOutcome = (outcome as ChemicalOutcome) || round.outcome || 'FIXED_OPTIMAL';
-  if (typeof deviationPct === 'number' && Number.isFinite(deviationPct)) {
-    round.deviationPct = Math.max(0, Math.min(99, Math.round(deviationPct)));
-  }
-  const fBuf = typeof forecastData === 'string' ? decodeJpeg(forecastData) : null;
-  const saved = await saveAudienceFrame(
-    persisted,
-    fNo,
-    buf,
-    devPct,
-    out,
-    fBuf,
-    (collapseZone as CollapseZone | null) ?? null,
-  );
-  persisted = saved.next;
-  round.hasFreeze = true;
-  await broadcastSync();
-  const storage = await computeStorageStats(persisted);
-  console.log(`[archive] 底片 ${saved.archiveName} 已保存 (${(buf.length / 1024).toFixed(0)}KB, dev=${Math.round(devPct)}%, outcome=${out})`);
-  res.json({ ok: true, archiveName: saved.archiveName, state: persisted, storage });
-});
-
-app.post('/api/cache/ghost', async (req, res) => {
-  const { frames, rollNumber, frameNumber } = req.body || {};
-  if (!Array.isArray(frames)) return void res.status(400).json({ ok: false, error: 'frames array required' });
-  persisted = await saveGhostSequence(
-    persisted,
-    Number(rollNumber) || config.rollNumber,
-    Number(frameNumber) || round.frameNumber,
-    frames,
-  );
-  await broadcastSync();
-  console.log(`[cache] 鬼影序列已缓存 (${frames.length} 帧)`);
-  res.json({ ok: true, hasGhostSequence: persisted.hasGhostSequence, updatedAt: persisted.ghostUpdatedAt });
-});
-
-app.get('/api/cache/ghost', async (_req, res) => {
-  const payload = await loadGhostSequence();
-  res.set('Cache-Control', 'no-store');
-  res.json({ ok: true, payload });
 });
 
 app.post('/api/roll/new', async (req, res) => {
@@ -210,7 +168,7 @@ app.post('/api/cache/clear', async (req, res) => {
   const cleared = await clearCache(mode, config, persisted);
   config = cleared.config;
   persisted = cleared.state;
-  round = freshRound(round.id, config.rollNumber, nextAudienceFrameNumber(persisted));
+  round = freshRound(round.id, config.rollNumber, nextFrameNumber(persisted));
   await broadcastSync();
   broadcast({ type: 'config', config });
   const storage = await computeStorageStats(persisted);
@@ -218,15 +176,12 @@ app.post('/api/cache/clear', async (req, res) => {
   res.json({ ok: true, mode, config, state: persisted, storage });
 });
 
-// /assets：保留静态挂载以兼容现有 Docker volume 配置
+// /assets
 const noCache = (res: Response) => res.setHeader('Cache-Control', 'no-cache');
-app.use(
-  '/assets',
-  express.static(ASSETS_DIR, { etag: true, lastModified: true, maxAge: 0, setHeaders: noCache }),
-);
+app.use('/assets', express.static(ASSETS_DIR, { etag: true, lastModified: true, maxAge: 0, setHeaders: noCache }));
 app.use('/assets', (_req, res) => res.status(404).type('text/plain').send('asset not found'));
 
-// /data：持久化目录
+// /data
 app.use('/data', (req: Request, res: Response, next: NextFunction) => {
   if (/\.tmp$/i.test(req.path)) return void res.status(404).end();
   if (req.path.startsWith('/rolls')) {
@@ -239,17 +194,11 @@ app.use('/data', (req: Request, res: Response, next: NextFunction) => {
 });
 app.use(
   '/data',
-  express.static(DATA_DIR, {
-    etag: true,
-    lastModified: true,
-    maxAge: 0,
-    dotfiles: 'deny',
-    setHeaders: noCache,
-  }),
+  express.static(DATA_DIR, { etag: true, lastModified: true, maxAge: 0, dotfiles: 'deny', setHeaders: noCache }),
 );
 app.use('/data', (_req, res) => res.status(404).type('text/plain').send('not found'));
 
-// 前端构建产物
+// Frontend build
 app.use(
   express.static(PUBLIC_DIR, {
     index: false,
@@ -271,7 +220,7 @@ app.get('*', (req, res, next) => {
     return void res
       .status(503)
       .type('text/plain; charset=utf-8')
-      .send('Frontend not built yet: run npm run build first (in dev mode open the Vite port 5173)');
+      .send('Frontend not built yet: run npm run build first');
   }
   res.setHeader('Cache-Control', 'no-cache');
   res.sendFile(indexFile);
@@ -349,7 +298,6 @@ function touch(p: Peer): void {
 const heartbeat = setInterval(() => {
   for (const [ws, p] of peers) {
     if (!p.alive) {
-      console.log(`[ws] 心跳超时，断开 ${p.role ?? '?'} ${p.ip}`);
       ws.terminate();
       continue;
     }
@@ -388,18 +336,16 @@ wss.on('connection', (ws, req) => {
   ws.on('close', () => {
     if (peer.role) lastSeenByRole[peer.role] = Date.now();
     peers.delete(ws);
-    if (peer.role) console.log(`[ws] ${peer.role} 断开 (${ip})`);
     pushClients();
   });
-  ws.on('error', () => {
-    /* close 会随后触发 */
-  });
+  ws.on('error', () => {});
 });
 
 async function sendFullSync(ws: WebSocket, peer: Peer): Promise<void> {
   send(ws, { type: 'time', clientTime: 0, serverTime: Date.now() });
   send(ws, stateMsg());
   send(ws, { type: 'config', config });
+  send(ws, { type: 'calibration', calibration });
   send(ws, { type: 'door-photo', photo: doorPhotoInfo(), serverTime: Date.now() });
   send(ws, { type: 'contact-sheet', sheet: contactSheetFromState(persisted), serverTime: Date.now() });
   const storage = await computeStorageStats(persisted);
@@ -443,26 +389,36 @@ function handleMessage(ws: WebSocket, peer: Peer, msg: ClientMsg): void {
         what: 'START_SESSION',
         ok,
         message: ok
-          ? `Shutter released · Roll ${pad(round.rollNumber, 2)} Frame ${pad(round.frameNumber, 2)}A`
+          ? `Session started · Roll ${pad(round.rollNumber, 2)} Frame ${pad(round.frameNumber, 2)}A`
           : `Current state is ${state}; can only start from IDLE`,
       });
     }
-    case 'CAPTURE_BASE': {
+    case 'ENTER_CALIBRATION': {
       if (peer.role !== 'admin' || !(peer.isAdmin || (ADMIN_TOKEN && msg.token === ADMIN_TOKEN))) {
-        return send(ws, { type: 'ack', what: 'CAPTURE_BASE', ok: false, message: 'Only /admin can capture base' });
+        return send(ws, { type: 'ack', what: 'ENTER_CALIBRATION', ok: false, message: 'Unauthorized' });
       }
       if (state !== 'IDLE') {
-        return send(ws, { type: 'ack', what: 'CAPTURE_BASE', ok: false, message: `Busy (${state})` });
+        return send(ws, { type: 'ack', what: 'ENTER_CALIBRATION', ok: false, message: `Busy (${state})` });
       }
-      round = freshRound(round.id + 1, config.rollNumber, 0, null, null);
-      round.trigger = 'base';
-      enter('CAPTURING_BASE');
-      return send(ws, {
-        type: 'ack',
-        what: 'CAPTURE_BASE',
-        ok: true,
-        message: `Capturing 00A BASE · Clear the beam (4s)`,
-      });
+      enter('CALIBRATING');
+      return send(ws, { type: 'ack', what: 'ENTER_CALIBRATION', ok: true, message: 'Calibration target on /main' });
+    }
+    case 'EXIT_CALIBRATION': {
+      if (peer.role !== 'admin' || !(peer.isAdmin || (ADMIN_TOKEN && msg.token === ADMIN_TOKEN))) {
+        return send(ws, { type: 'ack', what: 'EXIT_CALIBRATION', ok: false, message: 'Unauthorized' });
+      }
+      if (state === 'CALIBRATING') enter('IDLE');
+      return send(ws, { type: 'ack', what: 'EXIT_CALIBRATION', ok: true, message: 'Exited calibration' });
+    }
+    case 'REQUEST_SNAPSHOT': {
+      if (peer.role !== 'admin' || !(peer.isAdmin || (ADMIN_TOKEN && msg.token === ADMIN_TOKEN))) return;
+      broadcast({ type: 'REQUEST_SNAPSHOT' }, (p) => p.role === 'main');
+      return send(ws, { type: 'ack', what: 'REQUEST_SNAPSHOT', ok: true, message: 'Snapshot requested from /main' });
+    }
+    case 'SNAPSHOT_DATA': {
+      if (peer.role !== 'main') return;
+      broadcast({ type: 'SNAPSHOT_READY', imageData: msg.imageData, ts: Date.now() }, (p) => p.role === 'admin');
+      return;
     }
     case 'TEST_FLASH': {
       if (peer.role !== 'admin' || !(peer.isAdmin || (ADMIN_TOKEN && msg.token === ADMIN_TOKEN))) {
@@ -479,7 +435,7 @@ function handleMessage(ws: WebSocket, peer: Peer, msg: ClientMsg): void {
       return onTriggerFix(ws);
     case 'freeze':
       if (peer.role !== 'main') return;
-      return void onFreeze(ws, msg.data, msg.forecastData, msg.collapseZone ?? null, msg.deviationPct ?? null);
+      return void onFreeze(ws, msg.data);
     case 'admin': {
       if (peer.role !== 'admin' || !(peer.isAdmin || (ADMIN_TOKEN && msg.token === ADMIN_TOKEN))) {
         return send(ws, { type: 'ack', what: msg.action, ok: false, message: 'Not authorised (ADMIN_TOKEN)' });
@@ -508,44 +464,41 @@ function freshRound(
   id: number,
   rollNumber: number,
   frameNumber: number,
-  predictedUrl: string | null = null,
-  collapseZone: CollapseZone | null = null,
+  sourceUrl: string | null = null,
+  sampleIndex = 0,
 ): RoundInfo {
   return {
     id,
     rollNumber,
     frameNumber,
-    printMode: config.printMode,
+    sourceUrl,
+    sampleIndex,
     devProgress: 0,
     finalDevProgress: null,
     fixTriggeredBy: null,
     outcome: null,
-    deviationPct: null,
     hasFreeze: false,
-    predictedUrl,
-    collapseZone,
     trigger: null,
   };
 }
 
-let round: RoundInfo = freshRound(0, config.rollNumber, nextAudienceFrameNumber(persisted));
+let round: RoundInfo = freshRound(0, config.rollNumber, nextFrameNumber(persisted));
 
 function nextPhaseAfter(cur: Phase): Phase {
   switch (cur) {
-    case 'CAPTURING_BASE':
-      return 'IDLE';
-    case 'ENTER_BUFFER':
-      return config.safelightSec <= 0 ? 'EXPOSURE' : 'SAFELIGHT_COMPOSE';
-    case 'SAFELIGHT_COMPOSE':
-      return 'EXPOSURE';
-    case 'EXPOSURE':
-      return 'DEVELOPING';
-    case 'DEVELOPING':
-      return round.devProgress >= 0.2 ? 'LIGHT_LEAK' : 'FIXED_REVEAL';
+    case 'CAPTURE_CLEAN':
+      return 'OBSERVE';
+    case 'OBSERVE':
+      return 'EXPOSE';
+    case 'EXPOSE':
+      return 'DEVELOP';
+    case 'DEVELOP':
+      return round.devProgress >= 0.25 ? 'LIGHT_LEAK' : 'REVEAL';
     case 'LIGHT_LEAK':
-      return 'FIXED_REVEAL';
-    case 'FIXED_REVEAL':
+      return 'REVEAL';
+    case 'REVEAL':
       return 'IDLE';
+    case 'CALIBRATING':
     case 'IDLE':
     default:
       return 'IDLE';
@@ -556,26 +509,24 @@ function durationFor(p: Phase): number {
   let sec = 0;
   switch (p) {
     case 'IDLE':
+    case 'CALIBRATING':
       return 0;
-    case 'CAPTURING_BASE':
-      sec = 5.5;
+    case 'CAPTURE_CLEAN':
+      sec = 0.8;
       break;
-    case 'ENTER_BUFFER':
-      sec = config.enterBufferSec;
+    case 'OBSERVE':
+      sec = config.observeSec;
       break;
-    case 'SAFELIGHT_COMPOSE':
-      sec = config.safelightSec;
+    case 'EXPOSE':
+      sec = config.exposeSec;
       break;
-    case 'EXPOSURE':
-      sec = config.exposureSec;
-      break;
-    case 'DEVELOPING':
-      sec = config.maxDevelopSec;
+    case 'DEVELOP':
+      sec = config.developSec;
       break;
     case 'LIGHT_LEAK':
       sec = 2.2;
       break;
-    case 'FIXED_REVEAL':
+    case 'REVEAL':
       sec = config.revealSec;
       break;
   }
@@ -592,7 +543,6 @@ function stateMsg(): ServerMsg {
     timeScale: TIME_SCALE,
     round,
     doorPhoto: doorPhotoInfo(),
-    forecast: forecastInfoFromState(persisted),
   };
 }
 
@@ -610,7 +560,7 @@ function startDevLoop(): void {
   stopDevLoop();
   lastDevTick = Date.now();
   devTimer = setInterval(() => {
-    if (state !== 'DEVELOPING') return stopDevLoop();
+    if (state !== 'DEVELOP') return stopDevLoop();
     const now = Date.now();
     if (now - lastEnergyAt > 400) latestAudioLevel = 0;
     const storyDt = Math.max(0, (now - lastDevTick) / 1000 / TIME_SCALE);
@@ -635,8 +585,8 @@ function startDevLoop(): void {
 }
 
 function classifyOutcome(dev: number, by: 'station2' | 'timeout' | 'admin'): ChemicalOutcome {
-  if (by === 'timeout' && dev >= 0.2) return 'UNFIXED_LIGHT_LEAK';
-  if (dev < 0.2) return 'UNDERDEVELOPED_TRACE_LOST';
+  if (by === 'timeout' && dev >= 0.25) return 'UNFIXED_LIGHT_LEAK';
+  if (dev < 0.25) return 'UNDERDEVELOPED_TRACE_LOST';
   if (dev > 1.05) return 'OVERDEVELOPED_BURNED';
   return 'FIXED_OPTIMAL';
 }
@@ -655,28 +605,34 @@ function enter(next: Phase, fixSource: 'station2' | 'timeout' | 'admin' = 'timeo
   phaseTimer = null;
 
   const prev = state;
-  if (prev === 'DEVELOPING' && (next === 'FIXED_REVEAL' || next === 'LIGHT_LEAK')) {
+  if (prev === 'DEVELOP' && (next === 'REVEAL' || next === 'LIGHT_LEAK')) {
     lockDevelopment(next === 'LIGHT_LEAK' ? 'timeout' : fixSource);
-  } else if (prev === 'DEVELOPING') {
+  } else if (prev === 'DEVELOP') {
     stopDevLoop();
   }
-  if (prev === 'FIXED_REVEAL' && next === 'IDLE') {
+  if (prev === 'REVEAL' && next === 'IDLE') {
     lastFixedRoundEndAt = Date.now();
+    // Privacy: ensure user's uploaded original photo is permanently deleted after round ends
+    if (persisted.hasQueuedPhoto && round.sampleIndex === 0) {
+      void purgeQueuedPhoto(persisted).then((nextSt) => {
+        persisted = nextSt;
+        void broadcastSync();
+      });
+    }
   }
 
   state = next;
   phaseStartedAt = Date.now();
   phaseDurationMs = durationFor(next);
 
-  if (next === 'DEVELOPING') {
+  if (next === 'DEVELOP') {
     round.devProgress = 0;
     round.finalDevProgress = null;
     round.fixTriggeredBy = null;
     round.outcome = null;
-    round.deviationPct = null;
     startDevLoop();
     broadcast({ type: 'dev', devProgress: 0, audioLevel: 0, effLevel: 0, serverTime: phaseStartedAt }, isDevSubscriber);
-  } else if (next === 'LIGHT_LEAK' || next === 'FIXED_REVEAL') {
+  } else if (next === 'LIGHT_LEAK' || next === 'REVEAL') {
     broadcast(
       {
         type: 'dev',
@@ -704,16 +660,26 @@ function schedule(atMs: number): void {
 
 function tryStart(trigger: string): boolean {
   if (state !== 'IDLE') return false;
-  const nextFrame = nextAudienceFrameNumber(persisted);
-  const frameSnapUrl = persisted.forecastUrl
-    ? `/data/rolls/${rollDirName(config.rollNumber)}/forecast_${pad(nextFrame, 2)}A.jpg`
-    : null;
-  const predictedUrl = frameSnapUrl && fs.existsSync(path.join(DATA_DIR, frameSnapUrl.replace(/^\/data\//, '')))
-    ? frameSnapUrl
-    : persisted.forecastUrl;
-  round = freshRound(round.id + 1, config.rollNumber, nextFrame, predictedUrl, persisted.collapseZone);
+  const nextFrame = nextFrameNumber(persisted);
+  let sourceUrl: string | null = null;
+  let sampleIndex = 0;
+
+  if (config.sampleFallback > 0) {
+    sampleIndex = config.sampleFallback;
+    if (sampleIndex === 4 && persisted.latestFrameUrl) {
+      sourceUrl = persisted.latestFrameUrl;
+    }
+  } else if (persisted.hasQueuedPhoto && persisted.queuedPhotoUrl) {
+    sourceUrl = persisted.queuedPhotoUrl;
+    sampleIndex = 0;
+  } else {
+    // Fallback gracefully to sample 1 if nothing queued
+    sampleIndex = 1;
+  }
+
+  round = freshRound(round.id + 1, config.rollNumber, nextFrame, sourceUrl, sampleIndex);
   round.trigger = trigger;
-  enter('ENTER_BUFFER');
+  enter('CAPTURE_CLEAN');
   return true;
 }
 
@@ -721,55 +687,47 @@ function onAudioEnergy(rawLevel: number): void {
   const n = Number(rawLevel);
   if (!Number.isFinite(n)) return;
   const level = Math.max(0, Math.min(1, n));
-  if (state !== 'DEVELOPING') return;
+  if (state !== 'DEVELOP') return;
   latestAudioLevel = level;
   lastEnergyAt = Date.now();
 }
 
 function onTriggerFix(ws: WebSocket): void {
-  if (state !== 'DEVELOPING') {
-    return send(ws, { type: 'ack', what: 'TRIGGER_FIX', ok: false, message: 'Fixation only active during DEVELOPING' });
+  if (state !== 'DEVELOP') {
+    return send(ws, { type: 'ack', what: 'TRIGGER_FIX', ok: false, message: 'Fixation only active during DEVELOP' });
   }
-  console.log(`[round ${round.id}] 定影推杆拉到底 → FIXED_REVEAL (dev=${(round.devProgress * 100).toFixed(1)}%)`);
-  enter('FIXED_REVEAL', 'station2');
+  console.log(`[round ${round.id}] 定影推杆拉到底 → REVEAL (dev=${(round.devProgress * 100).toFixed(1)}%)`);
+  enter('REVEAL', 'station2');
   send(ws, { type: 'ack', what: 'TRIGGER_FIX', ok: true, message: 'Fixed' });
 }
 
-async function onFreeze(
-  ws: WebSocket,
-  data: string,
-  forecastData?: string,
-  collapseZone: CollapseZone | null = null,
-  deviationPct: number | null = null,
-): Promise<void> {
+async function onFreeze(ws: WebSocket, data: string): Promise<void> {
   const buf = typeof data === 'string' ? decodeJpeg(data) : null;
   if (!buf) return send(ws, { type: 'ack', what: 'freeze', ok: false, message: 'Not a valid JPEG' });
   if (round.hasFreeze || freezeSaving) {
     return send(ws, { type: 'ack', what: 'freeze', ok: false, message: 'Freeze frame already saved this round' });
   }
   const justExitedReveal = state === 'IDLE' && round.id > 0 && Date.now() - lastFixedRoundEndAt < 3000;
-  if (state !== 'FIXED_REVEAL' && !justExitedReveal) {
-    return send(ws, { type: 'ack', what: 'freeze', ok: false, message: 'Freeze frame only accepted in FIXED_REVEAL' });
+  if (state !== 'REVEAL' && !justExitedReveal) {
+    return send(ws, { type: 'ack', what: 'freeze', ok: false, message: 'Freeze frame only accepted in REVEAL' });
   }
   freezeSaving = true;
   try {
     const devPct = (round.finalDevProgress ?? round.devProgress) * 100;
-    if (typeof deviationPct === 'number' && Number.isFinite(deviationPct)) {
-      round.deviationPct = Math.max(0, Math.min(99, Math.round(deviationPct)));
-    }
-    const fBuf = typeof forecastData === 'string' ? decodeJpeg(forecastData) : null;
-    const saved = await saveAudienceFrame(
+    const saved = await saveArchivedFrame(
       persisted,
       round.frameNumber,
       buf,
       devPct,
       round.outcome ?? 'FIXED_OPTIMAL',
-      fBuf,
-      collapseZone,
     );
     persisted = saved.next;
     round.hasFreeze = true;
-    console.log(`[round ${round.id}] 底片已入档 ${saved.archiveName} (${(buf.length / 1024).toFixed(0)}KB, dev=${Math.round(devPct)}%, outcome=${round.outcome ?? 'FIXED_OPTIMAL'})`);
+    // Immediately purge user's uploaded original photo once final print is archived
+    if (persisted.hasQueuedPhoto && round.sampleIndex === 0) {
+      persisted = await purgeQueuedPhoto(persisted);
+    }
+    console.log(`[round ${round.id}] 彩色暗房成品已入档 ${saved.archiveName} (${(buf.length / 1024).toFixed(0)}KB, dev=${Math.round(devPct)}%, outcome=${round.outcome ?? 'FIXED_OPTIMAL'})`);
     send(ws, { type: 'ack', what: 'freeze', ok: true, message: saved.archiveName });
     await broadcastSync();
   } catch (err) {
@@ -789,20 +747,17 @@ async function performNewRoll(): Promise<void> {
     console.error('[config] 保存新胶卷号失败', err);
   }
   await resetDoorPhoto();
-  // Clear temporary ghost cache only; preserve ./data/rolls/ history
-  try {
-    for (const f of await fs.promises.readdir(CACHE_DIR)) {
-      await fs.promises.rm(path.join(CACHE_DIR, f), { recursive: true, force: true });
-    }
-  } catch {
-    /* ignore */
-  }
-  persisted = emptyPersistedState(config.rollNumber);
+  persisted = {
+    ...emptyPersistedState(config.rollNumber),
+    hasQueuedPhoto: persisted.hasQueuedPhoto,
+    queuedPhotoUrl: persisted.queuedPhotoUrl,
+    queuedAt: persisted.queuedAt,
+  };
   await savePersistedState(persisted);
   if (state === 'IDLE') {
     round = freshRound(round.id, config.rollNumber, 1);
   }
-  console.log(`[admin] 开启新胶卷 ROLL ${pad(config.rollNumber, 2)}（历史卷完整保留，请先拍摄 00A 基准底片）`);
+  console.log(`[admin] 开启新胶卷 ROLL ${pad(config.rollNumber, 2)}（历史卷完整保留）`);
   broadcast({ type: 'config', config });
   await broadcastSync();
 }
@@ -815,9 +770,7 @@ async function onAdmin(ws: WebSocket, action: string, cfg?: Partial<AppConfig>):
       return send(ws, { type: 'ack', what: 'reset', ok: true, message: 'Reset to IDLE' });
 
     case 'skipPhase': {
-      if (state === 'IDLE') {
-        return send(ws, { type: 'ack', what: 'skipPhase', ok: false, message: 'Already in IDLE' });
-      }
+      if (state === 'IDLE') return send(ws, { type: 'ack', what: 'skipPhase', ok: false, message: 'Already in IDLE' });
       const prev = state;
       const next = nextPhaseAfter(prev);
       enter(next, 'admin');
@@ -826,12 +779,7 @@ async function onAdmin(ws: WebSocket, action: string, cfg?: Partial<AppConfig>):
 
     case 'newRoll': {
       await performNewRoll();
-      return send(ws, {
-        type: 'ack',
-        what: 'newRoll',
-        ok: true,
-        message: `Started Roll ${pad(config.rollNumber, 2)} · capture 00A BASE next`,
-      });
+      return send(ws, { type: 'ack', what: 'newRoll', ok: true, message: `Started Roll ${pad(config.rollNumber, 2)}` });
     }
 
     case 'resetDoor': {
@@ -845,24 +793,23 @@ async function onAdmin(ws: WebSocket, action: string, cfg?: Partial<AppConfig>):
       return send(ws, { type: 'ack', what: 'testFlash', ok: true, message: 'Flash pulse sent to all screens' });
 
     case 'testDevelop':
-      if (state !== 'DEVELOPING') {
-        return send(ws, { type: 'ack', what: 'testDevelop', ok: false, message: 'Only available during DEVELOPING' });
-      }
+      if (state !== 'DEVELOP') return send(ws, { type: 'ack', what: 'testDevelop', ok: false, message: 'Only available during DEVELOP' });
       latestAudioLevel = 0.72;
       lastEnergyAt = Date.now() + 1200;
       return send(ws, { type: 'ack', what: 'testDevelop', ok: true, message: 'Developing pulse (+1.5s)' });
 
     case 'setConfig': {
       const merged: Partial<AppConfig> = {
-        enterBufferSec: cfg?.enterBufferSec ?? config.enterBufferSec,
-        safelightSec: cfg?.safelightSec ?? config.safelightSec,
-        exposureSec: cfg?.exposureSec ?? config.exposureSec,
-        maxDevelopSec: cfg?.maxDevelopSec ?? config.maxDevelopSec,
+        observeSec: cfg?.observeSec ?? config.observeSec,
+        exposeSec: cfg?.exposeSec ?? config.exposeSec,
+        developSec: cfg?.developSec ?? config.developSec,
         revealSec: cfg?.revealSec ?? config.revealSec,
         noiseFloor: cfg?.noiseFloor ?? config.noiseFloor,
         devSpeed: cfg?.devSpeed ?? config.devSpeed,
-        pastOpacity: cfg?.pastOpacity ?? config.pastOpacity,
-        printMode: cfg?.printMode ?? config.printMode,
+        easelMargin: cfg?.easelMargin ?? config.easelMargin,
+        diffSensitivity: cfg?.diffSensitivity ?? config.diffSensitivity,
+        mouseSimulator: cfg?.mouseSimulator ?? config.mouseSimulator,
+        sampleFallback: cfg?.sampleFallback ?? config.sampleFallback,
         rollNumber: cfg?.rollNumber ?? config.rollNumber,
       };
       config = sanitizeConfig(merged, config);
@@ -872,16 +819,7 @@ async function onAdmin(ws: WebSocket, action: string, cfg?: Partial<AppConfig>):
         console.error('[config] 保存失败', err);
       }
       broadcast({ type: 'config', config });
-      if (state !== 'FIXED_REVEAL' && round.printMode !== config.printMode) {
-        round.printMode = config.printMode;
-        broadcast(stateMsg());
-      }
-      return send(ws, {
-        type: 'ack',
-        what: 'setConfig',
-        ok: true,
-        message: `Config saved (${config.printMode === 'photogram_negative' ? 'NEGATIVE' : 'POSITIVE'})`,
-      });
+      return send(ws, { type: 'ack', what: 'setConfig', ok: true, message: 'Config saved' });
     }
 
     default:
@@ -889,16 +827,14 @@ async function onAdmin(ws: WebSocket, action: string, cfg?: Partial<AppConfig>):
   }
 }
 
-// ======================================================================
 server.listen(PORT, HOST, () => {
-  console.log(`《入画三十秒 (RH-30)》v3 活体暗房引擎已启动 http://${HOST}:${PORT}  (TIME_SCALE=${TIME_SCALE}, ROLL=${pad(config.rollNumber, 2)})`);
+  console.log(`《入画三十秒 (RH-30)》v3.2 彩色暗房精修引擎已启动 http://${HOST}:${PORT} (TIME_SCALE=${TIME_SCALE}, ROLL=${pad(config.rollNumber, 2)})`);
   console.log(`  data:   ${DATA_DIR}`);
   console.log(`  public: ${PUBLIC_DIR}`);
   if (ADMIN_TOKEN) console.log('  ADMIN_TOKEN 已启用：/admin?token=...');
 });
 
-function shutdown(sig: string): void {
-  console.log(`收到 ${sig}，正在关闭...`);
+function shutdown(_sig: string): void {
   clearInterval(heartbeat);
   clearInterval(adminStatusTimer);
   stopDevLoop();

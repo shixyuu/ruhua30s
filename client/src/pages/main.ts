@@ -1,9 +1,11 @@
 /**
- * /main — Mac + projector + wide-angle USB camera (v3 Live Darkroom & Temporal Extrapolation Engine)
- * - 92%+ pure darkroom optical imagery; single-row bottom timeline bar (56px, hidden in IDLE/CAPTURING_BASE).
- * - CAPTURING_BASE: 4s exit countdown -> 1.5s pure #F6F2E8 multi-frame 00A BASE capture + FORECAST 01A init -> POST /api/archive/base.
- * - EXPOSURE: captures 480×270 grayscale ghost sequence every 0.5s -> POST /api/cache/ghost; restores from GET /api/cache/ghost after refresh.
- * - Exported Instax / archive JPEGs render from offscreen exportCanvas and NEVER include the bottom timeline UI.
+ * /main — Mac + projector + wide-angle USB camera (v3.2 Color Darkroom & Physical Dodging Engine)
+ * - CALIBRATING: pure high-contrast TL/TR/BR/BL target inside easelMargin (no camera echo)
+ * - CAPTURE_CLEAN (0.8s): shadow-lifted color photo + 4-frame warped camClean baseline
+ * - OBSERVE (8s): safelight red monochrome projection + `01 OBSERVE` timeline
+ * - EXPOSE (30s): shadow-lifted color photo + 7 FPS homography dodge integration (or Mouse Dodge Simulator)
+ * - DEVELOP (25s): RA-4 subtractive color darkroom developing model driven by /station1 acoustic energy
+ * - REVEAL (12s): side-by-side ORIGINAL vs ALTERED PRINT + clean Instax color JPEG upload
  */
 import { Net, mountNetDot, triggerFlashPulse } from '../lib/net';
 import {
@@ -21,59 +23,41 @@ import {
 } from '../lib/sfx';
 import {
   DarkroomEngine,
-  drawExposureBeam,
+  computeEaselRect,
+  drawCalibrationTarget,
   drawIdleDarkroom,
-  drawSafelightField,
   setupCanvas,
 } from '../lib/darkroom';
 import { keepAwake, requestFullscreen, withTimeout } from '../lib/unlock';
 import { TITLE_EN } from '../lib/brand';
-import { outcomeFullLabel, outcomeShortCode } from '../../../shared/protocol';
-import type { Phase, PrintMode } from '../../../shared/protocol';
+import { outcomeFullLabel } from '../../../shared/protocol';
+import type { Phase } from '../../../shared/protocol';
 
 const LS_CAM = 'ruhua.main.camera';
 const LS_SINK = 'ruhua.main.sink';
-const SAMPLE_INTERVAL_MS = 55; // ~18 FPS live exposure sampling
-
-function pad2(n: number): string {
-  return String(Math.max(0, Math.floor(n))).padStart(2, '0');
-}
-
-function pickRecorderMime(): string | undefined {
-  if (typeof MediaRecorder === 'undefined') return undefined;
-  for (const m of ['video/webm;codecs=vp8', 'video/webm', 'video/mp4']) {
-    if (MediaRecorder.isTypeSupported?.(m)) return m;
-  }
-  return undefined;
-}
+const EXPOSE_SAMPLE_MS = 140; // ~7 FPS camera dodge integration
+const CLEAN_SAMPLE_MS = 150;
 
 export default async function mainPage(app: HTMLElement): Promise<void> {
   document.title = `Enlarger Projector · ${TITLE_EN}`;
   app.innerHTML = `
     <canvas class="layer" id="fx"></canvas>
-    <div class="main-countdown hidden" id="countdownBox"><span id="countdown">5</span></div>
-    <div class="main-base-prompt hidden" id="basePrompt">CLEAR THE BEAM · BASE CAPTURE IN <span id="baseSec">4</span></div>
     <footer class="main-timeline hidden" id="timelineBar" aria-hidden="true">
       <div class="tl-steps">
-        <div class="tl-seg" id="segCompose"><span>01 COMPOSE</span><div class="tl-fill"></div></div>
+        <div class="tl-seg" id="segObserve"><span>01 OBSERVE</span><div class="tl-fill"></div></div>
         <div class="tl-seg" id="segExpose"><span>02 EXPOSE</span><div class="tl-fill" id="expFill"></div></div>
         <div class="tl-seg" id="segDevelop"><span>03 DEVELOP</span><div class="tl-fill" id="devFill"></div></div>
         <div class="tl-seg" id="segFixed"><span>04 FIXED</span><div class="tl-fill"></div></div>
       </div>
-      <div class="tl-prompt" id="tlPrompt">STEP INTO POSITION</div>
+      <div class="tl-prompt" id="tlPrompt">FIND WHAT YOU WANT TO SOFTEN OR ERASE</div>
     </footer>
-    <video id="cam" class="hidden" muted playsinline autoplay></video>
-    <video id="pastVid" class="hidden" muted playsinline></video>`;
+    <video id="cam" class="hidden" muted playsinline autoplay></video>`;
 
   const $ = <T extends HTMLElement>(s: string) => app.querySelector(s) as T;
   const fx = $<HTMLCanvasElement>('#fx');
   const g = setupCanvas(fx);
-  const countdownBox = $<HTMLDivElement>('#countdownBox');
-  const countdown = $<HTMLSpanElement>('#countdown');
-  const basePrompt = $<HTMLDivElement>('#basePrompt');
-  const baseSecEl = $<HTMLSpanElement>('#baseSec');
   const timelineBar = $<HTMLElement>('#timelineBar');
-  const segCompose = $<HTMLDivElement>('#segCompose');
+  const segObserve = $<HTMLDivElement>('#segObserve');
   const segExpose = $<HTMLDivElement>('#segExpose');
   const segDevelop = $<HTMLDivElement>('#segDevelop');
   const segFixed = $<HTMLDivElement>('#segFixed');
@@ -81,7 +65,6 @@ export default async function mainPage(app: HTMLElement): Promise<void> {
   const devFill = $<HTMLDivElement>('#devFill');
   const tlPrompt = $<HTMLDivElement>('#tlPrompt');
   const camV = $<HTMLVideoElement>('#cam');
-  const pastVid = $<HTMLVideoElement>('#pastVid');
 
   const engine = new DarkroomEngine();
   const net = new Net('main');
@@ -102,8 +85,8 @@ export default async function mainPage(app: HTMLElement): Promise<void> {
       camStream = await navigator.mediaDevices.getUserMedia({
         video: {
           ...(deviceId ? { deviceId: { exact: deviceId } } : {}),
-          width: { ideal: 1920 },
-          height: { ideal: 1080 },
+          width: { ideal: 1280 },
+          height: { ideal: 720 },
           frameRate: { ideal: 30 },
         },
         audio: false,
@@ -125,155 +108,14 @@ export default async function mainPage(app: HTMLElement): Promise<void> {
     if (!camLive()) await openCamera(camId);
   }
 
-  // ====================================================================
-  // Recursive Past (local MediaRecorder + VPS 480×270 Ghost Sequence)
-  // ====================================================================
-  let lastRoundVideoUrl: string | null = null;
-  let recorder: MediaRecorder | null = null;
-  let recChunks: Blob[] = [];
-  let trackedRollNumber: number | null = null;
+  // Remote calibration snapshot request from /admin
+  net.on('REQUEST_SNAPSHOT', async () => {
+    await ensureCamera();
+    const margin = net.config?.easelMargin ?? 6;
+    const imageData = engine.grabCameraSnapshot(camLive() ? camV : null, margin);
+    net.send({ type: 'SNAPSHOT_DATA', imageData });
+  });
 
-  let cachedGhostImgs: HTMLImageElement[] = [];
-  let capturedGhostFrames: string[] = [];
-  let lastGhostSlot = -1;
-
-  let safelightForecastImg: HTMLImageElement | null = null;
-  let predictedRevealImg: HTMLImageElement | null = null;
-
-  function loadImg(url: string | null | undefined): HTMLImageElement | null {
-    if (!url) return null;
-    const img = new Image();
-    img.src = url;
-    return img;
-  }
-
-  function clearRollMemory(): void {
-    stopPastRecorder(false);
-    if (lastRoundVideoUrl) {
-      URL.revokeObjectURL(lastRoundVideoUrl);
-      lastRoundVideoUrl = null;
-    }
-    cachedGhostImgs = [];
-    capturedGhostFrames = [];
-    pastVid.pause();
-    pastVid.removeAttribute('src');
-    pastVid.load();
-    safelightForecastImg = null;
-    predictedRevealImg = null;
-    engine.resetMemory();
-  }
-
-  async function loadGhostFromVps(): Promise<void> {
-    try {
-      const r = await fetch('/api/cache/ghost', { cache: 'no-store' });
-      const j = await r.json();
-      const frames: string[] = j?.payload?.frames ?? [];
-      if (frames.length > 0) {
-        cachedGhostImgs = frames.map((u) => {
-          const im = new Image();
-          im.src = u;
-          return im;
-        });
-      }
-    } catch {
-      /* ignore */
-    }
-  }
-
-  async function restoreFromVpsState(): Promise<void> {
-    try {
-      const r = await fetch('/api/state', { cache: 'no-store' });
-      const j = await r.json();
-      if (!j?.ok || !j.state) return;
-      const st = j.state;
-      trackedRollNumber = st.rollNumber;
-      const baselineUrl = st.latestFrameUrl || st.baseFrameUrl;
-      if (baselineUrl) await engine.restoreBaselineFromUrl(baselineUrl);
-      if (st.hasGhostSequence && cachedGhostImgs.length === 0) {
-        await loadGhostFromVps();
-      }
-    } catch {
-      /* ignore */
-    }
-  }
-
-  function startPastRecorder(): void {
-    stopPastRecorder(false);
-    if (typeof MediaRecorder === 'undefined') return;
-    const stream = camLive() ? camStream : engine.getSimulatedStream(20);
-    if (!stream) return;
-    try {
-      const mimeType = pickRecorderMime();
-      recorder = mimeType ? new MediaRecorder(stream, { mimeType }) : new MediaRecorder(stream);
-      recChunks = [];
-      recorder.ondataavailable = (ev) => {
-        if (ev.data && ev.data.size > 0) recChunks.push(ev.data);
-      };
-      recorder.start(250);
-    } catch (err) {
-      console.warn('MediaRecorder unavailable', err);
-      recorder = null;
-      recChunks = [];
-    }
-  }
-
-  function stopPastRecorder(save: boolean): void {
-    const rec = recorder;
-    recorder = null;
-    if (!rec) return;
-    if (!save) {
-      rec.onstop = null;
-      try {
-        if (rec.state !== 'inactive') rec.stop();
-      } catch {
-        /* ignore */
-      }
-      recChunks = [];
-      return;
-    }
-    const chunksRef = recChunks;
-    recChunks = [];
-    const mime = rec.mimeType || 'video/webm';
-    const commit = () => {
-      if (!chunksRef.length) return;
-      const blob = new Blob(chunksRef, { type: mime });
-      if (blob.size < 256) return;
-      if (lastRoundVideoUrl) URL.revokeObjectURL(lastRoundVideoUrl);
-      lastRoundVideoUrl = URL.createObjectURL(blob);
-    };
-    if (rec.state === 'inactive') {
-      commit();
-    } else {
-      rec.onstop = commit;
-      try {
-        rec.stop();
-      } catch {
-        commit();
-      }
-    }
-  }
-
-  async function uploadCapturedGhost(rollNumber: number, frameNumber: number): Promise<void> {
-    if (capturedGhostFrames.length === 0) return;
-    const frames = [...capturedGhostFrames];
-    capturedGhostFrames = [];
-    cachedGhostImgs = frames.map((u) => {
-      const im = new Image();
-      im.src = u;
-      return im;
-    });
-    try {
-      await fetch('/api/cache/ghost', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ rollNumber, frameNumber, frames }),
-      });
-    } catch {
-      /* ignore */
-    }
-  }
-
-  // Test flash audio sync
   net.on('FLASH_PULSE', () => {
     try {
       shutter();
@@ -283,16 +125,55 @@ export default async function mainPage(app: HTMLElement): Promise<void> {
   });
 
   // ====================================================================
-  // exposure & base capture samplers
+  // Home Mouse Dodge Simulator (paint directly on /main during EXPOSE)
+  // ====================================================================
+  let mouseDown = false;
+  let lastPaintAt = 0;
+
+  function canvasClientToEaselNorm(clientX: number, clientY: number): { nx: number; ny: number } | null {
+    const cr = fx.getBoundingClientRect();
+    const scale = Math.min(cr.width / fx.width, cr.height / fx.height);
+    const drawW = fx.width * scale;
+    const drawH = fx.height * scale;
+    const offX = cr.left + (cr.width - drawW) / 2;
+    const offY = cr.top + (cr.height - drawH) / 2;
+
+    const cx = (clientX - offX) / scale;
+    const cy = (clientY - offY) / scale;
+    const { w, h } = engine.getSourceSize();
+    const er = computeEaselRect(fx.width, fx.height, net.config?.easelMargin ?? 6, w, h);
+    if (cx < er.x || cx > er.x + er.w || cy < er.y || cy > er.y + er.h) return null;
+    return { nx: (cx - er.x) / er.w, ny: (cy - er.y) / er.h };
+  }
+
+  fx.addEventListener('pointerdown', (e) => {
+    if (net.phase !== 'EXPOSE' || !net.config?.mouseSimulator) return;
+    mouseDown = true;
+    lastPaintAt = performance.now();
+    const pt = canvasClientToEaselNorm(e.clientX, e.clientY);
+    if (pt) engine.applyMouseDodge(pt.nx, pt.ny, 0.06);
+  });
+  fx.addEventListener('pointermove', (e) => {
+    if (!mouseDown || net.phase !== 'EXPOSE' || !net.config?.mouseSimulator) return;
+    const now = performance.now();
+    const dt = Math.min(0.15, Math.max(0.016, (now - lastPaintAt) / 1000));
+    lastPaintAt = now;
+    const pt = canvasClientToEaselNorm(e.clientX, e.clientY);
+    if (pt) engine.applyMouseDodge(pt.nx, pt.ny, dt);
+  });
+  window.addEventListener('pointerup', () => {
+    mouseDown = false;
+  });
+
+  // ====================================================================
+  // exposure / clean sampling & developing state
   // ====================================================================
   let sampleTimer: number | null = null;
+  let lastSampleAt = 0;
   let liveDevProgress = 0;
   let frozenDevProgress = 0;
-  let frozenDeviationPct: number | null = null;
-  let activePrintMode: PrintMode = 'photogram_negative';
   let freezeUploadedRound = -1;
-  let baseUploadedRound = -1;
-  let baseShutterFired = false;
+  let exposeFastTickStarted = false;
   let devWarnTickStarted = false;
 
   function stopSampler(): void {
@@ -302,56 +183,39 @@ export default async function mainPage(app: HTMLElement): Promise<void> {
     }
   }
 
-  function startSampler(roundId: number): void {
+  function startCleanSampler(): void {
     stopSampler();
-    engine.beginExposure(roundId);
-    capturedGhostFrames = [];
-    lastGhostSlot = -1;
-    const sampleOnce = () => {
-      if (net.phase !== 'EXPOSURE') return stopSampler();
-      const totalSec = net.config?.exposureSec ?? 15;
-      const elapsedSec = net.storySec();
-      engine.sampleExposureFrame(camLive() ? camV : null, elapsedSec, totalSec);
-
-      const slot = Math.floor(elapsedSec / 0.5);
-      if (slot > lastGhostSlot && capturedGhostFrames.length < 30) {
-        lastGhostSlot = slot;
-        capturedGhostFrames.push(engine.captureGhostFrame(camLive() ? camV : null, elapsedSec, totalSec));
-      }
+    if (net.config?.mouseSimulator) return;
+    const run = () => {
+      if (net.phase !== 'CAPTURE_CLEAN') return stopSampler();
+      engine.sampleCleanFrame(camLive() ? camV : null, net.calibration?.hInv ?? null);
     };
-    sampleOnce();
-    sampleTimer = window.setInterval(sampleOnce, SAMPLE_INTERVAL_MS);
+    run();
+    sampleTimer = window.setInterval(run, CLEAN_SAMPLE_MS);
   }
 
-  function startBaseSampler(roundId: number): void {
+  function startExposeSampler(): void {
     stopSampler();
-    engine.beginExposure(roundId);
-    baseShutterFired = false;
-    baseUploadedRound = -1;
-    const sampleBase = () => {
-      if (net.phase !== 'CAPTURING_BASE') return stopSampler();
-      const s = net.storySec();
-      if (s >= 4.0 && s < 4.95) {
-        engine.sampleBaseFrame(camLive() ? camV : null);
-      } else if (s >= 4.95 && baseUploadedRound !== roundId) {
-        baseUploadedRound = roundId;
-        stopSampler();
-        const { baseDataUrl, forecastDataUrl, collapseZone } = engine.finalizeBaseAndForecast();
-        void fetch('/api/archive/base', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ imageData: baseDataUrl, forecastData: forecastDataUrl, collapseZone }),
-        }).catch(() => {});
-      }
+    if (net.config?.mouseSimulator) return;
+    lastSampleAt = performance.now();
+    const run = () => {
+      if (net.phase !== 'EXPOSE') return stopSampler();
+      const now = performance.now();
+      const dtSec = Math.max(0.05, (now - lastSampleAt) / 1000 / net.timeScale);
+      lastSampleAt = now;
+      engine.sampleExposeFrame(
+        camLive() ? camV : null,
+        dtSec,
+        net.calibration?.hInv ?? null,
+        net.config?.diffSensitivity ?? 0.12,
+      );
     };
-    sampleTimer = window.setInterval(sampleBase, SAMPLE_INTERVAL_MS);
+    sampleTimer = window.setInterval(run, EXPOSE_SAMPLE_MS);
   }
 
   net.on('dev', (m) => {
     liveDevProgress = m.devProgress;
-    if (net.phase === 'DEVELOPING') {
-      devBathAudio.update(liveDevProgress);
-    }
+    if (net.phase === 'DEVELOP') devBathAudio.update(liveDevProgress);
   });
 
   // ====================================================================
@@ -361,10 +225,10 @@ export default async function mainPage(app: HTMLElement): Promise<void> {
   let curRound = -1;
 
   function setActiveSegment(seg: HTMLDivElement | null, stateCls = ''): void {
-    for (const s of [segCompose, segExpose, segDevelop, segFixed]) {
+    for (const s of [segObserve, segExpose, segDevelop, segFixed]) {
       s.classList.remove('active', 'done', 'gold', 'burn');
     }
-    const order = [segCompose, segExpose, segDevelop, segFixed];
+    const order = [segObserve, segExpose, segDevelop, segFixed];
     const idx = seg ? order.indexOf(seg) : -1;
     order.forEach((s, i) => {
       if (idx > i) s.classList.add('done');
@@ -378,94 +242,58 @@ export default async function mainPage(app: HTMLElement): Promise<void> {
   async function onPhase(phase: Phase, fresh: boolean, prevPhase: Phase | null): Promise<void> {
     const st = net.state!;
     const roundId = st.round.id;
-    const isSeed = st.round.frameNumber === 0;
-    activePrintMode = st.round.printMode ?? net.config?.printMode ?? 'photogram_negative';
-    countdownBox.classList.add('hidden');
-    basePrompt.classList.add('hidden');
     stopSampler();
+    exposeFastTickStarted = false;
     devWarnTickStarted = false;
 
-    if (prevPhase === 'EXPOSURE' && phase !== 'EXPOSURE') {
-      stopPastRecorder(phase === 'DEVELOPING' || phase === 'LIGHT_LEAK' || phase === 'FIXED_REVEAL');
-      pastVid.pause();
-      void uploadCapturedGhost(st.round.rollNumber, st.round.frameNumber);
-    }
+    if (prevPhase === 'CAPTURE_CLEAN') engine.finalizeClean();
+    if (prevPhase === 'EXPOSE') engine.finalizeDodgeMap();
 
     switch (phase) {
       case 'IDLE':
+      case 'CALIBRATING':
         stopAllLoops();
         timelineBar.classList.add('hidden');
+        if (phase === 'CALIBRATING') await ensureCamera();
         break;
 
-      case 'CAPTURING_BASE':
-        stopAllLoops();
-        timelineBar.classList.add('hidden');
-        basePrompt.classList.remove('hidden');
-        await ensureCamera();
-        if (net.phase === 'CAPTURING_BASE') startBaseSampler(roundId);
-        break;
-
-      case 'ENTER_BUFFER':
+      case 'CAPTURE_CLEAN':
         stopAllLoops();
         liveDevProgress = 0;
-        frozenDeviationPct = null;
-        if (!isSeed) {
-          safelightForecastImg = loadImg(st.forecast?.has ? st.forecast.url : st.round.predictedUrl);
-          predictedRevealImg = loadImg(st.round.predictedUrl || (st.forecast?.has ? st.forecast.url : null));
-        } else {
-          safelightForecastImg = null;
-          predictedRevealImg = null;
-        }
         timelineBar.classList.add('hidden');
-        countdownBox.classList.remove('hidden');
-        if (cachedGhostImgs.length === 0 && !lastRoundVideoUrl) void loadGhostFromVps();
+        engine.beginRound();
+        await engine.loadSource(st.round.sourceUrl, st.round.sampleIndex || 1);
         await ensureCamera();
+        if (net.phase === 'CAPTURE_CLEAN') startCleanSampler();
         break;
 
-      case 'SAFELIGHT_COMPOSE':
+      case 'OBSERVE':
         stopAllLoops();
         if (fresh) safelightClick();
-        if (!isSeed) {
-          safelightForecastImg = loadImg(st.forecast?.has ? st.forecast.url : st.round.predictedUrl);
-          predictedRevealImg = loadImg(st.round.predictedUrl || (st.forecast?.has ? st.forecast.url : null));
-        } else {
-          safelightForecastImg = null;
-          predictedRevealImg = null;
-        }
         timelineBar.classList.remove('hidden');
-        setActiveSegment(segCompose);
+        setActiveSegment(segObserve);
         tlPrompt.className = 'tl-prompt';
-        tlPrompt.textContent = isSeed ? 'SEED 00A · STEP INTO POSITION' : 'STEP INTO POSITION';
-        if (cachedGhostImgs.length === 0 && !lastRoundVideoUrl) void loadGhostFromVps();
-        await ensureCamera();
+        tlPrompt.textContent = 'FIND WHAT YOU WANT TO SOFTEN OR ERASE';
         break;
 
-      case 'EXPOSURE':
+      case 'EXPOSE':
         stopAllLoops();
         if (fresh) relayClick(true);
         enlargerTimer.start(0.85, 0.1, 1.0);
         timelineBar.classList.remove('hidden');
         setActiveSegment(segExpose);
         tlPrompt.className = 'tl-prompt';
-        tlPrompt.textContent = 'ALTER FRAME WITH BOARDS & FILMS';
-        if (lastRoundVideoUrl) {
-          pastVid.src = lastRoundVideoUrl;
-          pastVid.currentTime = 0;
-          void pastVid.play().catch(() => {});
-        } else if (cachedGhostImgs.length === 0) {
-          void loadGhostFromVps();
-        }
+        tlPrompt.textContent = net.config?.mouseSimulator
+          ? 'SIMULATOR ACTIVE · PAINT ON PHOTO TO DODGE'
+          : 'BLOCK LIGHT WITH BOARDS, HANDS OR FILMS TO DODGE';
         await ensureCamera();
-        if (net.phase === 'EXPOSURE') {
-          startSampler(roundId);
-          startPastRecorder();
-        }
+        if (net.phase === 'EXPOSE') startExposeSampler();
         break;
 
-      case 'DEVELOPING':
+      case 'DEVELOP':
         enlargerTimer.stop();
         if (fresh) relayClick(false);
-        engine.finalizeLatent();
+        engine.finalizeDodgeMap();
         liveDevProgress = st.round.devProgress ?? 0;
         timelineBar.classList.remove('hidden');
         devBathAudio.start();
@@ -474,7 +302,7 @@ export default async function mainPage(app: HTMLElement): Promise<void> {
 
       case 'LIGHT_LEAK':
         stopAllLoops();
-        engine.finalizeLatent();
+        engine.finalizeDodgeMap();
         frozenDevProgress = st.round.finalDevProgress ?? st.round.devProgress ?? liveDevProgress;
         if (fresh) lightLeakBurst();
         timelineBar.classList.remove('hidden');
@@ -483,9 +311,9 @@ export default async function mainPage(app: HTMLElement): Promise<void> {
         tlPrompt.textContent = 'UNFIXED · LIGHT LEAK — IMAGE DESTROYED';
         break;
 
-      case 'FIXED_REVEAL': {
+      case 'REVEAL': {
         stopAllLoops();
-        engine.finalizeLatent();
+        engine.finalizeDodgeMap();
         frozenDevProgress = st.round.finalDevProgress ?? st.round.devProgress ?? liveDevProgress;
         const outcome = st.round.outcome ?? (prevPhase === 'LIGHT_LEAK' ? 'UNFIXED_LIGHT_LEAK' : 'FIXED_OPTIMAL');
         const isLeak = outcome === 'UNFIXED_LIGHT_LEAK' || prevPhase === 'LIGHT_LEAK';
@@ -498,57 +326,21 @@ export default async function mainPage(app: HTMLElement): Promise<void> {
             triggerFlashPulse(0.22, 50, 90);
           }
         }
-        const jpegData = engine.exportCleanJpeg(frozenDevProgress, activePrintMode, isLeak);
-        if (!isSeed && st.round.predictedUrl && !predictedRevealImg) {
-          predictedRevealImg = loadImg(st.round.predictedUrl);
-        }
-        frozenDeviationPct = isSeed ? null : (st.round.deviationPct ?? engine.computeDeviationPct(predictedRevealImg));
-        const { forecastDataUrl, collapseZone } = engine.computeAndExportForecast(isSeed, frozenDevProgress);
+        const jpegData = engine.exportCleanInstaxPrint(frozenDevProgress, isLeak);
         if (freezeUploadedRound !== roundId) {
           freezeUploadedRound = roundId;
-          net.send({
-            type: 'freeze',
-            data: jpegData,
-            forecastData: forecastDataUrl,
-            collapseZone,
-            deviationPct: frozenDeviationPct,
-          });
+          net.send({ type: 'freeze', data: jpegData });
         }
         timelineBar.classList.remove('hidden');
         setActiveSegment(segFixed);
         tlPrompt.className = 'tl-prompt';
-        tlPrompt.textContent = isSeed
-          ? 'SEED 00A BASELINE ESTABLISHED · EXIT NORTH ↑'
-          : `${outcomeShortCode(outcome)} · EXPOSURE LOCKED · EXIT NORTH ↑`;
+        tlPrompt.textContent = '04 FIXED · CHEMICAL PRINT ARCHIVED';
         break;
       }
     }
   }
 
-  net.on('config', (m) => {
-    if (trackedRollNumber !== null && m.config.rollNumber !== trackedRollNumber) {
-      clearRollMemory();
-    }
-    trackedRollNumber = m.config.rollNumber;
-  });
-
-  net.on('STATE_SYNC', (m) => {
-    const p = m.persisted;
-    if (!p.hasBase && p.frames.length === 0 && !p.hasGhostSequence) {
-      clearRollMemory();
-    } else if (p.hasGhostSequence && !lastRoundVideoUrl && cachedGhostImgs.length === 0) {
-      void loadGhostFromVps();
-    }
-  });
-
-  net.on('open', () => void restoreFromVpsState());
-
   net.on('state', (m) => {
-    if (trackedRollNumber !== null && m.round.rollNumber !== trackedRollNumber) {
-      clearRollMemory();
-    }
-    trackedRollNumber = m.round.rollNumber;
-    activePrintMode = m.round.printMode ?? net.config?.printMode ?? activePrintMode;
     const fresh = m.state !== curPhase || m.round.id !== curRound;
     if (!fresh) return;
     const prev = curPhase;
@@ -563,65 +355,40 @@ export default async function mainPage(app: HTMLElement): Promise<void> {
   function frame(): void {
     const phase = net.phase;
     const st = net.state;
-    const isSeed = (st?.round.frameNumber ?? 0) === 0;
+    const margin = net.config?.easelMargin ?? 6;
+
     switch (phase) {
       case 'IDLE':
         drawIdleDarkroom(g, net.now());
         break;
 
-      case 'CAPTURING_BASE': {
-        const s = net.storySec();
-        if (s < 4.0) {
-          drawIdleDarkroom(g, net.now());
-          basePrompt.classList.remove('hidden');
-          baseSecEl.textContent = String(Math.max(1, Math.ceil(4.0 - s)));
-        } else {
-          if (!baseShutterFired) {
-            baseShutterFired = true;
-            try {
-              shutter();
-            } catch {
-              /* ignore */
-            }
-          }
-          basePrompt.classList.add('hidden');
-          drawExposureBeam(g, null, 0);
+      case 'CALIBRATING':
+        drawCalibrationTarget(g, margin);
+        break;
+
+      case 'CAPTURE_CLEAN':
+        engine.drawExpose(g, margin);
+        break;
+
+      case 'OBSERVE':
+        engine.drawObserve(g, margin);
+        break;
+
+      case 'EXPOSE': {
+        engine.drawExpose(g, margin);
+        const total = Math.max(1, net.config?.exposeSec ?? 30);
+        const elapsed = net.storySec();
+        expFill.style.width = `${Math.min(100, (elapsed / total) * 100).toFixed(1)}%`;
+        const remainSec = Math.max(0, total - elapsed);
+        if (!exposeFastTickStarted && remainSec <= 5.0 && remainSec > 0) {
+          exposeFastTickStarted = true;
+          enlargerTimer.start(0.85, 0.05, 0.5);
         }
         break;
       }
 
-      case 'ENTER_BUFFER': {
-        drawIdleDarkroom(g, net.now());
-        const remain = Math.max(1, Math.ceil(net.remainingMs() / 1000 / net.timeScale));
-        countdown.textContent = String(remain);
-        break;
-      }
-
-      case 'SAFELIGHT_COMPOSE': {
-        const cz = isSeed ? null : (st?.round.collapseZone ?? st?.forecast?.collapseZone ?? null);
-        drawSafelightField(g, isSeed ? null : safelightForecastImg, cz);
-        break;
-      }
-
-      case 'EXPOSURE': {
-        const pastOpacity = net.config?.pastOpacity ?? 0.48;
-        let pastMedia: HTMLVideoElement | HTMLImageElement | null = null;
-        if (lastRoundVideoUrl) {
-          pastMedia = pastVid;
-        } else if (cachedGhostImgs.length > 0) {
-          const total = Math.max(1, net.config?.exposureSec ?? 15);
-          const idx = Math.min(cachedGhostImgs.length - 1, Math.floor((net.storySec() / total) * cachedGhostImgs.length));
-          pastMedia = cachedGhostImgs[idx];
-        }
-        drawExposureBeam(g, pastMedia, pastOpacity);
-        const total = Math.max(1, net.config?.exposureSec ?? 15);
-        const frac = Math.max(0, Math.min(1, net.storySec() / total));
-        expFill.style.width = `${(frac * 100).toFixed(1)}%`;
-        break;
-      }
-
-      case 'DEVELOPING': {
-        engine.renderPrint(g, g.canvas.width, g.canvas.height, liveDevProgress, activePrintMode, 0.93);
+      case 'DEVELOP': {
+        engine.drawDevelop(g, liveDevProgress, margin);
         const remainSec = Math.max(0, net.remainingMs() / 1000 / net.timeScale);
         devFill.style.width = `${Math.min(100, (liveDevProgress / 1.2) * 100).toFixed(1)}%`;
 
@@ -633,10 +400,10 @@ export default async function mainPage(app: HTMLElement): Promise<void> {
           setActiveSegment(segDevelop, 'burn');
           tlPrompt.className = 'tl-prompt burn';
           tlPrompt.textContent = 'BURNING — PULL FIX NOW →';
-        } else if (liveDevProgress >= 0.72) {
+        } else if (liveDevProgress >= 0.75) {
           setActiveSegment(segDevelop, 'gold');
           tlPrompt.className = 'tl-prompt gold';
-          tlPrompt.textContent = 'OPTIMAL — PULL FIX AT RIGHT NOW →';
+          tlPrompt.textContent = 'OPTIMAL — PULL FIX LEVER AT RIGHT NOW →';
         } else if (liveDevProgress >= 0.25) {
           setActiveSegment(segDevelop);
           tlPrompt.className = 'tl-prompt';
@@ -655,27 +422,13 @@ export default async function mainPage(app: HTMLElement): Promise<void> {
       }
 
       case 'LIGHT_LEAK':
-        engine.renderLightLeak(g, g.canvas.width, g.canvas.height, net.storySec(), frozenDevProgress, activePrintMode);
+        engine.drawLightLeak(g, net.storySec(), frozenDevProgress, margin);
         break;
 
-      case 'FIXED_REVEAL': {
-        if (isSeed) {
-          engine.renderPrint(g, g.canvas.width, g.canvas.height, frozenDevProgress, activePrintMode, 1.0);
-        } else {
-          const frNo = `${pad2(st?.round.frameNumber ?? 1)}A`;
-          const devPct = Math.round(frozenDevProgress * 100);
-          const outcome = st?.round.outcome ?? 'FIXED_OPTIMAL';
-          const devVal = frozenDeviationPct ?? st?.round.deviationPct ?? null;
-          engine.drawSideBySideReveal(
-            g,
-            predictedRevealImg,
-            frNo,
-            outcomeFullLabel(outcome),
-            devPct,
-            devVal,
-            outcome === 'UNDERDEVELOPED_TRACE_LOST',
-          );
-        }
+      case 'REVEAL': {
+        const outcome = st?.round.outcome ?? 'FIXED_OPTIMAL';
+        const isLeak = outcome === 'UNFIXED_LIGHT_LEAK';
+        engine.drawSideBySideReveal(g, frozenDevProgress, outcomeFullLabel(outcome), isLeak);
         break;
       }
     }
@@ -702,13 +455,13 @@ export default async function mainPage(app: HTMLElement): Promise<void> {
       el.innerHTML = `
         <div class="ticket">
           <div class="head">
-            <h2><small>RH-30 · LIVE ENLARGER · /main</small>Main projector setup</h2>
+            <h2><small>RH-30 · COLOR ENLARGER · /main</small>Main projector setup</h2>
             <span class="mono">S = SETUP · F = FULLSCREEN</span>
           </div>
           <div class="fields">
             <label><span class="no">01 / CAMERA</span>External USB wide-angle camera<select id="camSel"></select></label>
             <label><span class="no">02 / AUDIO OUT</span>Audio output device<select id="sinkSel"></select></label>
-            <div class="hint" id="camHint">Camera stream stays strictly local; only lightweight 480×270 ghost frames cache to VPS.</div>
+            <div class="hint" id="camHint">Camera stream stays strictly local for optical dodging &amp; remote homography calibration.</div>
           </div>
           <div class="fields">
             <div class="pv"><video id="pv" muted playsinline autoplay></video><span class="mono">LIVE CAMERA PREVIEW</span></div>
@@ -740,7 +493,7 @@ export default async function mainPage(app: HTMLElement): Promise<void> {
             o.textContent = d.label || `Camera ${i + 1}`;
             camSel.appendChild(o);
           });
-          if (!cams.length) camSel.innerHTML = '<option value="">(no camera detected — procedural simulation active)</option>';
+          if (!cams.length) camSel.innerHTML = '<option value="">(no camera detected — use Mouse Dodge Simulator)</option>';
           const saved = cams.find((d) => d.deviceId === camId);
           const external = cams.find((d) => !/facetime|built-?in|integrated|\u5185\u5efa/i.test(d.label));
           camSel.value = (saved || external || cams[0])?.deviceId || '';

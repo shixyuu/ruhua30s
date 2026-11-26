@@ -1,14 +1,9 @@
 /**
- * /admin — mobile-first single-hand operator desk & Instax instant print station (v3)
- * - Top trigger: huge PRESS SHUTTER · START (Space shortcut) + compact SKIP PHASE & 2-tap RESET TO IDLE
- * - Instax Express Print Card: caches latest clean borderless JPEG as File for synchronous navigator.share({ files })
- *   with automatic download fallback
- * - Live Acoustic & Optical Calibration: live mic meter + noiseFloor threshold line, devProgress bar (0–150%,
- *   marking 85–100% golden zone & >100% burn zone), Noise Floor & Develop Speed sliders, Photogram Negative vs Positive toggle
- * - New Roll (2-tap, keeps ./data/archive/ intact), 5 phase duration steppers, device heartbeat lamps & roll archive
+ * /admin — mobile-first single-hand operator desk & remote homography calibration (v3.2)
  */
 import { Net, mountFlashOverlay } from '../lib/net';
-import type { ContactSheetInfo, PersistedState, PrintMode, Role, StorageStats } from '../../../shared/protocol';
+import { computeHomographyInv } from '../lib/homography';
+import type { ContactSheetInfo, PersistedState, Point2D, Role, StorageStats } from '../../../shared/protocol';
 import { CONFIG_BOUNDS, outcomeShortCode } from '../../../shared/protocol';
 import { TITLE_EN } from '../lib/brand';
 import { triggerDownload } from '../lib/media';
@@ -16,7 +11,7 @@ import { escapeHtml } from '../lib/unlock';
 
 const ROLE_LABEL: Record<Exclude<Role, 'admin'>, string> = {
   main: 'Projector',
-  door: 'Contact',
+  door: 'Entrance QR',
   station1: 'Mic Gauge',
   station2: 'Fix Fader',
 };
@@ -39,19 +34,24 @@ export default function admin(app: HTMLElement): void {
   app.innerHTML = `
   <div class="admin-v3">
     <header class="desk-top">
-      <span class="ttl">RH-30 · LIVE DARKROOM DESK</span>
+      <span class="ttl">RH-30 · COLOR DARKROOM DESK</span>
       <span class="roll-pill" id="topRoll">ROLL 01</span>
       <span class="conn off" id="conn">OFFLINE</span>
     </header>
 
     <main class="desk-v3">
-      <!-- 1. Trigger & Live Phase -->
+      <!-- 1. Trigger & Queue Source -->
       <section class="card trigger-card">
         <button class="shutter-v3" id="shutter" type="button" disabled>
-          <span class="s-meta"><span id="shutterRoll">ROLL 01 · NEXT: FR 00A (SEED)</span><span class="kbd">SPACE</span></span>
-          <span class="s-main">PRESS SHUTTER · START</span>
+          <span class="s-meta"><span id="shutterRoll">ROLL 01 · NEXT FR 01A</span><span class="kbd">SPACE</span></span>
+          <span class="s-main">START SESSION</span>
           <span class="s-hint" id="shutterHint">Connecting…</span>
         </button>
+
+        <div class="queue-strip">
+          <span class="mono" id="queueState">QUEUE: WAITING FOR UPLOAD</span>
+          <button class="btn-mini" id="sampleBtn" type="button">USE BUILT-IN SAMPLE: OFF</button>
+        </div>
 
         <div class="phase-strip">
           <div>
@@ -76,25 +76,49 @@ export default function admin(app: HTMLElement): void {
         </div>
         <div class="instax-pv">
           <img id="latest" alt="Latest archival print" class="hidden" />
-          <div class="instax-empty" id="latestNone">No print fixed yet. Trigger a round to capture a clean borderless Instax print.</div>
-        </div>
-        <div class="instax-compare" id="compareStrip">
-          <div class="cmp-box">
-            <div class="cmp-img"><img id="cmpPredicted" alt="Predicted" class="hidden" /><span id="cmpPredNone">—</span></div>
-            <div class="cmp-lbl">THIS ROUND PREDICTED</div>
-          </div>
-          <div class="cmp-box forecast">
-            <div class="cmp-img"><img id="cmpForecast" alt="Next Forecast" class="hidden" /><span id="cmpFcNone">—</span></div>
-            <div class="cmp-lbl" id="cmpFcLbl">NEXT FORECAST</div>
-          </div>
+          <div class="instax-empty" id="latestNone">No print fixed yet. Start a session to capture a color darkroom print.</div>
         </div>
         <button class="btn-instax" id="shareInstax" type="button" disabled>SAVE / SHARE FOR INSTAX</button>
       </section>
 
-      <!-- 3. Live Acoustic & Optical Calibration -->
+      <!-- 3. Calibration & Home Test -->
       <section class="card cal-card">
         <div class="card-h">
-          <span>ACOUSTIC &amp; OPTICAL CALIBRATION</span>
+          <span>CALIBRATION &amp; TEST</span>
+          <span class="mono" id="calBadge">UNSET</span>
+        </div>
+
+        <div class="cal-btn-row">
+          <button class="btn-act" id="calModeBtn" type="button">ENTER CALIBRATION</button>
+          <button class="btn-act" id="simBtn" type="button">SIMULATOR: OFF</button>
+        </div>
+
+        <div class="sliders">
+          <label class="slider-ctl">
+            <div class="sl-head"><span>Easel Margin</span><span class="mono" id="marginVal">6%</span></div>
+            <input id="marginRange" type="range" min="${CONFIG_BOUNDS.easelMargin.min}" max="${CONFIG_BOUNDS.easelMargin.max}" step="1" value="6" />
+          </label>
+          <label class="slider-ctl">
+            <div class="sl-head"><span>Diff Sensitivity (AE / Moiré Filter)</span><span class="mono" id="diffVal">0.12</span></div>
+            <input id="diffRange" type="range" min="${CONFIG_BOUNDS.diffSensitivity.min}" max="${CONFIG_BOUNDS.diffSensitivity.max}" step="0.01" value="0.12" />
+          </label>
+        </div>
+
+        <div class="cal-snap-wrap">
+          <canvas id="calCanvas" width="640" height="360"></canvas>
+          <div class="cal-hint mono" id="calHint">Tap GRAB CAMERA SNAPSHOT, then tap/drag TL → TR → BR → BL.</div>
+        </div>
+
+        <div class="cal-btn-row">
+          <button class="btn-act" id="grabSnap" type="button">GRAB CAMERA SNAPSHOT</button>
+          <button class="btn-act primary-act" id="saveHomog" type="button">SAVE HOMOGRAPHY</button>
+        </div>
+      </section>
+
+      <!-- 4. Acoustic Calibration -->
+      <section class="card cal-card">
+        <div class="card-h">
+          <span>ACOUSTIC DEVELOPING</span>
           <span class="mono" id="devReadout">DEV 0% · MIC 0%</span>
         </div>
 
@@ -107,7 +131,7 @@ export default function admin(app: HTMLElement): void {
         </div>
 
         <div class="meter-row">
-          <div class="meter-lbl"><span>DEVELOP (0–20% UNDER · 85–105% GOLD · &gt;105% BURN)</span><span class="mono" id="devPct">0%</span></div>
+          <div class="meter-lbl"><span>DEVELOP (0–25% UNDER · 75–105% GOLD · &gt;105% BURN)</span><span class="mono" id="devPct">0%</span></div>
           <div class="bar-track dev-track">
             <div class="zone-under"></div>
             <div class="zone-gold"></div>
@@ -125,48 +149,25 @@ export default function admin(app: HTMLElement): void {
             <div class="sl-head"><span>Develop Speed</span><span class="mono" id="speedVal">0.20</span></div>
             <input id="speedRange" type="range" min="${CONFIG_BOUNDS.devSpeed.min}" max="${CONFIG_BOUNDS.devSpeed.max}" step="0.01" value="0.20" />
           </label>
-          <label class="slider-ctl">
-            <div class="sl-head"><span>Past Opacity (Recursive Overlay)</span><span class="mono" id="pastVal">0.48</span></div>
-            <input id="pastRange" type="range" min="${CONFIG_BOUNDS.pastOpacity.min}" max="${CONFIG_BOUNDS.pastOpacity.max}" step="0.01" value="0.48" />
-          </label>
-        </div>
-
-        <div class="mode-toggle" role="group" aria-label="Optical Print Mode">
-          <button type="button" id="modeNeg" class="active">PHOTOGRAM NEGATIVE</button>
-          <button type="button" id="modePos">POSITIVE PRINT</button>
         </div>
         <button class="btn-act btn-pulse" id="testDev" type="button" disabled>TEST DEVELOP PULSE (SOLO CAL)</button>
       </section>
 
-      <!-- 4. Phase Durations & Roll / Base Capture -->
+      <!-- 5. Phase Timings & Roll -->
       <section class="card timing-card">
         <div class="card-h">
           <span>PHASE TIMINGS &amp; ROLL</span>
-          <div class="roll-actions">
-            <button class="btn-mini amber" id="newRoll" type="button">NEW ROLL</button>
-            <button class="btn-mini base-btn needs-base" id="captureBase" type="button" disabled>CAPTURE BASE (00A)</button>
-          </div>
-        </div>
-        <div class="base-status" id="baseStatus">
-          <div class="base-thumb">
-            <img id="baseImg" alt="00A Baseline" class="hidden" />
-            <span id="baseNone">00A</span>
-          </div>
-          <div class="base-meta">
-            <div class="base-ttl" id="baseTitle">NO 00A BASELINE YET</div>
-            <div class="base-sub" id="baseTime">Clear beam &amp; tap CAPTURE BASE (00A)</div>
-          </div>
+          <button class="btn-mini amber" id="newRoll" type="button">NEW ROLL</button>
         </div>
         <div class="steppers">
-          ${stepperHtml('enterBufferSec', 'ENTER BUFFER', '2–10s', 5)}
-          ${stepperHtml('safelightSec', 'SAFELIGHT', '0–10s', 5)}
-          ${stepperHtml('exposureSec', 'EXPOSURE', '8–30s', 15)}
-          ${stepperHtml('maxDevelopSec', 'MAX DEVELOP', '15–45s', 25)}
-          ${stepperHtml('revealSec', 'REVEAL', '6–25s', 12)}
+          ${stepperHtml('observeSec', '01 OBSERVE (SAFELIGHT)', '3–20s', 8)}
+          ${stepperHtml('exposeSec', '02 EXPOSE (DODGE)', '10–60s', 30)}
+          ${stepperHtml('developSec', '03 DEVELOP (SOUND)', '10–45s', 25)}
+          ${stepperHtml('revealSec', '04 REVEAL (COMPARE)', '6–25s', 12)}
         </div>
       </section>
 
-      <!-- 5. Device Heartbeats & Current Roll Archive -->
+      <!-- 6. Device Heartbeats & Archive & VPS Storage -->
       <section class="card devices-card">
         <div class="card-h">
           <span>TERMINALS</span>
@@ -183,11 +184,10 @@ export default function admin(app: HTMLElement): void {
         <div class="archive-v3" id="archive"></div>
       </section>
 
-      <!-- 6. VPS Storage & Cache Management -->
       <section class="card storage-card">
         <div class="card-h">
-          <span>VPS STORAGE &amp; CACHE</span>
-          <span class="mono" id="ghostStatus">GHOST CACHE: EMPTY</span>
+          <span>VPS STORAGE &amp; QUEUE</span>
+          <span class="mono" id="queueStat">QUEUE: 0</span>
         </div>
         <div class="storage-stat mono" id="storageStat">VPS STORAGE: 0.0 MB · 0 ROLLS · 0 FRAMES</div>
         <div class="cache-actions">
@@ -205,6 +205,8 @@ export default function admin(app: HTMLElement): void {
   const shutterBtn = $<HTMLButtonElement>('#shutter');
   const shutterRoll = $<HTMLSpanElement>('#shutterRoll');
   const shutterHint = $<HTMLSpanElement>('#shutterHint');
+  const queueState = $<HTMLSpanElement>('#queueState');
+  const sampleBtn = $<HTMLButtonElement>('#sampleBtn');
   const phaseEl = $<HTMLDivElement>('#phase');
   const roundMeta = $<HTMLDivElement>('#roundMeta');
   const phaseClock = $<HTMLDivElement>('#phaseClock');
@@ -214,12 +216,21 @@ export default function admin(app: HTMLElement): void {
   const latestImg = $<HTMLImageElement>('#latest');
   const latestNone = $<HTMLDivElement>('#latestNone');
   const latestSlug = $<HTMLSpanElement>('#latestSlug');
-  const cmpPredicted = $<HTMLImageElement>('#cmpPredicted');
-  const cmpPredNone = $<HTMLSpanElement>('#cmpPredNone');
-  const cmpForecast = $<HTMLImageElement>('#cmpForecast');
-  const cmpFcNone = $<HTMLSpanElement>('#cmpFcNone');
-  const cmpFcLbl = $<HTMLDivElement>('#cmpFcLbl');
   const shareBtn = $<HTMLButtonElement>('#shareInstax');
+
+  const calBadge = $<HTMLSpanElement>('#calBadge');
+  const calModeBtn = $<HTMLButtonElement>('#calModeBtn');
+  const simBtn = $<HTMLButtonElement>('#simBtn');
+  const marginRange = $<HTMLInputElement>('#marginRange');
+  const marginVal = $<HTMLSpanElement>('#marginVal');
+  const diffRange = $<HTMLInputElement>('#diffRange');
+  const diffVal = $<HTMLSpanElement>('#diffVal');
+  const calCanvas = $<HTMLCanvasElement>('#calCanvas');
+  const calCtx = calCanvas.getContext('2d')!;
+  const calHint = $<HTMLDivElement>('#calHint');
+  const grabSnapBtn = $<HTMLButtonElement>('#grabSnap');
+  const saveHomogBtn = $<HTMLButtonElement>('#saveHomog');
+
   const devReadout = $<HTMLSpanElement>('#devReadout');
   const micPct = $<HTMLSpanElement>('#micPct');
   const micBar = $<HTMLDivElement>('#micBar');
@@ -230,23 +241,14 @@ export default function admin(app: HTMLElement): void {
   const floorVal = $<HTMLSpanElement>('#floorVal');
   const speedRange = $<HTMLInputElement>('#speedRange');
   const speedVal = $<HTMLSpanElement>('#speedVal');
-  const pastRange = $<HTMLInputElement>('#pastRange');
-  const pastVal = $<HTMLSpanElement>('#pastVal');
-  const modeNegBtn = $<HTMLButtonElement>('#modeNeg');
-  const modePosBtn = $<HTMLButtonElement>('#modePos');
   const testDevBtn = $<HTMLButtonElement>('#testDev');
   const newRollBtn = $<HTMLButtonElement>('#newRoll');
-  const captureBaseBtn = $<HTMLButtonElement>('#captureBase');
-  const baseImg = $<HTMLImageElement>('#baseImg');
-  const baseNone = $<HTMLSpanElement>('#baseNone');
-  const baseTitle = $<HTMLDivElement>('#baseTitle');
-  const baseTime = $<HTMLDivElement>('#baseTime');
   const lights = $<HTMLDivElement>('#lights');
   const onlineCount = $<HTMLSpanElement>('#onlineCount');
   const archTitle = $<HTMLSpanElement>('#archTitle');
   const totalDisk = $<HTMLSpanElement>('#totalDisk');
   const archive = $<HTMLDivElement>('#archive');
-  const ghostStatus = $<HTMLSpanElement>('#ghostStatus');
+  const queueStat = $<HTMLSpanElement>('#queueStat');
   const storageStat = $<HTMLDivElement>('#storageStat');
   const clearTempBtn = $<HTMLButtonElement>('#clearTemp');
   const purgeAllBtn = $<HTMLButtonElement>('#purgeAll');
@@ -264,7 +266,7 @@ export default function admin(app: HTMLElement): void {
     toastTimer = window.setTimeout(() => toastEl.classList.remove('show'), 2400);
   };
 
-  // ---------------- shutter + keyboard Space ----------------
+  // ---------------- Shutter & Queue ----------------
   let lastShutter = 0;
   function fireShutter(): void {
     if (net.phase !== 'IDLE' || !net.connected) return;
@@ -281,64 +283,23 @@ export default function admin(app: HTMLElement): void {
     const t = e.target as HTMLElement | null;
     if (t && (t.tagName === 'INPUT' || t.tagName === 'TEXTAREA' || t.tagName === 'SELECT' || t.isContentEditable)) return;
     e.preventDefault();
-    if (e.repeat) return;
-    fireShutter();
-  });
-  window.addEventListener('keyup', (e) => {
-    if (e.code === 'Space') e.preventDefault();
+    if (!e.repeat) fireShutter();
   });
 
   skipBtn.addEventListener('click', () => {
     if (net.phase === 'IDLE' || !net.connected) return;
     net.send({ type: 'admin', action: 'skipPhase', token });
   });
-
   testFlashBtn.addEventListener('click', () => net.send({ type: 'TEST_FLASH', token }));
 
-  // ---------------- two-tap RESET TO IDLE ----------------
-  let resetTimer = 0;
-  function disarmReset(): void {
-    clearTimeout(resetTimer);
-    resetBtn.classList.remove('armed');
-    resetBtn.textContent = 'RESET TO IDLE';
-  }
-  resetBtn.addEventListener('click', () => {
-    if (!resetBtn.classList.contains('armed')) {
-      resetBtn.classList.add('armed');
-      resetBtn.textContent = 'CONFIRM RESET?';
-      resetTimer = window.setTimeout(disarmReset, 3000);
-      return;
-    }
-    disarmReset();
-    net.send({ type: 'admin', action: 'reset', token });
+  sampleBtn.addEventListener('click', () => {
+    const cur = net.config?.sampleFallback ?? 0;
+    const next = (cur + 1) % 5; // 0=OFF, 1..3=samples, 4=last print
+    sendConfigPatch({ sampleFallback: next }, true);
   });
 
-  // ---------------- two-tap NEW ROLL + CAPTURE BASE (00A) ----------------
-  let rollTimer = 0;
-  function disarmRoll(): void {
-    clearTimeout(rollTimer);
-    newRollBtn.classList.remove('armed');
-    newRollBtn.textContent = 'NEW ROLL';
-  }
-  newRollBtn.addEventListener('click', () => {
-    if (!newRollBtn.classList.contains('armed')) {
-      const nextR = (net.config?.rollNumber ?? 1) + 1;
-      newRollBtn.classList.add('armed');
-      newRollBtn.textContent = `CONFIRM ROLL ${pad2(nextR)}?`;
-      rollTimer = window.setTimeout(disarmRoll, 3000);
-      return;
-    }
-    disarmRoll();
-    net.send({ type: 'admin', action: 'newRoll', token });
-  });
-
-  captureBaseBtn.addEventListener('click', () => {
-    if (net.phase !== 'IDLE' || !net.connected) return;
-    net.send({ type: 'CAPTURE_BASE', token });
-  });
-
-  // ---------------- two-tap CLEAR TEMP CACHE & PURGE ALL DATA ----------------
-  function wireTwoTap(btn: HTMLButtonElement, idleTxt: string, armTxt: string, onConfirm: () => Promise<void>): void {
+  // ---------------- Two-tap buttons ----------------
+  function wireTwoTap(btn: HTMLButtonElement, idleTxt: string, armTxt: string, onConfirm: () => void): void {
     let t = 0;
     const disarm = () => {
       clearTimeout(t);
@@ -353,45 +314,192 @@ export default function admin(app: HTMLElement): void {
         return;
       }
       disarm();
-      void onConfirm();
+      onConfirm();
     });
   }
 
-  wireTwoTap(clearTempBtn, 'CLEAR TEMP CACHE', 'CONFIRM CLEAR TEMP?', async () => {
-    try {
-      const r = await fetch('/api/cache/clear', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ mode: 'runtime', token }),
-      });
-      const j = await r.json();
-      if (j.ok) {
-        updatePersistedUi(j.state, j.storage);
-        toast('✓ Temp ghost & forecast cache cleared');
-      } else toast(`✗ ${j.error || 'Failed'}`);
-    } catch {
-      toast('✗ Request failed');
+  wireTwoTap(resetBtn, 'RESET TO IDLE', 'CONFIRM RESET?', () => net.send({ type: 'admin', action: 'reset', token }));
+  wireTwoTap(newRollBtn, 'NEW ROLL', 'CONFIRM NEW ROLL?', () => net.send({ type: 'admin', action: 'newRoll', token }));
+  wireTwoTap(clearTempBtn, 'CLEAR TEMP CACHE', 'CONFIRM CLEAR?', async () => {
+    const r = await fetch('/api/cache/clear', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ mode: 'runtime', token }),
+    });
+    const j = await r.json();
+    if (j.ok) {
+      updatePersistedUi(j.state, j.storage);
+      toast('✓ Queue cache cleared');
     }
   });
-
   wireTwoTap(purgeAllBtn, 'PURGE ALL DATA', 'CONFIRM PURGE ALL?', async () => {
-    try {
-      const r = await fetch('/api/cache/clear', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ mode: 'all', token }),
-      });
-      const j = await r.json();
-      if (j.ok) {
-        updatePersistedUi(j.state, j.storage);
-        toast('✓ All rolls & cache purged (ROLL 01 reset)');
-      } else toast(`✗ ${j.error || 'Failed'}`);
-    } catch {
-      toast('✗ Request failed');
+    const r = await fetch('/api/cache/clear', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ mode: 'all', token }),
+    });
+    const j = await r.json();
+    if (j.ok) {
+      updatePersistedUi(j.state, j.storage);
+      toast('✓ All rolls & queue purged');
     }
   });
 
-  // ---------------- Instax Share / Download (pre-cached File for synchronous gesture) ----------------
+  // ---------------- Calibration Snapshot & 4-Corner Homography UI ----------------
+  let snapImg: HTMLImageElement | null = null;
+  let corners: [Point2D, Point2D, Point2D, Point2D] = [
+    { x: 0.08, y: 0.08 },
+    { x: 0.92, y: 0.08 },
+    { x: 0.92, y: 0.92 },
+    { x: 0.08, y: 0.92 },
+  ];
+  let dragCornerIdx = -1;
+  const LABELS = ['TL', 'TR', 'BR', 'BL'];
+
+  function drawCalCanvas(): void {
+    const w = calCanvas.width;
+    const h = calCanvas.height;
+    calCtx.fillStyle = '#050504';
+    calCtx.fillRect(0, 0, w, h);
+
+    if (snapImg && snapImg.complete && snapImg.naturalWidth > 0) {
+      calCtx.drawImage(snapImg, 0, 0, w, h);
+    } else {
+      calCtx.fillStyle = 'rgba(232, 226, 213, 0.25)';
+      calCtx.font = '14px "RH Mono", monospace';
+      calCtx.textAlign = 'center';
+      calCtx.fillText('NO SNAPSHOT YET — TAP GRAB CAMERA SNAPSHOT', w / 2, h / 2);
+      calCtx.textAlign = 'left';
+    }
+
+    // Quad outline
+    calCtx.strokeStyle = '#C48A3A';
+    calCtx.lineWidth = 2;
+    calCtx.beginPath();
+    corners.forEach((p, idx) => {
+      const x = p.x * w;
+      const y = p.y * h;
+      if (idx === 0) calCtx.moveTo(x, y);
+      else calCtx.lineTo(x, y);
+    });
+    calCtx.closePath();
+    calCtx.stroke();
+
+    // Corner handles
+    corners.forEach((p, idx) => {
+      const x = p.x * w;
+      const y = p.y * h;
+      calCtx.fillStyle = '#9A0A0A';
+      calCtx.beginPath();
+      calCtx.arc(x, y, 11, 0, Math.PI * 2);
+      calCtx.fill();
+      calCtx.strokeStyle = '#E8E2D5';
+      calCtx.lineWidth = 2;
+      calCtx.stroke();
+
+      calCtx.fillStyle = '#E8E2D5';
+      calCtx.font = 'bold 11px "RH Mono", monospace';
+      calCtx.fillText(LABELS[idx], x + 13, y + 4);
+    });
+  }
+
+  function eventToNorm(e: PointerEvent): Point2D {
+    const r = calCanvas.getBoundingClientRect();
+    return {
+      x: Math.max(0.01, Math.min(0.99, (e.clientX - r.left) / r.width)),
+      y: Math.max(0.01, Math.min(0.99, (e.clientY - r.top) / r.height)),
+    };
+  }
+
+  calCanvas.addEventListener('pointerdown', (e) => {
+    e.preventDefault();
+    const p = eventToNorm(e);
+    let best = 0;
+    let bestD = Infinity;
+    corners.forEach((c, idx) => {
+      const d = (c.x - p.x) ** 2 + (c.y - p.y) ** 2;
+      if (d < bestD) {
+        bestD = d;
+        best = idx;
+      }
+    });
+    dragCornerIdx = best;
+    corners[best] = p;
+    drawCalCanvas();
+    try {
+      calCanvas.setPointerCapture(e.pointerId);
+    } catch {
+      /* ignore */
+    }
+  });
+  calCanvas.addEventListener('pointermove', (e) => {
+    if (dragCornerIdx < 0) return;
+    e.preventDefault();
+    corners[dragCornerIdx] = eventToNorm(e);
+    drawCalCanvas();
+  });
+  calCanvas.addEventListener('pointerup', () => {
+    dragCornerIdx = -1;
+  });
+
+  calModeBtn.addEventListener('click', () => {
+    if (!net.connected) return;
+    if (net.phase === 'CALIBRATING') {
+      net.send({ type: 'EXIT_CALIBRATION', token });
+    } else {
+      net.send({ type: 'ENTER_CALIBRATION', token });
+    }
+  });
+
+  simBtn.addEventListener('click', () => {
+    const next = !(net.config?.mouseSimulator ?? false);
+    sendConfigPatch({ mouseSimulator: next }, true);
+  });
+
+  grabSnapBtn.addEventListener('click', () => {
+    if (!net.connected) return;
+    net.send({ type: 'REQUEST_SNAPSHOT', token });
+    toast('Requesting camera snapshot from /main…');
+  });
+
+  net.on('SNAPSHOT_READY', (m) => {
+    const im = new Image();
+    im.onload = () => {
+      snapImg = im;
+      drawCalCanvas();
+      calHint.textContent = 'Drag TL / TR / BR / BL to match the 4 target corners, then tap SAVE HOMOGRAPHY.';
+    };
+    im.src = m.imageData;
+  });
+
+  net.on('calibration', (m) => {
+    if (m.calibration.corners) {
+      corners = m.calibration.corners;
+      drawCalCanvas();
+    }
+    calBadge.textContent = m.calibration.hInv ? 'CALIBRATED' : 'UNSET';
+  });
+
+  saveHomogBtn.addEventListener('click', async () => {
+    const hInv = computeHomographyInv(corners);
+    if (!hInv) return toast('✗ Degenerate corners — adjust 4 points');
+    try {
+      const r = await fetch('/api/calibration', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ corners, hInv, token }),
+      });
+      const j = await r.json();
+      if (j.ok) {
+        calBadge.textContent = 'CALIBRATED';
+        toast('✓ Homography saved to VPS');
+      } else toast(`✗ ${j.error}`);
+    } catch {
+      toast('✗ Failed to save homography');
+    }
+  });
+
+  // ---------------- Instax Share / Download ----------------
   let cachedUrl = '';
   let cachedFileName = 'RH30-print.jpg';
   let cachedFile: File | null = null;
@@ -405,9 +513,7 @@ export default function admin(app: HTMLElement): void {
     try {
       const resp = await fetch(url, { cache: 'no-store' });
       const blob = await resp.blob();
-      if (cachedUrl === url) {
-        cachedFile = new File([blob], filename, { type: 'image/jpeg' });
-      }
+      if (cachedUrl === url) cachedFile = new File([blob], filename, { type: 'image/jpeg' });
     } catch {
       cachedFile = null;
     }
@@ -422,14 +528,13 @@ export default function admin(app: HTMLElement): void {
         return;
       } catch (err) {
         if ((err as Error)?.name === 'AbortError') return;
-        /* fall back to direct download */
       }
     }
     triggerDownload(cachedUrl, cachedFileName);
     toast(`Downloading ${cachedFileName}`);
   });
 
-  // ---------------- Sliders, Mode Toggle & Phase Steppers ----------------
+  // ---------------- Config Sliders & Steppers ----------------
   let cfgSendTimer = 0;
   function sendConfigPatch(patch: Record<string, unknown>, immediate = false): void {
     clearTimeout(cfgSendTimer);
@@ -438,6 +543,16 @@ export default function admin(app: HTMLElement): void {
     else cfgSendTimer = window.setTimeout(run, 80);
   }
 
+  marginRange.addEventListener('input', () => {
+    const v = Number(marginRange.value);
+    marginVal.textContent = `${v}%`;
+    sendConfigPatch({ easelMargin: v });
+  });
+  diffRange.addEventListener('input', () => {
+    const v = Number(diffRange.value);
+    diffVal.textContent = v.toFixed(2);
+    sendConfigPatch({ diffSensitivity: v });
+  });
   floorRange.addEventListener('input', () => {
     const v = Number(floorRange.value);
     floorVal.textContent = v.toFixed(2);
@@ -449,23 +564,8 @@ export default function admin(app: HTMLElement): void {
     speedVal.textContent = v.toFixed(2);
     sendConfigPatch({ devSpeed: v });
   });
-  pastRange.addEventListener('input', () => {
-    const v = Number(pastRange.value);
-    pastVal.textContent = v.toFixed(2);
-    sendConfigPatch({ pastOpacity: v });
-  });
-
-  function setPrintMode(mode: PrintMode): void {
-    modeNegBtn.classList.toggle('active', mode === 'photogram_negative');
-    modePosBtn.classList.toggle('active', mode === 'positive_print');
-    sendConfigPatch({ printMode: mode }, true);
-  }
-  modeNegBtn.addEventListener('click', () => setPrintMode('photogram_negative'));
-  modePosBtn.addEventListener('click', () => setPrintMode('positive_print'));
   testDevBtn.addEventListener('click', () => {
-    if (net.phase === 'DEVELOPING' && net.connected) {
-      net.send({ type: 'admin', action: 'testDevelop', token });
-    }
+    if (net.phase === 'DEVELOP' && net.connected) net.send({ type: 'admin', action: 'testDevelop', token });
   });
 
   app.querySelectorAll<HTMLButtonElement>('[data-step-key]').forEach((btn) => {
@@ -479,27 +579,37 @@ export default function admin(app: HTMLElement): void {
     });
   });
 
+  function updateSampleLabel(sampleIdx: number): void {
+    const map = ['OFF', 'SAMPLE #1', 'SAMPLE #2', 'SAMPLE #3', 'LAST PRINT'];
+    sampleBtn.textContent = `USE BUILT-IN SAMPLE: ${map[sampleIdx] ?? 'OFF'}`;
+    sampleBtn.classList.toggle('armed', sampleIdx > 0);
+  }
+
   net.on('config', (m) => {
     const c = m.config;
     topRoll.textContent = `ROLL ${pad2(c.rollNumber)}`;
+    marginRange.value = String(c.easelMargin);
+    marginVal.textContent = `${c.easelMargin}%`;
+    diffRange.value = String(c.diffSensitivity);
+    diffVal.textContent = c.diffSensitivity.toFixed(2);
     floorRange.value = String(c.noiseFloor);
     floorVal.textContent = c.noiseFloor.toFixed(2);
     floorLine.style.left = `${Math.round(c.noiseFloor * 100)}%`;
     speedRange.value = String(c.devSpeed);
     speedVal.textContent = c.devSpeed.toFixed(2);
-    pastRange.value = String(c.pastOpacity ?? 0.48);
-    pastVal.textContent = (c.pastOpacity ?? 0.48).toFixed(2);
-    modeNegBtn.classList.toggle('active', c.printMode === 'photogram_negative');
-    modePosBtn.classList.toggle('active', c.printMode === 'positive_print');
 
-    for (const key of ['enterBufferSec', 'safelightSec', 'exposureSec', 'maxDevelopSec', 'revealSec'] as const) {
+    simBtn.textContent = `SIMULATOR: ${c.mouseSimulator ? 'MOUSE DODGE ON' : 'OFF'}`;
+    simBtn.classList.toggle('primary-act', c.mouseSimulator);
+    updateSampleLabel(c.sampleFallback);
+
+    for (const key of ['observeSec', 'exposeSec', 'developSec', 'revealSec'] as const) {
       const el = app.querySelector(`[data-step-val="${key}"]`);
       if (el) el.textContent = String(c[key]);
     }
     renderArchive(net.contactSheet);
   });
 
-  // ---------------- Live mic & dev meters ----------------
+  // ---------------- Live meters & clients ----------------
   net.on('dev', (m) => {
     const mic = Math.round(Math.max(0, Math.min(1, m.audioLevel)) * 100);
     const dev = Math.round(Math.max(0, m.devProgress) * 100);
@@ -507,12 +617,11 @@ export default function admin(app: HTMLElement): void {
     micBar.style.width = `${mic}%`;
     devPctEl.textContent = `${dev}%`;
     devBar.style.width = `${Math.min(100, (dev / 150) * 100)}%`;
-    devBar.classList.toggle('gold', dev >= 85 && dev <= 105);
+    devBar.classList.toggle('gold', dev >= 75 && dev <= 105);
     devBar.classList.toggle('burn', dev > 105);
     devReadout.textContent = `DEV ${dev}% · MIC ${mic}%`;
   });
 
-  // ---------------- Online lamps ----------------
   net.on('clients', (m) => {
     lights.innerHTML = '';
     let on = 0;
@@ -543,58 +652,27 @@ export default function admin(app: HTMLElement): void {
     lights.querySelectorAll('.light').forEach((l) => l.classList.remove('on'));
   });
 
-  function updateForecastCompare(sheet?: ContactSheetInfo | null): void {
-    const predUrl = net.round?.predictedUrl ?? null;
-    if (predUrl) {
-      cmpPredicted.src = predUrl;
-      cmpPredicted.classList.remove('hidden');
-      cmpPredNone.classList.add('hidden');
-    } else {
-      cmpPredicted.classList.add('hidden');
-      cmpPredicted.removeAttribute('src');
-      cmpPredNone.classList.remove('hidden');
-    }
-    const fc = sheet?.forecast ?? net.state?.forecast ?? null;
-    if (fc?.has && fc.url) {
-      cmpForecast.src = fc.url;
-      cmpForecast.classList.remove('hidden');
-      cmpFcNone.classList.add('hidden');
-      cmpFcLbl.textContent = `NEXT FORECAST (${fc.targetFrameNo})`;
-    } else {
-      cmpForecast.classList.add('hidden');
-      cmpForecast.removeAttribute('src');
-      cmpFcNone.classList.remove('hidden');
-      cmpFcLbl.textContent = 'NEXT FORECAST';
-    }
-  }
-
-  // ---------------- Archive & Latest Proof ----------------
+  // ---------------- Archive & Storage ----------------
   function renderArchive(sheet?: ContactSheetInfo | null): void {
     const rollNo = sheet?.rollNumber ?? net.config?.rollNumber ?? 1;
     const frames = sheet?.frames ?? [];
     archTitle.textContent = `ROLL ${pad2(rollNo)} ARCHIVE (${frames.length})`;
     if (net.phase === 'IDLE') {
-      shutterRoll.textContent =
-        frames.length === 0
-          ? `ROLL ${pad2(rollNo)} · NEXT: FR 00A (SEED)`
-          : `ROLL ${pad2(rollNo)} · NEXT: FR ${pad2(frames.length)}A`;
+      shutterRoll.textContent = `ROLL ${pad2(rollNo)} · NEXT FR ${pad2(frames.length + 1)}A`;
     }
-    updateForecastCompare(sheet);
 
     if (frames.length === 0) {
-      archive.innerHTML = `<div class="arch-empty">Roll ${pad2(rollNo)} is empty. Next shutter releases seed frame 00A.</div>`;
+      archive.innerHTML = `<div class="arch-empty">Roll ${pad2(rollNo)} is empty.</div>`;
       return;
     }
 
     const latestFrame = frames[frames.length - 1];
     const dlName = `RH30_R${pad2(rollNo)}_FR${latestFrame.frameNo}.jpg`;
     const code = latestFrame.outcomeCode || outcomeShortCode(latestFrame.outcome);
-    const devTxt = latestFrame.devPercent != null ? ` · DEV ${latestFrame.devPercent}%` : '';
-    const devnTxt = net.round?.deviationPct != null && net.round.frameNumber === latestFrame.index ? ` · Δ${net.round.deviationPct}%` : '';
     latestImg.src = latestFrame.url;
     latestImg.classList.remove('hidden');
     latestNone.classList.add('hidden');
-    latestSlug.textContent = `R${pad2(rollNo)} · ${latestFrame.frameNo} · ${code}${devTxt}${devnTxt}`;
+    latestSlug.textContent = `R${pad2(rollNo)} · ${latestFrame.frameNo} · ${code}${latestFrame.devPercent != null ? ` · DEV ${latestFrame.devPercent}%` : ''}`;
     void cacheLatestForInstax(latestFrame.url, dlName);
 
     const reversed = [...frames].reverse();
@@ -612,55 +690,23 @@ export default function admin(app: HTMLElement): void {
       .join('');
   }
 
-  net.on('contact-sheet', (m) => {
-    renderArchive(m.sheet);
-    void loadDiskTotal();
-  });
-
-  net.on('door-photo', (m) => {
-    if (!m.photo.url && (net.contactSheet?.frames?.length ?? 0) === 0) {
-      latestImg.classList.add('hidden');
-      latestImg.removeAttribute('src');
-      latestNone.classList.remove('hidden');
-      latestSlug.textContent = 'NO PRINT YET';
-      void cacheLatestForInstax('', 'RH30-print.jpg');
-    } else if (m.photo.url && (net.contactSheet?.frames?.length ?? 0) === 0) {
-      const rollNo = net.config?.rollNumber ?? 1;
-      latestImg.src = m.photo.url;
-      latestImg.classList.remove('hidden');
-      latestNone.classList.add('hidden');
-      latestSlug.textContent = `ROLL ${pad2(rollNo)} · LATEST`;
-      void cacheLatestForInstax(m.photo.url, `RH30-R${pad2(rollNo)}-latest.jpg`);
-    }
-  });
-
   function updatePersistedUi(st?: PersistedState | null, storage?: StorageStats | null): void {
     if (st) {
-      captureBaseBtn.classList.toggle('needs-base', !st.hasBase);
-      if (st.hasBase && st.baseFrameUrl) {
-        baseImg.src = st.baseFrameUrl;
-        baseImg.classList.remove('hidden');
-        baseNone.classList.add('hidden');
-        baseTitle.textContent = `00A BASELINE LOCKED · ROLL ${pad2(st.rollNumber)}`;
-        const tStr = st.baseCapturedAt ? new Date(st.baseCapturedAt).toLocaleTimeString([], { hour12: false }) : '';
-        baseTime.textContent = tStr ? `Captured at ${tStr} (tap CAPTURE BASE to reshoot)` : 'Ready';
-      } else {
-        baseImg.classList.add('hidden');
-        baseImg.removeAttribute('src');
-        baseNone.classList.remove('hidden');
-        baseTitle.textContent = `NO 00A BASELINE YET · ROLL ${pad2(st.rollNumber)}`;
-        baseTime.textContent = 'Clear beam & tap CAPTURE BASE (00A)';
-      }
-      ghostStatus.textContent = `GHOST CACHE: ${st.hasGhostSequence ? 'READY' : 'EMPTY'}`;
+      queueState.textContent = st.hasQueuedPhoto ? 'QUEUE: READY (UPLOADED)' : 'QUEUE: WAITING FOR UPLOAD';
+      queueState.classList.toggle('q-ready', st.hasQueuedPhoto);
     }
     if (storage) {
       const mb = (storage.totalBytes / (1024 * 1024)).toFixed(2);
       storageStat.textContent = `VPS STORAGE: ${mb} MB · ${storage.rollsCount} ROLLS · ${storage.framesCount} FRAMES`;
-      ghostStatus.textContent = `GHOST CACHE: ${storage.hasGhostSequence ? 'READY' : 'EMPTY'}`;
+      queueStat.textContent = `QUEUE: ${storage.queueCount}`;
     }
   }
 
   net.on('STATE_SYNC', (m) => updatePersistedUi(m.persisted, m.storage));
+  net.on('contact-sheet', (m) => {
+    renderArchive(m.sheet);
+    void loadDiskTotal();
+  });
 
   async function loadDiskTotal(): Promise<void> {
     try {
@@ -684,29 +730,25 @@ export default function admin(app: HTMLElement): void {
       const p = st.state;
       phaseEl.textContent = p;
       const r = st.round;
-      roundMeta.textContent = `ROUND ${String(r.id).padStart(3, '0')} · ROLL ${pad2(r.rollNumber)} · ${pad2(r.frameNumber)}A${r.frameNumber === 0 ? ' (SEED)' : ''}`;
+      roundMeta.textContent = `ROUND ${String(r.id).padStart(3, '0')} · ROLL ${pad2(r.rollNumber)} · ${pad2(r.frameNumber)}A`;
       if (p !== 'IDLE') shutterRoll.textContent = `ROLL ${pad2(r.rollNumber)} · FR ${pad2(r.frameNumber)}A`;
-      else updateForecastCompare(net.contactSheet);
 
       const el = net.elapsedMs() / 1000;
       const dur = st.phaseDurationMs / 1000;
-      if (dur > 0) {
-        const rem = Math.max(0, dur - el);
-        phaseClock.textContent = `${rem.toFixed(1)} S LEFT`;
-      } else {
-        phaseClock.textContent = `${el.toFixed(1)} S`;
-      }
+      phaseClock.textContent = dur > 0 ? `${Math.max(0, dur - el).toFixed(1)} S LEFT` : `${el.toFixed(1)} S`;
 
       const canStart = p === 'IDLE' && net.connected;
       shutterBtn.disabled = !canStart || Date.now() - lastShutter < 1500;
-      captureBaseBtn.disabled = !canStart;
       shutterHint.textContent = canStart ? 'Standby · tap or press SPACE' : net.connected ? `Running · ${p}` : 'Offline';
       skipBtn.disabled = p === 'IDLE' || !net.connected;
-      testDevBtn.disabled = p !== 'DEVELOPING' || !net.connected;
+      testDevBtn.disabled = p !== 'DEVELOP' || !net.connected;
+      calModeBtn.textContent = p === 'CALIBRATING' ? 'EXIT CALIBRATION' : 'ENTER CALIBRATION';
+      calModeBtn.classList.toggle('primary-act', p === 'CALIBRATING');
     }
     requestAnimationFrame(tick);
   }
 
+  drawCalCanvas();
   net.connect();
   renderArchive(null);
   void loadDiskTotal();

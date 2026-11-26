@@ -76,9 +76,9 @@ export default async function station2(app: HTMLElement): Promise<void> {
   }
 
   function updateCue(): void {
-    if (fixed || net.phase !== 'DEVELOPING') return;
+    if (fixed || net.phase !== 'DEVELOP') return;
     const remainSec = net.remainingMs() / 1000 / net.timeScale;
-    const urgent = latestDev >= 0.72 || (remainSec > 0 && remainSec <= 6);
+    const urgent = latestDev >= 0.75 || (remainSec > 0 && remainSec <= 6);
     const emerging = !urgent && latestDev >= 0.35;
 
     faderBox.classList.toggle('cue-urgent', urgent);
@@ -116,7 +116,7 @@ export default async function station2(app: HTMLElement): Promise<void> {
 
   // Full-well hotzone with 1:1 pointer tracking and setPointerCapture
   faderWell.addEventListener('pointerdown', (e) => {
-    if (fixed || net.phase !== 'DEVELOPING') return;
+    if (fixed || net.phase !== 'DEVELOP') return;
     e.preventDefault();
     dragging = true;
     activePointerId = e.pointerId;
@@ -186,7 +186,7 @@ export default async function station2(app: HTMLElement): Promise<void> {
   let wasActive = false;
 
   function renderPhase(): void {
-    const active = net.connected && net.phase === 'DEVELOPING';
+    const active = net.connected && net.phase === 'DEVELOP';
     root.classList.toggle('black', !active);
     if (active && !wasActive) stationWakeChime();
     wasActive = active;
@@ -208,9 +208,9 @@ export default async function station2(app: HTMLElement): Promise<void> {
   net.on('open', renderPhase);
   window.addEventListener('resize', place);
 
-  // Keep remaining-time urgent cue fresh during DEVELOPING
+  // Keep remaining-time urgent cue fresh during DEVELOP
   window.setInterval(() => {
-    if (net.connected && net.phase === 'DEVELOPING') updateCue();
+    if (net.connected && net.phase === 'DEVELOP') updateCue();
   }, 400);
 
   await showStartOverlay({

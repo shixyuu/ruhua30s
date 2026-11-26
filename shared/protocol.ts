@@ -1,19 +1,17 @@
 /**
- * 《入画三十秒 (RH-30)》v3 — 活体暗房时间预言引擎（完整终版）前后端共享协议。
+ * 《入画三十秒 (RH-30)》v3 — 扫码传图彩色暗房精修版（前后端共享协议）
  * 服务端是唯一真相源：所有终端根据 state / dev 包里的 serverTime / phaseStartedAt 校准本地时钟。
  */
 
 export type Phase =
   | 'IDLE'
-  | 'CAPTURING_BASE'
-  | 'ENTER_BUFFER'
-  | 'SAFELIGHT_COMPOSE'
-  | 'EXPOSURE'
-  | 'DEVELOPING'
+  | 'CALIBRATING'
+  | 'CAPTURE_CLEAN'
+  | 'OBSERVE'
+  | 'EXPOSE'
+  | 'DEVELOP'
   | 'LIGHT_LEAK'
-  | 'FIXED_REVEAL';
-
-export type PrintMode = 'photogram_negative' | 'positive_print';
+  | 'REVEAL';
 
 export type ChemicalOutcome =
   | 'FIXED_OPTIMAL'
@@ -25,81 +23,80 @@ export type Role = 'main' | 'door' | 'station1' | 'station2' | 'admin';
 
 export const ROLES: Role[] = ['main', 'door', 'station1', 'station2', 'admin'];
 
-export interface CollapseZone {
-  cx: number; // 0..1 normalized
-  cy: number; // 0..1 normalized
-  rx: number; // 0..1 normalized
-  ry: number; // 0..1 normalized
+export interface Point2D {
+  x: number; // normalized 0..1
+  y: number; // normalized 0..1
+}
+
+export interface CalibrationData {
+  /** 4 corners in camera snapshot normalized coords: [TL, TR, BR, BL] */
+  corners: [Point2D, Point2D, Point2D, Point2D] | null;
+  /** 3x3 inverse homography matrix (row-major 9 floats): 320x180 grid -> camera normalized [0..1] */
+  hInv: number[] | null;
+  updatedAt: number | null;
 }
 
 export interface AppConfig {
-  /** 入场缓冲秒数（2–10，默认 5） */
-  enterBufferSec: number;
-  /** 安全红光构图秒数（0–10，默认 5；设为 0 时直接跳过进入 EXPOSURE） */
-  safelightSec: number;
-  /** 放大机白光曝光秒数（8–30，默认 15） */
-  exposureSec: number;
-  /** 最长声控显影秒数（15–45，默认 25） */
-  maxDevelopSec: number;
-  /** 定影后画面展示秒数（6–25，默认 12） */
+  /** 01 OBSERVE 安全红光秒数（3–20，默认 8） */
+  observeSec: number;
+  /** 02 EXPOSE 彩色投影遮挡减光秒数（10–60，默认 30） */
+  exposeSec: number;
+  /** 03 DEVELOP 最长声控显影秒数（10–45，默认 25） */
+  developSec: number;
+  /** 04 REVEAL 前后对照展示秒数（6–25，默认 12） */
   revealSec: number;
   /** 抗环境底噪阈值（0.00–0.50，默认 0.08） */
   noiseFloor: number;
   /** 满能量时每秒显影增量（0.03–0.80，默认 0.20） */
   devSpeed: number;
-  /** 活着的过去：上一轮 15s 动态影像在白光重曝中的透明度（0.15–0.85，默认 0.48） */
-  pastOpacity: number;
-  /** 显影光学模式：classic photogram_negative 或 positive_print */
-  printMode: PrintMode;
+  /** 画框四周黑边百分比（0–30，默认 6） */
+  easelMargin: number;
+  /** 摄像头遮挡差分阈值（0.05–0.35，默认 0.12） */
+  diffSensitivity: number;
+  /** 在家无摄像头鼠标涂抹减光模拟开关 */
+  mouseSimulator: boolean;
+  /** 免扫码兜底：使用内置高反差测试图（0=关闭, 1..3=内置样张, 4=上一轮成品） */
+  sampleFallback: number;
   /** 当前胶卷编号（从 1 开始，NEW ROLL 时递增，历史照片按卷归档保留） */
   rollNumber: number;
 }
 
 export const CONFIG_BOUNDS = {
-  enterBufferSec: { min: 2, max: 10 },
-  safelightSec: { min: 0, max: 10 },
-  exposureSec: { min: 8, max: 30 },
-  maxDevelopSec: { min: 15, max: 45 },
+  observeSec: { min: 3, max: 20 },
+  exposeSec: { min: 10, max: 60 },
+  developSec: { min: 10, max: 45 },
   revealSec: { min: 6, max: 25 },
   noiseFloor: { min: 0.0, max: 0.5 },
   devSpeed: { min: 0.03, max: 0.8 },
-  pastOpacity: { min: 0.15, max: 0.85 },
+  easelMargin: { min: 0, max: 30 },
+  diffSensitivity: { min: 0.05, max: 0.35 },
 } as const;
 
 export const DEFAULT_CONFIG: AppConfig = {
-  enterBufferSec: 5,
-  safelightSec: 5,
-  exposureSec: 15,
-  maxDevelopSec: 25,
+  observeSec: 8,
+  exposeSec: 30,
+  developSec: 25,
   revealSec: 12,
   noiseFloor: 0.08,
   devSpeed: 0.2,
-  pastOpacity: 0.48,
-  printMode: 'photogram_negative',
+  easelMargin: 6,
+  diffSensitivity: 0.12,
+  mouseSimulator: false,
+  sampleFallback: 0,
   rollNumber: 1,
 };
-
-export interface ForecastInfo {
-  has: boolean;
-  version: number;
-  targetFrameNo: string; // e.g. "01A"
-  url: string | null;
-  collapseZone?: CollapseZone | null;
-}
 
 export interface RoundInfo {
   id: number;
   rollNumber: number;
-  frameNumber: number; // 当前卷内的底片序号（0 → 00A 种子轮，1 → 01A...）
-  printMode: PrintMode;
-  devProgress: number; // 初始 0.0，无上限，可超过 1.5
-  finalDevProgress: number | null; // 进入 LIGHT_LEAK / FIXED_REVEAL 时锁死
+  frameNumber: number; // 1 -> 01A, 2 -> 02A...
+  sourceUrl: string | null; // uploaded photo URL or null (sample fallback)
+  sampleIndex: number; // 0 = uploaded, 1..3 = built-in sample, 4 = prev print
+  devProgress: number;
+  finalDevProgress: number | null;
   fixTriggeredBy: 'station2' | 'timeout' | 'admin' | null;
   outcome: ChemicalOutcome | null;
-  deviationPct: number | null;
   hasFreeze: boolean;
-  predictedUrl: string | null; // 本轮开始前锁定的预测未来图 URL
-  collapseZone: CollapseZone | null; // 本轮开始前锁定的坍缩区
   trigger: string | null;
 }
 
@@ -110,42 +107,36 @@ export interface DoorPhotoInfo {
 }
 
 export interface ContactFrame {
-  frameNo: string; // "00A", "01A", "02A"...
-  index: number; // 0, 1, 2...
+  frameNo: string; // "01A", "02A"...
+  index: number; // 1, 2...
   url: string;
   timestamp: number;
   name: string;
   devPercent?: number;
   outcome?: ChemicalOutcome | null;
-  outcomeCode?: string; // "BASE" | "FIXED" | "BURNED" | "UNDER" | "LEAK"
-}
-
-export interface PersistedState {
-  rollNumber: number;
-  frames: ContactFrame[];
-  hasBase: boolean;
-  baseFrameUrl: string | null;
-  baseCapturedAt: number | null;
-  latestFrameUrl: string | null;
-  prevFrameUrl: string | null;
-  forecastUrl: string | null;
-  collapseZone: CollapseZone | null;
-  hasGhostSequence: boolean;
-  ghostUpdatedAt: number | null;
-}
-
-export interface StorageStats {
-  totalBytes: number;
-  rollsCount: number;
-  framesCount: number;
-  hasGhostSequence: boolean;
+  outcomeCode?: string; // "FIXED" | "BURNED" | "UNDER" | "LEAK"
 }
 
 export interface ContactSheetInfo {
   rollNumber: number;
   totalInRoll: number;
   frames: ContactFrame[];
-  forecast?: ForecastInfo;
+}
+
+export interface PersistedState {
+  rollNumber: number;
+  frames: ContactFrame[];
+  latestFrameUrl: string | null;
+  hasQueuedPhoto: boolean;
+  queuedPhotoUrl: string | null;
+  queuedAt: number | null;
+}
+
+export interface StorageStats {
+  totalBytes: number;
+  rollsCount: number;
+  framesCount: number;
+  queueCount: number;
 }
 
 export interface ClientStatus {
@@ -161,12 +152,11 @@ export type ServerMsg =
       type: 'state';
       state: Phase;
       phaseStartedAt: number;
-      phaseDurationMs: number; // 0 = 无限（IDLE）
+      phaseDurationMs: number;
       serverTime: number;
       timeScale: number;
       round: RoundInfo;
       doorPhoto: DoorPhotoInfo;
-      forecast: ForecastInfo;
     }
   | {
       type: 'dev';
@@ -177,16 +167,18 @@ export type ServerMsg =
     }
   | { type: 'time'; clientTime: number; serverTime: number }
   | { type: 'config'; config: AppConfig }
+  | { type: 'calibration'; calibration: CalibrationData }
+  | { type: 'REQUEST_SNAPSHOT' }
+  | { type: 'SNAPSHOT_READY'; imageData: string; ts: number }
   | { type: 'door-photo'; photo: DoorPhotoInfo; serverTime: number }
   | { type: 'contact-sheet'; sheet: ContactSheetInfo; serverTime: number }
   | { type: 'STATE_SYNC'; persisted: PersistedState; storage: StorageStats; serverTime: number }
-  | { type: 'FLASH_PULSE'; durationMs: number; ts: number } // 全端同步测试白闪（独立于状态机）
+  | { type: 'FLASH_PULSE'; durationMs: number; ts: number }
   | { type: 'clients'; clients: ClientStatus[]; serverTime: number }
   | { type: 'ack'; what: string; ok: boolean; message?: string }
   | { type: 'error'; message: string };
 
 // ---------------- 客户端 → 服务端 ----------------
-/** 状态机只能由 admin 端发送 START_SESSION 启动 */
 export type AdminAction = 'reset' | 'skipPhase' | 'newRoll' | 'resetDoor' | 'testFlash' | 'testDevelop' | 'setConfig';
 
 export type ClientMsg =
@@ -194,17 +186,14 @@ export type ClientMsg =
   | { type: 'time'; clientTime: number }
   | { type: 'hb' }
   | { type: 'START_SESSION'; token?: string }
-  | { type: 'CAPTURE_BASE'; token?: string }
+  | { type: 'ENTER_CALIBRATION'; token?: string }
+  | { type: 'EXIT_CALIBRATION'; token?: string }
+  | { type: 'REQUEST_SNAPSHOT'; token?: string }
+  | { type: 'SNAPSHOT_DATA'; imageData: string }
   | { type: 'TEST_FLASH'; token?: string }
   | { type: 'AUDIO_ENERGY'; level: number }
   | { type: 'TRIGGER_FIX' }
-  | {
-      type: 'freeze';
-      data: string;
-      forecastData?: string;
-      collapseZone?: CollapseZone | null;
-      deviationPct?: number | null;
-    }
+  | { type: 'freeze'; data: string }
   | { type: 'admin'; action: AdminAction; config?: Partial<AppConfig>; token?: string };
 
 export function outcomeShortCode(o?: ChemicalOutcome | null): string {

@@ -1,8 +1,10 @@
 import type {
   AppConfig,
+  CalibrationData,
   ClientMsg,
   ContactSheetInfo,
   DoorPhotoInfo,
+  PersistedState,
   Phase,
   Role,
   RoundInfo,
@@ -35,6 +37,8 @@ export class Net {
   connected = false;
   state: StateMsg | null = null;
   config: AppConfig | null = null;
+  calibration: CalibrationData | null = null;
+  persisted: PersistedState | null = null;
   doorPhoto: DoorPhotoInfo | null = null;
   contactSheet: ContactSheetInfo | null = null;
   lastDev: DevMsg | null = null;
@@ -203,6 +207,12 @@ export class Net {
         break;
       case 'config':
         this.config = msg.config;
+        break;
+      case 'calibration':
+        this.calibration = msg.calibration;
+        break;
+      case 'STATE_SYNC':
+        this.persisted = msg.persisted;
         break;
       case 'door-photo':
         this.doorPhoto = msg.photo;
