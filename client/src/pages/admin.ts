@@ -7,7 +7,7 @@
  *   marking 85–100% golden zone & >100% burn zone), Noise Floor & Develop Speed sliders, Photogram Negative vs Positive toggle
  * - New Roll (2-tap, keeps ./data/archive/ intact), 5 phase duration steppers, device heartbeat lamps & roll archive
  */
-import { Net } from '../lib/net';
+import { Net, mountFlashOverlay } from '../lib/net';
 import type { ContactSheetInfo, PrintMode, Role } from '../../../shared/protocol';
 import { CONFIG_BOUNDS, outcomeShortCode } from '../../../shared/protocol';
 import { TITLE_EN } from '../lib/brand';
@@ -219,6 +219,7 @@ export default function admin(app: HTMLElement): void {
 
   const net = new Net('admin', token);
   (window as any).__net = net;
+  mountFlashOverlay(net);
 
   let toastTimer = 0;
   const toast = (text: string) => {
@@ -257,7 +258,7 @@ export default function admin(app: HTMLElement): void {
     net.send({ type: 'admin', action: 'skipPhase', token });
   });
 
-  testFlashBtn.addEventListener('click', () => net.send({ type: 'admin', action: 'testFlash', token }));
+  testFlashBtn.addEventListener('click', () => net.send({ type: 'TEST_FLASH', token }));
 
   // ---------------- two-tap RESET TO IDLE ----------------
   let resetTimer = 0;

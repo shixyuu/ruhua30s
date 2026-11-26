@@ -78,6 +78,14 @@ async function main() {
     ok(ack.ok === false, `${c.role} 的 START_SESSION 被拒绝（${ack.message}）`);
   }
 
+  // ---- 1b. TEST_FLASH 必须同步广播 FLASH_PULSE 给所有已连接客户端，且不改变 IDLE 状态 ----
+  for (const c of [admin, door, s1, s2, mainC]) c.clear();
+  admin.send({ type: 'TEST_FLASH', token: TOKEN });
+  const pulses = await Promise.all(
+    [admin, door, s1, s2, mainC].map((c) => c.wait((m) => m.type === 'FLASH_PULSE', 3000, `${c.role} FLASH_PULSE`)),
+  );
+  ok(pulses.every((p) => p.durationMs === 260), 'TEST_FLASH 向全部 5 个终端同步广播 FLASH_PULSE');
+
   // ---- 2. 配置限幅与持久化 ----
   admin.clear();
   admin.send({

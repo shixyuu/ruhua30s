@@ -218,7 +218,43 @@ export class Net {
   }
 }
 
-/** connection dot in the corner (turns safelight red when offline) */
+let sharedFlashEl: HTMLDivElement | null = null;
+let flashHoldTimer = 0;
+
+/** Trigger crisp full-screen white flash (instant 1.0 -> hold ~100ms -> 220ms smooth decay) */
+export function triggerFlashPulse(peakOpacity = 1, holdMs = 100, decayMs = 220): void {
+  if (!sharedFlashEl) {
+    sharedFlashEl = document.createElement('div');
+    sharedFlashEl.className = 'flash-pulse';
+    document.body.appendChild(sharedFlashEl);
+  }
+  const el = sharedFlashEl;
+  clearTimeout(flashHoldTimer);
+  el.style.transition = 'none';
+  el.style.opacity = '0';
+  void el.offsetWidth; // force reflow so repeated clicks always re-trigger
+  el.style.opacity = String(peakOpacity);
+  flashHoldTimer = window.setTimeout(() => {
+    el.style.transition = `opacity ${decayMs}ms ease-out`;
+    el.style.opacity = '0';
+  }, holdMs);
+}
+
+/** Shared Flash Overlay mounted across all screens (/main, /door, /station1, /station2, /admin) */
+export function mountFlashOverlay(net: Net): void {
+  if (!sharedFlashEl) {
+    sharedFlashEl = document.createElement('div');
+    sharedFlashEl.className = 'flash-pulse';
+    document.body.appendChild(sharedFlashEl);
+  }
+  net.on('FLASH_PULSE', (m) => {
+    const hold = Math.max(60, Math.min(140, Math.round(m.durationMs * 0.38)));
+    const decay = Math.max(140, m.durationMs - hold);
+    triggerFlashPulse(1, hold, decay);
+  });
+}
+
+/** connection dot in the corner (turns safelight red when offline) + shared flash overlay */
 export function mountNetDot(net: Net): void {
   const dot = document.createElement('div');
   dot.className = 'net-dot';
@@ -227,4 +263,5 @@ export function mountNetDot(net: Net): void {
   net.on('open', upd);
   net.on('close', upd);
   upd();
+  mountFlashOverlay(net);
 }

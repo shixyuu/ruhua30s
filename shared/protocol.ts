@@ -157,7 +157,7 @@ export type ServerMsg =
   | { type: 'config'; config: AppConfig }
   | { type: 'door-photo'; photo: DoorPhotoInfo; serverTime: number }
   | { type: 'contact-sheet'; sheet: ContactSheetInfo; serverTime: number }
-  | { type: 'flash'; serverTime: number } // 测试闪白（仅发往 /main）
+  | { type: 'FLASH_PULSE'; durationMs: number; ts: number } // 全端同步测试白闪（独立于状态机）
   | { type: 'clients'; clients: ClientStatus[]; serverTime: number }
   | { type: 'ack'; what: string; ok: boolean; message?: string }
   | { type: 'error'; message: string };
@@ -171,6 +171,7 @@ export type ClientMsg =
   | { type: 'time'; clientTime: number }
   | { type: 'hb' }
   | { type: 'START_SESSION'; token?: string }
+  | { type: 'TEST_FLASH'; token?: string }
   | { type: 'AUDIO_ENERGY'; level: number }
   | { type: 'TRIGGER_FIX' }
   | {

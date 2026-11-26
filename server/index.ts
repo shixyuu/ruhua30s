@@ -343,6 +343,13 @@ function handleMessage(ws: WebSocket, peer: Peer, msg: ClientMsg): void {
           : `Current state is ${state}; can only start from IDLE`,
       });
     }
+    case 'TEST_FLASH': {
+      if (peer.role !== 'admin' || !(peer.isAdmin || (ADMIN_TOKEN && msg.token === ADMIN_TOKEN))) {
+        return send(ws, { type: 'ack', what: 'TEST_FLASH', ok: false, message: 'Not authorised (ADMIN_TOKEN)' });
+      }
+      broadcast({ type: 'FLASH_PULSE', durationMs: 260, ts: Date.now() });
+      return send(ws, { type: 'ack', what: 'TEST_FLASH', ok: true, message: 'Flash pulse sent to all screens' });
+    }
     case 'AUDIO_ENERGY':
       if (peer.role !== 'station1') return;
       return onAudioEnergy(msg.level);
@@ -699,8 +706,8 @@ async function onAdmin(ws: WebSocket, action: string, cfg?: Partial<AppConfig>):
     }
 
     case 'testFlash':
-      broadcast({ type: 'flash', serverTime: Date.now() }, (p) => p.role === 'main');
-      return send(ws, { type: 'ack', what: 'testFlash', ok: true, message: 'Test flash sent to main screen' });
+      broadcast({ type: 'FLASH_PULSE', durationMs: 260, ts: Date.now() });
+      return send(ws, { type: 'ack', what: 'testFlash', ok: true, message: 'Flash pulse sent to all screens' });
 
     case 'testDevelop':
       if (state !== 'DEVELOPING') {

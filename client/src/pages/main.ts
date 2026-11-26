@@ -1,14 +1,10 @@
 /**
  * /main — Mac + projector + wide-angle USB camera (v3 Live Darkroom & Temporal Extrapolation Engine)
- * - Zero pre-recorded video files, zero AI/CV libs: 100% live Canvas arithmetic.
- * - ENTER_BUFFER: deep safelight red + large countdown
- * - SAFELIGHT_COMPOSE: #9A0A0A safelight + deep-red FORECAST ghost + red crayon collapseZone + bottom viewfinder bar
- * - EXPOSURE: #F6F2E8 beam + Recursive Past overlay + MediaRecorder local capture + 18 FPS sampler + bottom 15s bar
- * - DEVELOPING: chemical bath sound + live developing print + auto-fading arrow guide (<0.25) + last-5s tick
- * - LIGHT_LEAK: 2.2s left->right blinding white sweep & silver-halide fog collapse when timeout with dev >= 0.20
- * - FIXED_REVEAL: 4 chemical outcomes, side-by-side PREDICTED vs ACTUAL + TIMELINE DEVIATION %, Instax JPEG + next forecast upload
+ * - 92%+ pure darkroom optical imagery; zero center arrow overlays or corner badges.
+ * - Minimalist single-row bottom darkroom timeline bar (56px, hidden in IDLE) with 4 steps + live action prompt.
+ * - Exported Instax / archive JPEGs render from offscreen exportCanvas and NEVER include the bottom timeline UI.
  */
-import { Net, mountNetDot } from '../lib/net';
+import { Net, mountNetDot, triggerFlashPulse } from '../lib/net';
 import {
   audioCtx,
   devBathAudio,
@@ -31,7 +27,7 @@ import {
 } from '../lib/darkroom';
 import { keepAwake, requestFullscreen, withTimeout } from '../lib/unlock';
 import { TITLE_EN } from '../lib/brand';
-import { outcomeFullLabel } from '../../../shared/protocol';
+import { outcomeFullLabel, outcomeShortCode } from '../../../shared/protocol';
 import type { Phase, PrintMode } from '../../../shared/protocol';
 
 const LS_CAM = 'ruhua.main.camera';
@@ -55,19 +51,15 @@ export default async function mainPage(app: HTMLElement): Promise<void> {
   app.innerHTML = `
     <canvas class="layer" id="fx"></canvas>
     <div class="main-countdown hidden" id="countdownBox"><span id="countdown">5</span></div>
-    <div class="main-viewfinder hidden" id="safelightHud"></div>
-    <div class="main-exp-bar hidden" id="exposureBar">
-      <div class="exp-txt">EXPOSING PAST · BLOCK OR REFRAME WITH BOARDS &amp; FILMS</div>
-      <div class="exp-track"><div class="exp-fill" id="exposureLine"></div></div>
-    </div>
-    <div class="main-dev-guide hidden" id="devGuide">
-      <div>← MAKE NOISE AT LEFT TO DEVELOP</div>
-      <div>PULL RIGHT TO FIX BEFORE IT BURNS →</div>
-    </div>
-    <div class="main-leak-hud hidden" id="leakHud">UNFIXED · LIGHT LEAK — IMAGE DESTROYED</div>
-    <div class="main-corner hidden" id="revealHud"></div>
-    <div class="main-exit" id="exitSign">NEXT FUTURE RECALCULATED · EXIT NORTH ↑</div>
-    <div class="flash" id="flash"></div>
+    <footer class="main-timeline hidden" id="timelineBar" aria-hidden="true">
+      <div class="tl-steps">
+        <div class="tl-seg" id="segCompose"><span>01 COMPOSE</span><div class="tl-fill"></div></div>
+        <div class="tl-seg" id="segExpose"><span>02 EXPOSE</span><div class="tl-fill" id="expFill"></div></div>
+        <div class="tl-seg" id="segDevelop"><span>03 DEVELOP</span><div class="tl-fill" id="devFill"></div></div>
+        <div class="tl-seg" id="segFixed"><span>04 FIXED</span><div class="tl-fill"></div></div>
+      </div>
+      <div class="tl-prompt" id="tlPrompt">STEP INTO POSITION</div>
+    </footer>
     <video id="cam" class="hidden" muted playsinline autoplay></video>
     <video id="pastVid" class="hidden" muted playsinline></video>`;
 
@@ -76,14 +68,14 @@ export default async function mainPage(app: HTMLElement): Promise<void> {
   const g = setupCanvas(fx);
   const countdownBox = $<HTMLDivElement>('#countdownBox');
   const countdown = $<HTMLSpanElement>('#countdown');
-  const safelightHud = $<HTMLDivElement>('#safelightHud');
-  const exposureBar = $<HTMLDivElement>('#exposureBar');
-  const exposureLine = $<HTMLDivElement>('#exposureLine');
-  const devGuide = $<HTMLDivElement>('#devGuide');
-  const leakHud = $<HTMLDivElement>('#leakHud');
-  const revealHud = $<HTMLDivElement>('#revealHud');
-  const exitSign = $<HTMLDivElement>('#exitSign');
-  const flashEl = $<HTMLDivElement>('#flash');
+  const timelineBar = $<HTMLElement>('#timelineBar');
+  const segCompose = $<HTMLDivElement>('#segCompose');
+  const segExpose = $<HTMLDivElement>('#segExpose');
+  const segDevelop = $<HTMLDivElement>('#segDevelop');
+  const segFixed = $<HTMLDivElement>('#segFixed');
+  const expFill = $<HTMLDivElement>('#expFill');
+  const devFill = $<HTMLDivElement>('#devFill');
+  const tlPrompt = $<HTMLDivElement>('#tlPrompt');
   const camV = $<HTMLVideoElement>('#cam');
   const pastVid = $<HTMLVideoElement>('#pastVid');
 
@@ -217,20 +209,13 @@ export default async function mainPage(app: HTMLElement): Promise<void> {
     }
   }
 
-  // ====================================================================
-  // gentle flash
-  // ====================================================================
-  function flash(ms = 120, peakOpacity = 0.45): void {
-    flashEl.style.opacity = String(peakOpacity);
-    flashEl.classList.add('on');
-    window.setTimeout(() => {
-      flashEl.classList.remove('on');
-      flashEl.style.opacity = '';
-    }, ms);
-  }
-  net.on('flash', () => {
-    shutter();
-    flash(150, 0.85);
+  // Test flash audio sync (shared flash overlay itself is mounted by mountNetDot)
+  net.on('FLASH_PULSE', () => {
+    try {
+      shutter();
+    } catch {
+      /* ignore if audio locked */
+    }
   });
 
   // ====================================================================
@@ -277,14 +262,19 @@ export default async function mainPage(app: HTMLElement): Promise<void> {
   let curPhase: Phase | null = null;
   let curRound = -1;
 
-  function hideOverlays(): void {
-    countdownBox.classList.add('hidden');
-    safelightHud.classList.add('hidden');
-    exposureBar.classList.add('hidden');
-    devGuide.classList.add('hidden');
-    leakHud.classList.add('hidden');
-    revealHud.classList.add('hidden');
-    exitSign.classList.remove('show');
+  function setActiveSegment(seg: HTMLDivElement | null, stateCls = ''): void {
+    for (const s of [segCompose, segExpose, segDevelop, segFixed]) {
+      s.classList.remove('active', 'done', 'gold', 'burn');
+    }
+    const order = [segCompose, segExpose, segDevelop, segFixed];
+    const idx = seg ? order.indexOf(seg) : -1;
+    order.forEach((s, i) => {
+      if (idx > i) s.classList.add('done');
+      if (idx === i) {
+        s.classList.add('active');
+        if (stateCls) s.classList.add(stateCls);
+      }
+    });
   }
 
   async function onPhase(phase: Phase, fresh: boolean, prevPhase: Phase | null): Promise<void> {
@@ -292,7 +282,7 @@ export default async function mainPage(app: HTMLElement): Promise<void> {
     const roundId = st.round.id;
     const isSeed = st.round.frameNumber === 0;
     activePrintMode = st.round.printMode ?? net.config?.printMode ?? 'photogram_negative';
-    hideOverlays();
+    countdownBox.classList.add('hidden');
     stopSampler();
     devWarnTickStarted = false;
     if (phase !== 'EXPOSURE') {
@@ -303,6 +293,7 @@ export default async function mainPage(app: HTMLElement): Promise<void> {
     switch (phase) {
       case 'IDLE':
         stopAllLoops();
+        timelineBar.classList.add('hidden');
         break;
 
       case 'ENTER_BUFFER':
@@ -316,6 +307,7 @@ export default async function mainPage(app: HTMLElement): Promise<void> {
           safelightForecastImg = null;
           predictedRevealImg = null;
         }
+        timelineBar.classList.add('hidden');
         countdownBox.classList.remove('hidden');
         await ensureCamera();
         break;
@@ -330,10 +322,10 @@ export default async function mainPage(app: HTMLElement): Promise<void> {
           safelightForecastImg = null;
           predictedRevealImg = null;
         }
-        safelightHud.textContent = isSeed
-          ? 'SEED EXPOSURE 00A · ESTABLISH BASELINE'
-          : `PREDICTED FUTURE ${pad2(st.round.frameNumber)}A · STEP IN TO ALTER IT`;
-        safelightHud.classList.remove('hidden');
+        timelineBar.classList.remove('hidden');
+        setActiveSegment(segCompose);
+        tlPrompt.className = 'tl-prompt';
+        tlPrompt.textContent = isSeed ? 'SEED 00A · STEP INTO POSITION' : 'STEP INTO POSITION';
         await ensureCamera();
         break;
 
@@ -341,7 +333,10 @@ export default async function mainPage(app: HTMLElement): Promise<void> {
         stopAllLoops();
         if (fresh) relayClick(true);
         enlargerTimer.start(0.85, 0.1, 1.0);
-        exposureBar.classList.remove('hidden');
+        timelineBar.classList.remove('hidden');
+        setActiveSegment(segExpose);
+        tlPrompt.className = 'tl-prompt';
+        tlPrompt.textContent = 'ALTER FRAME WITH BOARDS & FILMS';
         if (!isSeed && lastRoundVideoUrl) {
           pastVid.src = lastRoundVideoUrl;
           pastVid.currentTime = 0;
@@ -359,8 +354,7 @@ export default async function mainPage(app: HTMLElement): Promise<void> {
         if (fresh) relayClick(false);
         engine.finalizeLatent();
         liveDevProgress = st.round.devProgress ?? 0;
-        devGuide.classList.remove('hidden');
-        devGuide.style.opacity = '1';
+        timelineBar.classList.remove('hidden');
         devBathAudio.start();
         devBathAudio.update(liveDevProgress);
         break;
@@ -370,7 +364,10 @@ export default async function mainPage(app: HTMLElement): Promise<void> {
         engine.finalizeLatent();
         frozenDevProgress = st.round.finalDevProgress ?? st.round.devProgress ?? liveDevProgress;
         if (fresh) lightLeakBurst();
-        leakHud.classList.remove('hidden');
+        timelineBar.classList.remove('hidden');
+        setActiveSegment(segDevelop, 'burn');
+        tlPrompt.className = 'tl-prompt burn';
+        tlPrompt.textContent = 'UNFIXED · LIGHT LEAK — IMAGE DESTROYED';
         break;
 
       case 'FIXED_REVEAL': {
@@ -382,10 +379,10 @@ export default async function mainPage(app: HTMLElement): Promise<void> {
         if (fresh && !isLeak) {
           if (outcome === 'FIXED_OPTIMAL') {
             shutter();
-            flash(120, 0.45);
+            triggerFlashPulse(0.45, 70, 120);
           } else {
             stopBathThud();
-            flash(90, 0.22);
+            triggerFlashPulse(0.22, 50, 90);
           }
         }
         const jpegData = engine.exportCleanJpeg(frozenDevProgress, activePrintMode, isLeak);
@@ -404,10 +401,12 @@ export default async function mainPage(app: HTMLElement): Promise<void> {
             deviationPct: frozenDeviationPct,
           });
         }
-        if (isSeed) {
-          revealHud.textContent = 'SEED ARCHIVE 00A · BASELINE ESTABLISHED';
-          revealHud.classList.remove('hidden');
-        }
+        timelineBar.classList.remove('hidden');
+        setActiveSegment(segFixed);
+        tlPrompt.className = 'tl-prompt';
+        tlPrompt.textContent = isSeed
+          ? 'SEED 00A BASELINE ESTABLISHED · EXIT NORTH ↑'
+          : `${outcomeShortCode(outcome)} · EXPOSURE LOCKED · EXIT NORTH ↑`;
         break;
       }
     }
@@ -469,20 +468,39 @@ export default async function mainPage(app: HTMLElement): Promise<void> {
         const pastOpacity = net.config?.pastOpacity ?? 0.48;
         drawExposureBeam(g, !isSeed && lastRoundVideoUrl ? pastVid : null, pastOpacity);
         const total = Math.max(1, net.config?.exposureSec ?? 15);
-        const remFrac = Math.max(0, Math.min(1, 1 - net.storySec() / total));
-        exposureLine.style.width = `${(remFrac * 100).toFixed(2)}%`;
+        const frac = Math.max(0, Math.min(1, net.storySec() / total));
+        expFill.style.width = `${(frac * 100).toFixed(1)}%`;
         break;
       }
 
       case 'DEVELOPING': {
         engine.renderPrint(g, g.canvas.width, g.canvas.height, liveDevProgress, activePrintMode, 0.93);
-        const guideAlpha =
-          liveDevProgress <= 0.1 ? 1 : liveDevProgress >= 0.25 ? 0 : (0.25 - liveDevProgress) / 0.15;
-        devGuide.style.opacity = guideAlpha.toFixed(3);
-        devGuide.classList.toggle('hidden', guideAlpha <= 0.01);
+        const remainSec = Math.max(0, net.remainingMs() / 1000 / net.timeScale);
+        devFill.style.width = `${Math.min(100, (liveDevProgress / 1.2) * 100).toFixed(1)}%`;
 
-        const remainStorySec = net.remainingMs() / 1000 / net.timeScale;
-        if (!devWarnTickStarted && remainStorySec > 0 && remainStorySec <= 5.0) {
+        if (remainSec > 0 && remainSec <= 6) {
+          setActiveSegment(segDevelop, 'burn');
+          tlPrompt.className = 'tl-prompt burn';
+          tlPrompt.textContent = `LIGHT LEAK IN ${Math.ceil(remainSec)}s — PULL FIX NOW →`;
+        } else if (liveDevProgress > 1.0) {
+          setActiveSegment(segDevelop, 'burn');
+          tlPrompt.className = 'tl-prompt burn';
+          tlPrompt.textContent = 'BURNING — PULL FIX NOW →';
+        } else if (liveDevProgress >= 0.72) {
+          setActiveSegment(segDevelop, 'gold');
+          tlPrompt.className = 'tl-prompt gold';
+          tlPrompt.textContent = 'OPTIMAL — PULL FIX AT RIGHT NOW →';
+        } else if (liveDevProgress >= 0.25) {
+          setActiveSegment(segDevelop);
+          tlPrompt.className = 'tl-prompt';
+          tlPrompt.textContent = 'KEEP DEVELOPING · PREPARE RIGHT LEVER';
+        } else {
+          setActiveSegment(segDevelop);
+          tlPrompt.className = 'tl-prompt';
+          tlPrompt.textContent = 'MAKE NOISE AT LEFT TO DEVELOP';
+        }
+
+        if (!devWarnTickStarted && remainSec > 0 && remainSec <= 5.0) {
           devWarnTickStarted = true;
           enlargerTimer.start(0.32, 0.06, 0.5);
         }
@@ -511,8 +529,6 @@ export default async function mainPage(app: HTMLElement): Promise<void> {
             outcome === 'UNDERDEVELOPED_TRACE_LOST',
           );
         }
-        const remainStorySec = net.remainingMs() / 1000 / net.timeScale;
-        exitSign.classList.toggle('show', remainStorySec <= 4.0);
         break;
       }
     }
