@@ -28,6 +28,20 @@ export interface Point2D {
   y: number; // normalized 0..1
 }
 
+/** Live detection telemetry streamed /main -> /admin while the admin DETECT VIEW is on */
+export interface DetectStatsMsg {
+  phase: string;
+  camLive: boolean;
+  hasRef: boolean;
+  refKind: 'round' | 'preview';
+  activePct: number;
+  photoActivePct: number;
+  threshold: number;
+  minAreaPct: number;
+  triggered: boolean;
+  aeScale: number;
+}
+
 export interface CalibrationData {
   /** 4 corners in camera snapshot normalized coords: [TL, TR, BR, BL] */
   corners: [Point2D, Point2D, Point2D, Point2D] | null;
@@ -53,6 +67,12 @@ export interface AppConfig {
   easelMargin: number;
   /** 摄像头遮挡差分阈值（0.02–0.50，默认 0.12；越低越灵敏） */
   diffSensitivity: number;
+  /** Detection noise filter: box-blur radius on the diff map, grid px (0–4, default 0 = off) */
+  detectBlur: number;
+  /** Detection min area: ignore frames with less than this % of the grid changed (0–10, default 0) */
+  detectMinArea: number;
+  /** Seconds of continuous blocking to reach full dodge (5–40, default 18) */
+  fullDodgeSec: number;
   /** 在家无摄像头鼠标涂抹减光模拟开关 */
   mouseSimulator: boolean;
   /** 免扫码兜底：使用内置高反差测试图（0=关闭, 1..3=内置样张, 4=上一轮成品） */
@@ -70,6 +90,9 @@ export const CONFIG_BOUNDS = {
   devSpeed: { min: 0.03, max: 0.8 },
   easelMargin: { min: 0, max: 30 },
   diffSensitivity: { min: 0.02, max: 0.5 },
+  detectBlur: { min: 0, max: 4 },
+  detectMinArea: { min: 0, max: 10 },
+  fullDodgeSec: { min: 5, max: 40 },
 } as const;
 
 export const DEFAULT_CONFIG: AppConfig = {
@@ -81,6 +104,9 @@ export const DEFAULT_CONFIG: AppConfig = {
   devSpeed: 0.2,
   easelMargin: 6,
   diffSensitivity: 0.12,
+  detectBlur: 0,
+  detectMinArea: 0,
+  fullDodgeSec: 18,
   mouseSimulator: false,
   sampleFallback: 0,
   rollNumber: 1,
@@ -170,6 +196,8 @@ export type ServerMsg =
   | { type: 'calibration'; calibration: CalibrationData }
   | { type: 'REQUEST_SNAPSHOT' }
   | { type: 'SNAPSHOT_READY'; imageData: string; ts: number }
+  | { type: 'DETECT_VIEW'; on: boolean; reref?: boolean }
+  | { type: 'DETECT_FRAME'; imageData: string; stats: DetectStatsMsg; ts: number }
   | { type: 'door-photo'; photo: DoorPhotoInfo; serverTime: number }
   | { type: 'contact-sheet'; sheet: ContactSheetInfo; serverTime: number }
   | { type: 'STATE_SYNC'; persisted: PersistedState; storage: StorageStats; serverTime: number }
@@ -190,6 +218,8 @@ export type ClientMsg =
   | { type: 'EXIT_CALIBRATION'; token?: string }
   | { type: 'REQUEST_SNAPSHOT'; token?: string }
   | { type: 'SNAPSHOT_DATA'; imageData: string }
+  | { type: 'DETECT_VIEW'; on: boolean; reref?: boolean; token?: string }
+  | { type: 'DETECT_FRAME'; imageData: string; stats: DetectStatsMsg }
   | { type: 'TEST_FLASH'; token?: string }
   | { type: 'AUDIO_ENERGY'; level: number }
   | { type: 'TRIGGER_FIX' }

@@ -111,6 +111,15 @@ export function sanitizeConfig(input: Partial<AppConfig> | undefined, base: AppC
         base.diffSensitivity,
       ),
     ),
+    detectBlur: Math.round(
+      clamp(src.detectBlur ?? base.detectBlur, CONFIG_BOUNDS.detectBlur.min, CONFIG_BOUNDS.detectBlur.max, base.detectBlur),
+    ),
+    detectMinArea: round1(
+      clamp(src.detectMinArea ?? base.detectMinArea, CONFIG_BOUNDS.detectMinArea.min, CONFIG_BOUNDS.detectMinArea.max, base.detectMinArea),
+    ),
+    fullDodgeSec: round1(
+      clamp(src.fullDodgeSec ?? base.fullDodgeSec, CONFIG_BOUNDS.fullDodgeSec.min, CONFIG_BOUNDS.fullDodgeSec.max, base.fullDodgeSec),
+    ),
     mouseSimulator: typeof src.mouseSimulator === 'boolean' ? src.mouseSimulator : base.mouseSimulator,
     sampleFallback: (() => {
       const s = typeof src.sampleFallback === 'number' ? src.sampleFallback : Number(src.sampleFallback);

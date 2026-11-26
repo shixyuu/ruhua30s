@@ -27,6 +27,7 @@ import {
   drawCalibrationTarget,
   drawIdleDarkroom,
   setupCanvas,
+  type DetectOptions,
 } from '../lib/darkroom';
 import { keepAwake, requestFullscreen, withTimeout } from '../lib/unlock';
 import { TITLE_EN } from '../lib/brand';
@@ -37,6 +38,8 @@ const LS_CAM = 'ruhua.main.camera';
 const LS_SINK = 'ruhua.main.sink';
 const EXPOSE_SAMPLE_MS = 140; // ~7 FPS camera dodge integration
 const CLEAN_SAMPLE_MS = 150;
+const CLEAN_SETTLE_MS = 300; // ignore camera frames right after the projection changes
+const DETECT_VIEW_MS = 400; // admin detect view stream (~2.5 fps)
 
 export default async function mainPage(app: HTMLElement): Promise<void> {
   document.title = `Enlarger Projector · ${TITLE_EN}`;
@@ -183,11 +186,25 @@ export default async function mainPage(app: HTMLElement): Promise<void> {
     }
   }
 
+  function detectOpts(): DetectOptions {
+    const c = net.config;
+    return {
+      threshold: c?.diffSensitivity ?? 0.12,
+      blur: c?.detectBlur ?? 0,
+      minAreaPct: c?.detectMinArea ?? 0,
+      fullDodgeSec: c?.fullDodgeSec ?? 18,
+      marginPct: c?.easelMargin ?? 6,
+    };
+  }
+
   function startCleanSampler(): void {
     stopSampler();
     if (net.config?.mouseSimulator) return;
+    const t0 = performance.now();
     const run = () => {
       if (net.phase !== 'CAPTURE_CLEAN') return stopSampler();
+      // Let the camera settle (latency / auto-exposure after the projection switches to the photo)
+      if (performance.now() - t0 < CLEAN_SETTLE_MS) return;
       engine.sampleCleanFrame(camLive() ? camV : null, net.calibration?.hInv ?? null);
     };
     run();
@@ -198,8 +215,14 @@ export default async function mainPage(app: HTMLElement): Promise<void> {
     stopSampler();
     if (net.config?.mouseSimulator) return;
     lastSampleAt = performance.now();
+    const t0 = performance.now();
     const run = () => {
       if (net.phase !== 'EXPOSE') return stopSampler();
+      // No clean plate yet (camera was late): wait for the projection to settle before bootstrapping one
+      if (!engine.hasCleanPlate() && performance.now() - t0 < CLEAN_SETTLE_MS) {
+        lastSampleAt = performance.now();
+        return;
+      }
       const now = performance.now();
       const dtSec = Math.max(0.05, (now - lastSampleAt) / 1000 / net.timeScale);
       lastSampleAt = now;
@@ -207,7 +230,7 @@ export default async function mainPage(app: HTMLElement): Promise<void> {
         camLive() ? camV : null,
         dtSec,
         net.calibration?.hInv ?? null,
-        net.config?.diffSensitivity ?? 0.12,
+        detectOpts(),
       );
     };
     sampleTimer = window.setInterval(run, EXPOSE_SAMPLE_MS);
@@ -255,6 +278,7 @@ export default async function mainPage(app: HTMLElement): Promise<void> {
         stopAllLoops();
         timelineBar.classList.add('hidden');
         if (phase === 'CALIBRATING') await ensureCamera();
+        else if (!net.config?.mouseSimulator) void ensureCamera(); // keep the camera warm so CAPTURE_CLEAN gets real frames
         break;
 
       case 'CAPTURE_CLEAN':
@@ -350,12 +374,52 @@ export default async function mainPage(app: HTMLElement): Promise<void> {
   });
 
   // ====================================================================
+  // admin DETECT VIEW: stream a low-fps debug frame + stats to /admin
+  // ====================================================================
+  const detectCanvas = document.createElement('canvas');
+  let detectTimer: number | null = null;
+  let detectPhase: Phase | null = null;
+  function stopDetectView(): void {
+    if (detectTimer !== null) clearInterval(detectTimer);
+    detectTimer = null;
+  }
+  function startDetectView(): void {
+    stopDetectView();
+    engine.resetPreviewRef();
+    void ensureCamera();
+    detectTimer = window.setInterval(() => {
+      const phase = net.phase ?? 'IDLE';
+      if (phase !== detectPhase) {
+        detectPhase = phase;
+        engine.resetPreviewRef(); // projection changed: new preview reference
+      }
+      const stats =
+        phase === 'EXPOSE' && !net.config?.mouseSimulator
+          ? engine.getDetectStats()
+          : engine.previewDetect(camLive() ? camV : null, net.calibration?.hInv ?? null, detectOpts(), false);
+      engine.renderDetectView(detectCanvas, net.calibration?.corners ?? null);
+      net.send({
+        type: 'DETECT_FRAME',
+        imageData: detectCanvas.toDataURL('image/jpeg', 0.6),
+        stats: { ...stats, phase },
+      });
+    }, DETECT_VIEW_MS);
+  }
+  net.on('DETECT_VIEW', (m) => {
+    if (!m.on) return stopDetectView();
+    if (m.reref) engine.resetPreviewRef();
+    if (detectTimer === null) startDetectView();
+  });
+  net.on('close', stopDetectView);
+
+  // ====================================================================
   // render loop
   // ====================================================================
   function frame(): void {
     const phase = net.phase;
     const st = net.state;
     const margin = net.config?.easelMargin ?? 6;
+    engine.setEaselMargin(margin);
 
     switch (phase) {
       case 'IDLE':

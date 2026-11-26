@@ -20,6 +20,27 @@ import samplePhoto5 from '../samples/sample-5.jpg';
 import samplePhoto6 from '../samples/sample-6.jpg';
 const SAMPLE_PHOTOS = [samplePhoto1, samplePhoto2, samplePhoto3, samplePhoto4, samplePhoto5, samplePhoto6];
 
+/** Live-tunable camera dodge detection options (from server config) */
+export interface DetectOptions {
+  threshold: number; // per-pixel |diff| threshold (config.diffSensitivity)
+  blur: number; // box-blur radius on the diff map before thresholding (noise/speckle filter), grid px
+  minAreaPct: number; // frame ignored unless >= this % of the grid is active
+  fullDodgeSec: number; // seconds of continuous blocking to reach full dodge
+  marginPct: number; // easel margin (to map the 16:9 calibrated grid onto the photo's own aspect)
+}
+
+export interface DetectStats {
+  camLive: boolean;
+  hasRef: boolean; // a clean/reference plate exists to diff against
+  refKind: 'round' | 'preview';
+  activePct: number; // % of grid pixels above threshold (after blur)
+  photoActivePct: number; // same, restricted to the area the photo actually occupies
+  threshold: number;
+  minAreaPct: number;
+  triggered: boolean;
+  aeScale: number;
+}
+
 export const DISPLAY_W = 1280;
 export const DISPLAY_H = 720;
 const CAM_W = 640;
@@ -159,6 +180,23 @@ export class DarkroomEngine {
   private diffScratch = new Float32Array(Math.ceil(GRID_N / 4));
   private ratioScratch = new Float32Array(Math.ceil(GRID_N / 4));
   private dodgeFinalized = false;
+  private diffBuf = new Float32Array(GRID_N);
+  private diffTmp = new Float32Array(GRID_N);
+  private lastMask = new Uint8Array(GRID_N);
+  private previewRef = new Float32Array(GRID_N);
+  private hasPreviewRef = false;
+  private marginPct = 6;
+  private lastStats: DetectStats = {
+    camLive: false,
+    hasRef: false,
+    refKind: 'round',
+    activePct: 0,
+    photoActivePct: 0,
+    threshold: 0.12,
+    minAreaPct: 0,
+    triggered: false,
+    aeScale: 1,
+  };
 
   constructor() {
     this.origCanvas = document.createElement('canvas');
@@ -290,8 +328,18 @@ export class DarkroomEngine {
     g.drawImage(this.liftedCanvas, rect.x, rect.y, rect.w, rect.h);
   }
 
+  hasCleanPlate(): boolean {
+    return this.cleanCount > 0;
+  }
+
+  /** Easel margin used to map the calibrated 16:9 grid onto the photo (keep in sync with config) */
+  setEaselMargin(marginPct: number): void {
+    this.marginPct = marginPct;
+  }
+
   /** Reset dodge buffers for a new round */
   beginRound(): void {
+    this.lastMask.fill(0);
     this.cleanAccum.fill(0);
     this.cleanCount = 0;
     this.camClean.fill(0.5);
@@ -343,21 +391,27 @@ export class DarkroomEngine {
     for (let i = 0; i < GRID_N; i++) this.camClean[i] = this.cleanAccum[i] * inv;
   }
 
-  /** EXPOSE (30s): anti-AE drift normalization + dodgeMap integration */
-  sampleExposeFrame(videoEl: HTMLVideoElement | null, dtSec: number, hInv: number[] | null, diffSensitivity: number): void {
-    if (this.cleanCount === 0) return;
-    if (!this.sampleCameraToGrid(videoEl, hInv)) return;
+  /** Photo rect inside the calibrated 16:9 grid, in grid px (photo is letterboxed at its own aspect) */
+  private photoGridRect(): { x: number; y: number; w: number; h: number } {
+    const cal = computeEaselRect(DISPLAY_W, DISPLAY_H, this.marginPct, 16, 9);
+    const ph = computeEaselRect(DISPLAY_W, DISPLAY_H, this.marginPct, this.origW, this.origH);
+    const sx = GRID_W / cal.w;
+    const sy = GRID_H / cal.h;
+    return { x: (ph.x - cal.x) * sx, y: (ph.y - cal.y) * sy, w: ph.w * sx, h: ph.h * sy };
+  }
 
-    // 1. Anti-AE drift normalization: median ratio of lowest-20% diff pixels (sampled 1/4 for speed)
+  /** Diff currGray vs ref -> diffBuf (AE-normalized, box-blurred), lastMask + stats */
+  private computeDiff(ref: Float32Array, opts: DetectOptions, refKind: 'round' | 'preview'): DetectStats {
+    this.marginPct = opts.marginPct;
+    // 1. Anti-AE drift normalization: median ratio of lowest-20% diff pixels (sampled for speed)
     let k = 0;
     for (let i = 0; i < GRID_N; i += 4) {
-      const c = this.camClean[i];
+      const c = ref[i];
       const v = this.currGray[i];
       this.diffScratch[k] = Math.abs(v - c);
       this.ratioScratch[k] = c > 0.04 ? v / c : 1.0;
       k++;
     }
-    // Quick partial selection via sorted indices on every 16th pixel (~3600 samples -> <0.3ms)
     const idxList: number[] = [];
     for (let j = 0; j < k; j += 4) idxList.push(j);
     idxList.sort((a, b) => this.diffScratch[a] - this.diffScratch[b]);
@@ -365,23 +419,197 @@ export class DarkroomEngine {
     const ratios = idxList.slice(0, take).map((j) => this.ratioScratch[j]).sort((a, b) => a - b);
     const aeScale = Math.max(0.65, Math.min(1.55, ratios[Math.floor(ratios.length / 2)] || 1.0));
 
-    // 2. Dodge integration
-    const rate = Math.max(0, dtSec) / 18.0; // ~5s -> 0.28, ~18s -> 1.0
+    // 2. Raw diff
+    const d = this.diffBuf;
+    for (let i = 0; i < GRID_N; i++) d[i] = Math.abs(this.currGray[i] / aeScale - ref[i]);
+
+    // 3. Separable box blur (speckle / sensor-noise filter)
+    const r = Math.max(0, Math.min(4, Math.round(opts.blur)));
+    if (r > 0) {
+      const t = this.diffTmp;
+      for (let y = 0; y < GRID_H; y++) {
+        const row = y * GRID_W;
+        for (let x = 0; x < GRID_W; x++) {
+          let sum = 0;
+          let cnt = 0;
+          for (let q = Math.max(0, x - r); q <= Math.min(GRID_W - 1, x + r); q++) {
+            sum += d[row + q];
+            cnt++;
+          }
+          t[row + x] = sum / cnt;
+        }
+      }
+      for (let x = 0; x < GRID_W; x++) {
+        for (let y = 0; y < GRID_H; y++) {
+          let sum = 0;
+          let cnt = 0;
+          for (let q = Math.max(0, y - r); q <= Math.min(GRID_H - 1, y + r); q++) {
+            sum += t[q * GRID_W + x];
+            cnt++;
+          }
+          d[y * GRID_W + x] = sum / cnt;
+        }
+      }
+    }
+
+    // 4. Threshold -> mask, coverage stats (whole grid + photo area only)
+    const pr = this.photoGridRect();
+    const px0 = Math.max(0, Math.floor(pr.x));
+    const px1 = Math.min(GRID_W, Math.ceil(pr.x + pr.w));
+    const py0 = Math.max(0, Math.floor(pr.y));
+    const py1 = Math.min(GRID_H, Math.ceil(pr.y + pr.h));
+    let active = 0;
+    let photoActive = 0;
+    const thr = opts.threshold;
+    for (let y = 0; y < GRID_H; y++) {
+      const row = y * GRID_W;
+      const inY = y >= py0 && y < py1;
+      for (let x = 0; x < GRID_W; x++) {
+        const on = d[row + x] > thr ? 1 : 0;
+        this.lastMask[row + x] = on;
+        if (on) {
+          active++;
+          if (inY && x >= px0 && x < px1) photoActive++;
+        }
+      }
+    }
+    const photoN = Math.max(1, (px1 - px0) * (py1 - py0));
+    const activePct = (active / GRID_N) * 100;
+    const photoActivePct = (photoActive / photoN) * 100;
+    const floorPct = Math.max(0.2, opts.minAreaPct);
+    this.lastStats = {
+      camLive: true,
+      hasRef: true,
+      refKind,
+      activePct,
+      photoActivePct,
+      threshold: thr,
+      minAreaPct: opts.minAreaPct,
+      triggered: photoActivePct >= floorPct,
+      aeScale,
+    };
+    return this.lastStats;
+  }
+
+  /** EXPOSE (30s): anti-AE drift normalization + denoised diff + dodgeMap integration */
+  sampleExposeFrame(videoEl: HTMLVideoElement | null, dtSec: number, hInv: number[] | null, opts: DetectOptions): void {
+    if (!this.sampleCameraToGrid(videoEl, hInv)) {
+      this.lastStats = { ...this.lastStats, camLive: false, triggered: false };
+      return;
+    }
+    if (this.cleanCount === 0) {
+      // Camera came up after CAPTURE_CLEAN: bootstrap the clean plate from the first live frame
+      this.camClean.set(this.currGray);
+      this.cleanCount = 1;
+      console.warn('[darkroom] no clean plate captured; bootstrapped from first EXPOSE frame');
+      return;
+    }
+    const st = this.computeDiff(this.camClean, opts, 'round');
+    if (st.activePct < opts.minAreaPct) return; // too little change: treat as noise
+    const rate = Math.max(0, dtSec) / Math.max(1, opts.fullDodgeSec);
     for (let i = 0; i < GRID_N; i++) {
-      const currNorm = this.currGray[i] / aeScale;
-      const diff = Math.abs(currNorm - this.camClean[i]);
-      if (diff > diffSensitivity) {
+      if (this.lastMask[i]) {
         const next = this.dodgeMap[i] + rate;
         this.dodgeMap[i] = next > 1 ? 1 : next;
       }
     }
   }
 
+  /** Admin detect view outside EXPOSE: diff against the round clean plate (if any) or a preview reference */
+  previewDetect(videoEl: HTMLVideoElement | null, hInv: number[] | null, opts: DetectOptions, useRoundClean: boolean): DetectStats {
+    this.marginPct = opts.marginPct;
+    if (!this.sampleCameraToGrid(videoEl, hInv)) {
+      this.lastStats = { ...this.lastStats, camLive: false, hasRef: false, triggered: false, activePct: 0, photoActivePct: 0 };
+      this.lastMask.fill(0);
+      return this.lastStats;
+    }
+    if (useRoundClean && this.cleanCount > 0) return this.computeDiff(this.camClean, opts, 'round');
+    if (!this.hasPreviewRef) {
+      this.previewRef.set(this.currGray);
+      this.hasPreviewRef = true;
+    }
+    return this.computeDiff(this.previewRef, opts, 'preview');
+  }
+
+  /** Drop the preview reference so the next preview frame becomes the new reference */
+  resetPreviewRef(): void {
+    this.hasPreviewRef = false;
+  }
+
+  getDetectStats(): DetectStats {
+    return this.lastStats;
+  }
+
+  /**
+   * Render the admin detect view (640x180): left = raw camera with calibrated trigger quad,
+   * right = warped easel grid with live mask (red), accumulated dodge (amber) and photo area outline.
+   */
+  renderDetectView(out: HTMLCanvasElement, corners: Array<{ x: number; y: number }> | null): void {
+    const PW = GRID_W;
+    const PH = GRID_H;
+    if (out.width !== PW * 2 || out.height !== PH) {
+      out.width = PW * 2;
+      out.height = PH;
+    }
+    const g = out.getContext('2d')!;
+    g.fillStyle = '#000';
+    g.fillRect(0, 0, out.width, out.height);
+    // Left: raw camera (last frame drawn into camCanvas)
+    g.drawImage(this.camCanvas, 0, 0, PW, PH);
+    if (corners && corners.length === 4) {
+      g.strokeStyle = '#ff3b2f';
+      g.lineWidth = 2;
+      g.beginPath();
+      corners.forEach((p, i) => (i ? g.lineTo(p.x * PW, p.y * PH) : g.moveTo(p.x * PW, p.y * PH)));
+      g.closePath();
+      g.stroke();
+    }
+    // Right: warped grid + overlays
+    const img = g.createImageData(PW, PH);
+    const px = img.data;
+    for (let i = 0; i < GRID_N; i++) {
+      const v = Math.max(0, Math.min(255, this.currGray[i] * 255 * 0.7));
+      let r = v;
+      let gg = v;
+      let b = v;
+      const dm = this.dodgeMap[i];
+      if (dm > 0) {
+        r = r + (255 - r) * dm * 0.55;
+        gg = gg + (176 - gg) * dm * 0.55;
+        b = b * (1 - dm * 0.55);
+      }
+      if (this.lastMask[i]) {
+        r = 255;
+        gg = gg * 0.25;
+        b = b * 0.25;
+      }
+      const o = i * 4;
+      px[o] = r;
+      px[o + 1] = gg;
+      px[o + 2] = b;
+      px[o + 3] = 255;
+    }
+    g.putImageData(img, PW, 0);
+    const pr = this.photoGridRect();
+    g.strokeStyle = '#e8e2d5';
+    g.lineWidth = 1;
+    g.setLineDash([4, 3]);
+    g.strokeRect(PW + pr.x + 0.5, pr.y + 0.5, pr.w - 1, pr.h - 1);
+    g.setLineDash([]);
+    g.fillStyle = 'rgba(0,0,0,0.72)';
+    g.fillRect(0, 0, PW * 2, 16);
+    g.fillStyle = '#e8e2d5';
+    g.font = '10px monospace';
+    g.fillText('CAMERA + CAL QUAD', 6, 12);
+    g.fillText('EASEL GRID · RED=ACTIVE · AMBER=DODGE · DASH=PHOTO', PW + 6, 12);
+  }
+
   /** HOME MOUSE SIMULATOR: paint soft dodge brush directly onto dodgeMap */
   applyMouseDodge(normX: number, normY: number, dtSec: number): void {
     if (normX < 0 || normX > 1 || normY < 0 || normY > 1) return;
-    const gx = normX * GRID_W;
-    const gy = normY * GRID_H;
+    const pr = this.photoGridRect();
+    const gx = pr.x + normX * pr.w;
+    const gy = pr.y + normY * pr.h;
     const radius = 24;
     const r2 = radius * radius;
     const x0 = Math.max(0, Math.floor(gx - radius));
@@ -449,14 +677,15 @@ export class DarkroomEngine {
     if (out.length !== w * h) this.upsampledDodge = new Float32Array(w * h);
     const dst = this.upsampledDodge;
 
+    const pr = this.photoGridRect();
     for (let y = 0; y < h; y++) {
-      const sy = (y / Math.max(1, h - 1)) * (GRID_H - 1);
+      const sy = Math.max(0, Math.min(GRID_H - 1, pr.y + (y / Math.max(1, h - 1)) * pr.h));
       const y0 = Math.floor(sy);
       const y1 = Math.min(GRID_H - 1, y0 + 1);
       const fy = sy - y0;
       const row = y * w;
       for (let x = 0; x < w; x++) {
-        const sx = (x / Math.max(1, w - 1)) * (GRID_W - 1);
+        const sx = Math.max(0, Math.min(GRID_W - 1, pr.x + (x / Math.max(1, w - 1)) * pr.w));
         const x0 = Math.floor(sx);
         const x1 = Math.min(GRID_W - 1, x0 + 1);
         const fx = sx - x0;

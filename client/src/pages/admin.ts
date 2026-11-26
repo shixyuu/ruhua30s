@@ -115,6 +115,40 @@ export default function admin(app: HTMLElement): void {
         </div>
       </section>
 
+      <!-- 3b. Camera Dodge Detection (live tuning) -->
+      <section class="card cal-card detect-card">
+        <div class="card-h">
+          <span>CAMERA DETECTION · TRIGGER AREA</span>
+          <span class="mono det-lamp" id="detLamp">OFF</span>
+        </div>
+        <div class="cal-btn-row">
+          <button class="btn-act" id="detViewBtn" type="button">DETECT VIEW: OFF</button>
+          <button class="btn-act" id="detRerefBtn" type="button">RE-REFERENCE (EMPTY EASEL)</button>
+        </div>
+        <div class="det-view">
+          <img id="detImg" alt="detection view from /main" class="hidden" />
+          <div class="cal-hint mono" id="detHint">Turn DETECT VIEW on: /main streams its camera (~2.5 fps). Left: camera + calibrated quad. Right: easel grid, red = above threshold, amber = accumulated dodge, dashed = photo area.</div>
+        </div>
+        <div class="meter-row det-meter">
+          <div class="det-bar"><div class="det-fill" id="detFill"></div><div class="det-line" id="detLine"></div></div>
+          <span class="mono" id="detReadout">ACTIVE 0.0% · TRIGGER ≥ 0.2%</span>
+        </div>
+        <div class="sliders">
+          <label class="slider-ctl">
+            <div class="sl-head"><span>Noise Filter (blur radius)</span><span class="mono" id="blurVal">0</span></div>
+            <input id="blurRange" type="range" min="${CONFIG_BOUNDS.detectBlur.min}" max="${CONFIG_BOUNDS.detectBlur.max}" step="1" value="0" />
+          </label>
+          <label class="slider-ctl">
+            <div class="sl-head"><span>Min Area (ignore frames below)</span><span class="mono" id="areaVal">0.0%</span></div>
+            <input id="areaRange" type="range" min="${CONFIG_BOUNDS.detectMinArea.min}" max="${CONFIG_BOUNDS.detectMinArea.max}" step="0.1" value="0" />
+          </label>
+          <label class="slider-ctl">
+            <div class="sl-head"><span>Full Dodge After (hold time)</span><span class="mono" id="holdVal">18s</span></div>
+            <input id="holdRange" type="range" min="${CONFIG_BOUNDS.fullDodgeSec.min}" max="${CONFIG_BOUNDS.fullDodgeSec.max}" step="1" value="18" />
+          </label>
+        </div>
+      </section>
+
       <!-- 4. Acoustic Calibration -->
       <section class="card cal-card">
         <div class="card-h">
@@ -225,6 +259,20 @@ export default function admin(app: HTMLElement): void {
   const marginVal = $<HTMLSpanElement>('#marginVal');
   const diffRange = $<HTMLInputElement>('#diffRange');
   const diffVal = $<HTMLSpanElement>('#diffVal');
+  const detLamp = $<HTMLSpanElement>('#detLamp');
+  const detViewBtn = $<HTMLButtonElement>('#detViewBtn');
+  const detRerefBtn = $<HTMLButtonElement>('#detRerefBtn');
+  const detImg = $<HTMLImageElement>('#detImg');
+  const detHint = $<HTMLDivElement>('#detHint');
+  const detFill = $<HTMLDivElement>('#detFill');
+  const detLine = $<HTMLDivElement>('#detLine');
+  const detReadout = $<HTMLSpanElement>('#detReadout');
+  const blurRange = $<HTMLInputElement>('#blurRange');
+  const blurVal = $<HTMLSpanElement>('#blurVal');
+  const areaRange = $<HTMLInputElement>('#areaRange');
+  const areaVal = $<HTMLSpanElement>('#areaVal');
+  const holdRange = $<HTMLInputElement>('#holdRange');
+  const holdVal = $<HTMLSpanElement>('#holdVal');
   const calCanvas = $<HTMLCanvasElement>('#calCanvas');
   const calCtx = calCanvas.getContext('2d')!;
   const calHint = $<HTMLDivElement>('#calHint');
@@ -548,6 +596,64 @@ export default function admin(app: HTMLElement): void {
     marginVal.textContent = `${v}%`;
     sendConfigPatch({ easelMargin: v });
   });
+  // ---------------- camera detection tuning + live view ----------------
+  let detOn = false;
+  let detLastFrameAt = 0;
+  const DET_METER_MAX = 10; // meter full scale, % of photo area
+  function setDetOn(on: boolean): void {
+    detOn = on;
+    detViewBtn.textContent = `DETECT VIEW: ${on ? 'ON' : 'OFF'}`;
+    detViewBtn.classList.toggle('primary-act', on);
+    if (!on) {
+      detLamp.textContent = 'OFF';
+      detLamp.className = 'mono det-lamp';
+      detImg.classList.add('hidden');
+    }
+  }
+  detViewBtn.addEventListener('click', () => net.send({ type: 'DETECT_VIEW', on: !detOn, token }));
+  detRerefBtn.addEventListener('click', () => {
+    net.send({ type: 'DETECT_VIEW', on: true, reref: true, token });
+    toast('Reference re-captured on /main (keep the easel empty)');
+  });
+  net.on('DETECT_VIEW', (m) => setDetOn(m.on));
+  net.on('DETECT_FRAME', (m) => {
+    if (!detOn) setDetOn(true);
+    detLastFrameAt = Date.now();
+    detImg.src = m.imageData;
+    detImg.classList.remove('hidden');
+    const st = m.stats;
+    const floor = Math.max(0.2, st.minAreaPct);
+    detFill.style.width = `${Math.min(100, (st.photoActivePct / DET_METER_MAX) * 100).toFixed(1)}%`;
+    detLine.style.left = `${Math.min(100, (floor / DET_METER_MAX) * 100).toFixed(1)}%`;
+    detFill.classList.toggle('hot', st.triggered);
+    const ref = !st.camLive ? 'NO CAMERA' : st.refKind === 'round' ? 'vs ROUND CLEAN PLATE' : 'vs PREVIEW REFERENCE';
+    detReadout.textContent = `ACTIVE ${st.photoActivePct.toFixed(1)}% · TRIGGER ≥ ${floor.toFixed(1)}% · THR ${st.threshold.toFixed(2)} · AE ×${st.aeScale.toFixed(2)} · ${st.phase} · ${ref}`;
+    detLamp.textContent = !st.camLive ? 'NO CAMERA' : st.triggered ? 'TRIGGERED' : 'CLEAR';
+    detLamp.className = `mono det-lamp ${st.triggered ? 'hot' : st.camLive ? 'ok' : ''}`;
+    detHint.classList.add('hidden');
+  });
+  window.setInterval(() => {
+    if (detOn && detLastFrameAt && Date.now() - detLastFrameAt > 3000) {
+      detLamp.textContent = 'NO FRAMES (/main offline?)';
+      detLamp.className = 'mono det-lamp';
+    }
+  }, 1000);
+  blurRange.addEventListener('input', () => {
+    const v = Number(blurRange.value);
+    blurVal.textContent = String(v);
+    sendConfigPatch({ detectBlur: v });
+  });
+  areaRange.addEventListener('input', () => {
+    const v = Number(areaRange.value);
+    areaVal.textContent = `${v.toFixed(1)}%`;
+    sendConfigPatch({ detectMinArea: v });
+  });
+  holdRange.addEventListener('input', () => {
+    const v = Number(holdRange.value);
+    holdVal.textContent = `${v}s`;
+    sendConfigPatch({ fullDodgeSec: v });
+  });
+
   diffRange.addEventListener('input', () => {
     const v = Number(diffRange.value);
     diffVal.textContent = v.toFixed(2);
@@ -592,6 +698,12 @@ export default function admin(app: HTMLElement): void {
     marginVal.textContent = `${c.easelMargin}%`;
     diffRange.value = String(c.diffSensitivity);
     diffVal.textContent = c.diffSensitivity.toFixed(2);
+    blurRange.value = String(c.detectBlur);
+    blurVal.textContent = String(c.detectBlur);
+    areaRange.value = String(c.detectMinArea);
+    areaVal.textContent = `${c.detectMinArea.toFixed(1)}%`;
+    holdRange.value = String(c.fullDodgeSec);
+    holdVal.textContent = `${c.fullDodgeSec}s`;
     floorRange.value = String(c.noiseFloor);
     floorVal.textContent = c.noiseFloor.toFixed(2);
     floorLine.style.left = `${Math.round(c.noiseFloor * 100)}%`;

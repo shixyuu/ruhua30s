@@ -520,3 +520,16 @@ button { font: inherit; color: inherit; cursor: pointer; }
 .cal-snap-wrap { display: grid; gap: 6px; }
 #calCanvas { width: 100%; aspect-ratio: 16 / 9; background: #050504; border: 1px solid var(--hair-2); touch-action: none; cursor: crosshair; display: block; }
 .cal-hint { font-size: 10.5px; color: var(--silver); line-height: 1.4; }
+
+/* ---------- admin camera detection panel ---------- */
+.detect-card .det-view { display: grid; gap: 6px; }
+.detect-card .det-view img { width: 100%; aspect-ratio: 32 / 9; image-rendering: pixelated; border: 1px solid var(--hair-2); background: #000; }
+.det-lamp { padding: 2px 6px; border: 1px solid var(--hair-2); }
+.det-lamp.ok { color: var(--paper); border-color: var(--paper); }
+.det-lamp.hot { background: var(--safelight); border-color: var(--safelight); color: #fff; }
+.det-meter { display: grid; gap: 4px; }
+.det-meter .mono { font-size: 10.5px; letter-spacing: .04em; }
+.det-bar { position: relative; height: 10px; border: 1px solid var(--hair-2); background: #000; }
+.det-fill { position: absolute; inset: 0 auto 0 0; width: 0; background: var(--amber); }
+.det-fill.hot { background: var(--safelight); }
+.det-line { position: absolute; top: -3px; bottom: -3px; width: 2px; background: var(--paper); left: 2%; }

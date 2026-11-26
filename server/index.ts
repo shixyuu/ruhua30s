@@ -56,6 +56,16 @@ const TIME_SCALE = Math.min(10, Math.max(0.01, Number(process.env.TIME_SCALE || 
 const MAX_PAYLOAD = 15 * 1024 * 1024;
 const HEARTBEAT_MS = 20_000;
 const DEV_TICK_MS = 50;
+/** Admin DETECT VIEW auto-expires so /main stops streaming if the admin tab is closed */
+const DETECT_VIEW_TTL_MS = 10 * 60_000;
+let detectViewOn = false;
+let detectViewUntil = 0;
+const detectViewTimer = setInterval(() => {
+  if (detectViewOn && Date.now() > detectViewUntil) {
+    detectViewOn = false;
+    broadcast({ type: 'DETECT_VIEW', on: false }, (p) => p.role === 'main' || p.role === 'admin');
+  }
+}, 5000);
 
 ensureDirs();
 let config: AppConfig = loadConfig();
@@ -346,6 +356,7 @@ async function sendFullSync(ws: WebSocket, peer: Peer): Promise<void> {
   send(ws, stateMsg());
   send(ws, { type: 'config', config });
   send(ws, { type: 'calibration', calibration });
+  if (detectViewOn && (peer.role === 'main' || peer.role === 'admin')) send(ws, { type: 'DETECT_VIEW', on: true });
   send(ws, { type: 'door-photo', photo: doorPhotoInfo(), serverTime: Date.now() });
   send(ws, { type: 'contact-sheet', sheet: contactSheetFromState(persisted), serverTime: Date.now() });
   const storage = await computeStorageStats(persisted);
@@ -414,6 +425,19 @@ function handleMessage(ws: WebSocket, peer: Peer, msg: ClientMsg): void {
       if (peer.role !== 'admin' || !(peer.isAdmin || (ADMIN_TOKEN && msg.token === ADMIN_TOKEN))) return;
       broadcast({ type: 'REQUEST_SNAPSHOT' }, (p) => p.role === 'main');
       return send(ws, { type: 'ack', what: 'REQUEST_SNAPSHOT', ok: true, message: 'Snapshot requested from /main' });
+    }
+    case 'DETECT_VIEW': {
+      if (peer.role !== 'admin' || !(peer.isAdmin || (ADMIN_TOKEN && msg.token === ADMIN_TOKEN))) return;
+      detectViewOn = !!msg.on;
+      detectViewUntil = detectViewOn ? Date.now() + DETECT_VIEW_TTL_MS : 0;
+      broadcast({ type: 'DETECT_VIEW', on: detectViewOn, reref: !!msg.reref }, (p) => p.role === 'main' || p.role === 'admin');
+      return;
+    }
+    case 'DETECT_FRAME': {
+      if (peer.role !== 'main' || !detectViewOn) return;
+      if (typeof msg.imageData !== 'string' || msg.imageData.length > 400_000) return;
+      broadcast({ type: 'DETECT_FRAME', imageData: msg.imageData, stats: msg.stats, ts: Date.now() }, (p) => p.role === 'admin');
+      return;
     }
     case 'SNAPSHOT_DATA': {
       if (peer.role !== 'main') return;
@@ -808,6 +832,9 @@ async function onAdmin(ws: WebSocket, action: string, cfg?: Partial<AppConfig>):
         devSpeed: cfg?.devSpeed ?? config.devSpeed,
         easelMargin: cfg?.easelMargin ?? config.easelMargin,
         diffSensitivity: cfg?.diffSensitivity ?? config.diffSensitivity,
+        detectBlur: cfg?.detectBlur ?? config.detectBlur,
+        detectMinArea: cfg?.detectMinArea ?? config.detectMinArea,
+        fullDodgeSec: cfg?.fullDodgeSec ?? config.fullDodgeSec,
         mouseSimulator: cfg?.mouseSimulator ?? config.mouseSimulator,
         sampleFallback: cfg?.sampleFallback ?? config.sampleFallback,
         rollNumber: cfg?.rollNumber ?? config.rollNumber,
@@ -837,6 +864,7 @@ server.listen(PORT, HOST, () => {
 function shutdown(_sig: string): void {
   clearInterval(heartbeat);
   clearInterval(adminStatusTimer);
+  clearInterval(detectViewTimer);
   stopDevLoop();
   for (const ws of peers.keys()) ws.close(1001, 'server shutdown');
   wss.close();
