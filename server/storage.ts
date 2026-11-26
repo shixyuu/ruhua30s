@@ -8,6 +8,7 @@ import {
   ContactSheetInfo,
   DEFAULT_CONFIG,
   DoorPhotoInfo,
+  ForecastInfo,
   PrintMode,
 } from '../shared/protocol.js';
 
@@ -15,11 +16,14 @@ export const ROOT_DIR = process.cwd();
 export const ASSETS_DIR = path.resolve(process.env.ASSETS_DIR || path.join(ROOT_DIR, 'assets'));
 export const DATA_DIR = path.resolve(process.env.DATA_DIR || path.join(ROOT_DIR, 'data'));
 export const ARCHIVE_DIR = path.join(DATA_DIR, 'archive');
+export const FORECAST_DIR = path.join(DATA_DIR, 'forecasts');
 const CONFIG_FILE = path.join(DATA_DIR, 'config.json');
 const DOOR_FILE = path.join(DATA_DIR, 'latest-door.jpg');
+const FORECAST_FILE = path.join(DATA_DIR, 'latest-forecast.jpg');
+const FORECAST_META_FILE = path.join(DATA_DIR, 'latest-forecast.json');
 
 export function ensureDirs(): void {
-  for (const d of [ASSETS_DIR, DATA_DIR, ARCHIVE_DIR]) fs.mkdirSync(d, { recursive: true });
+  for (const d of [ASSETS_DIR, DATA_DIR, ARCHIVE_DIR, FORECAST_DIR]) fs.mkdirSync(d, { recursive: true });
 }
 
 function clamp(n: unknown, min: number, max: number, fallback: number): number {
@@ -42,6 +46,10 @@ export function rollDirPath(rollNumber: number): string {
 
 function round1(n: number): number {
   return Math.round(n * 10) / 10;
+}
+
+function round2(n: number): number {
+  return Math.round(n * 100) / 100;
 }
 
 function round3(n: number): number {
@@ -71,6 +79,9 @@ export function sanitizeConfig(input: Partial<AppConfig> | undefined, base: AppC
   const devSpeed = round3(
     clamp(src.devSpeed ?? base.devSpeed, CONFIG_BOUNDS.devSpeed.min, CONFIG_BOUNDS.devSpeed.max, base.devSpeed),
   );
+  const pastOpacity = round2(
+    clamp(src.pastOpacity ?? base.pastOpacity, CONFIG_BOUNDS.pastOpacity.min, CONFIG_BOUNDS.pastOpacity.max, base.pastOpacity),
+  );
   const printMode: PrintMode =
     src.printMode === 'positive_print' || src.printMode === 'photogram_negative' ? src.printMode : base.printMode;
   const rollRaw = typeof src.rollNumber === 'number' ? src.rollNumber : Number(src.rollNumber);
@@ -84,6 +95,7 @@ export function sanitizeConfig(input: Partial<AppConfig> | undefined, base: AppC
     revealSec,
     noiseFloor,
     devSpeed,
+    pastOpacity,
     printMode,
     rollNumber,
   };
@@ -145,6 +157,7 @@ export async function saveConfig(cfg: AppConfig): Promise<void> {
 }
 
 let doorVersion = 0;
+let forecastVersion = 0;
 let tmpSeq = 0;
 /** 每次写入使用唯一临时文件名，避免并发写入互相 rename 掉对方的临时文件 */
 const tmpName = (file: string) => `${file}.${process.pid}.${Date.now()}.${++tmpSeq}.tmp`;
@@ -159,6 +172,94 @@ export function doorPhotoInfo(): DoorPhotoInfo {
     has = false;
   }
   return { has, version: doorVersion, url: has ? `/data/latest-door.jpg?v=${doorVersion}` : null };
+}
+
+export function forecastInfo(rollNumber: number): ForecastInfo {
+  const nextIdx = countRollFramesSync(rollNumber);
+  const fallbackTarget = `${pad(nextIdx, 2)}A`;
+  try {
+    const st = fs.statSync(FORECAST_FILE);
+    if (!st.isFile() || st.size === 0) {
+      return { has: false, version: forecastVersion, targetFrameNo: fallbackTarget, url: null };
+    }
+    const meta = JSON.parse(fs.readFileSync(FORECAST_META_FILE, 'utf8')) as {
+      rollNumber?: number;
+      targetFrameNo?: string;
+      version?: number;
+      archiveUrl?: string;
+    };
+    if (meta.rollNumber !== rollNumber) {
+      return { has: false, version: forecastVersion, targetFrameNo: fallbackTarget, url: null };
+    }
+    const ver = meta.version || forecastVersion || Math.floor(st.mtimeMs);
+    if (forecastVersion === 0) forecastVersion = ver;
+    return {
+      has: true,
+      version: ver,
+      targetFrameNo: meta.targetFrameNo || fallbackTarget,
+      url: `/data/latest-forecast.jpg?v=${ver}`,
+    };
+  } catch {
+    return { has: false, version: forecastVersion, targetFrameNo: fallbackTarget, url: null };
+  }
+}
+
+export async function saveForecast(
+  buf: Buffer,
+  rollNumber: number,
+  targetFrameNumber: number,
+): Promise<{ forecast: ForecastInfo; archiveUrl: string }> {
+  const rFolder = rollDirName(rollNumber);
+  const fDir = path.join(FORECAST_DIR, rFolder);
+  await fsp.mkdir(fDir, { recursive: true });
+  const targetFrameNo = `${pad(targetFrameNumber, 2)}A`;
+  const ver = Date.now();
+  forecastVersion = ver;
+  const archiveFile = `forecast-f${pad(targetFrameNumber, 2)}-v${ver}.jpg`;
+  const archiveUrl = `/data/forecasts/${rFolder}/${encodeURIComponent(archiveFile)}`;
+  await fsp.writeFile(path.join(fDir, archiveFile), buf);
+
+  const tmpImg = tmpName(FORECAST_FILE);
+  await fsp.writeFile(tmpImg, buf);
+  await fsp.rename(tmpImg, FORECAST_FILE);
+
+  const tmpMeta = tmpName(FORECAST_META_FILE);
+  await fsp.writeFile(tmpMeta, JSON.stringify({ rollNumber, targetFrameNo, version: ver, archiveUrl }));
+  await fsp.rename(tmpMeta, FORECAST_META_FILE);
+
+  return {
+    forecast: {
+      has: true,
+      version: ver,
+      targetFrameNo,
+      url: `/data/latest-forecast.jpg?v=${ver}`,
+    },
+    archiveUrl,
+  };
+}
+
+export function currentForecastArchiveUrl(rollNumber: number): string | null {
+  try {
+    const meta = JSON.parse(fs.readFileSync(FORECAST_META_FILE, 'utf8')) as {
+      rollNumber?: number;
+      archiveUrl?: string;
+    };
+    if (meta.rollNumber === rollNumber && meta.archiveUrl) return meta.archiveUrl;
+  } catch {
+    /* ignore */
+  }
+  return null;
+}
+
+export async function resetForecast(): Promise<void> {
+  for (const f of [FORECAST_FILE, FORECAST_META_FILE]) {
+    try {
+      await fsp.unlink(f);
+    } catch {
+      /* ignore */
+    }
+  }
+  forecastVersion = Date.now();
 }
 
 export function dateStamp(d = new Date()): string {
@@ -187,15 +288,16 @@ export function countRollFramesSync(rollNumber: number): number {
   }
 }
 
-/** 读取指定胶卷的完整接触印相表（按时间升序编号 01A, 02A...） */
+/** 读取指定胶卷的完整接触印相表（按时间升序编号 00A, 01A, 02A...） */
 export async function getContactSheet(rollNumber: number): Promise<ContactSheetInfo> {
   const rFolder = rollDirName(rollNumber);
   const dir = path.join(ARCHIVE_DIR, rFolder);
+  const fc = forecastInfo(rollNumber);
   let names: string[] = [];
   try {
     names = await fsp.readdir(dir);
   } catch {
-    return { rollNumber, totalInRoll: 0, frames: [] };
+    return { rollNumber, totalInRoll: 0, frames: [], forecast: fc };
   }
   const raw: { name: string; mtime: number }[] = [];
   for (const name of names) {
@@ -209,13 +311,12 @@ export async function getContactSheet(rollNumber: number): Promise<ContactSheetI
   }
   raw.sort((a, b) => a.name.localeCompare(b.name) || a.mtime - b.mtime);
   const frames: ContactFrame[] = raw.map((it, idx) => {
-    const index = idx + 1;
     const fm = /-f(\d+)/i.exec(it.name);
     const dm = /-d(\d+)/i.exec(it.name);
-    const num = fm ? Number(fm[1]) || index : index;
+    const num = fm ? Number(fm[1]) : idx;
     return {
       frameNo: `${pad(num, 2)}A`,
-      index,
+      index: num,
       url: `/data/archive/${rFolder}/${encodeURIComponent(it.name)}`,
       timestamp: it.mtime,
       name: `${rFolder}/${it.name}`,
@@ -226,6 +327,7 @@ export async function getContactSheet(rollNumber: number): Promise<ContactSheetI
     rollNumber,
     totalInRoll: frames.length,
     frames,
+    forecast: fc,
   };
 }
 

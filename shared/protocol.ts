@@ -1,5 +1,5 @@
 /**
- * 《入画三十秒 (RH-30)》v3 — 纯现场活体暗房引擎（Zero Pre-recorded Media）前后端共享协议。
+ * 《入画三十秒 (RH-30)》v3 — 纯现场活体暗房与时间预言引擎（Zero Pre-recorded Media）前后端共享协议。
  * 服务端是唯一真相源：所有终端根据 state / dev 包里的 serverTime / phaseStartedAt 校准本地时钟。
  */
 
@@ -30,8 +30,10 @@ export interface AppConfig {
   revealSec: number;
   /** 抗环境底噪阈值（0.00–0.50，默认 0.08） */
   noiseFloor: number;
-  /** 满能量时每秒显影增量（0.03–0.80，默认 0.18） */
+  /** 满能量时每秒显影增量（0.03–0.80，默认 0.20） */
   devSpeed: number;
+  /** 活着的过去：上一轮 15s 动态影像在白光重曝中的透明度（0.15–0.85，默认 0.48） */
+  pastOpacity: number;
   /** 显影光学模式：classic photogram_negative 或 positive_print */
   printMode: PrintMode;
   /** 当前胶卷编号（从 1 开始，NEW ROLL 时递增，历史照片按卷归档保留） */
@@ -46,6 +48,7 @@ export const CONFIG_BOUNDS = {
   revealSec: { min: 6, max: 25 },
   noiseFloor: { min: 0.0, max: 0.5 },
   devSpeed: { min: 0.03, max: 0.8 },
+  pastOpacity: { min: 0.15, max: 0.85 },
 } as const;
 
 export const DEFAULT_CONFIG: AppConfig = {
@@ -55,20 +58,29 @@ export const DEFAULT_CONFIG: AppConfig = {
   maxDevelopSec: 25,
   revealSec: 12,
   noiseFloor: 0.08,
-  devSpeed: 0.18,
+  devSpeed: 0.2,
+  pastOpacity: 0.48,
   printMode: 'photogram_negative',
   rollNumber: 1,
 };
 
+export interface ForecastInfo {
+  has: boolean;
+  version: number;
+  targetFrameNo: string; // e.g. "01A"
+  url: string | null;
+}
+
 export interface RoundInfo {
   id: number;
   rollNumber: number;
-  frameNumber: number; // 当前卷内的底片序号（1 → 01A）
+  frameNumber: number; // 当前卷内的底片序号（0 → 00A 种子轮，1 → 01A...）
   printMode: PrintMode;
   devProgress: number; // 初始 0.0，无上限，可超过 1.5
   finalDevProgress: number | null; // 进入 FIXED_REVEAL 时锁死
   fixTriggeredBy: 'station2' | 'timeout' | 'admin' | null;
   hasFreeze: boolean;
+  predictedUrl: string | null; // 本轮开始前锁定的预测未来图 URL（供 /main 双屏对照与 /admin 对比）
   trigger: string | null;
 }
 
@@ -79,8 +91,8 @@ export interface DoorPhotoInfo {
 }
 
 export interface ContactFrame {
-  frameNo: string; // "01A", "02A"...
-  index: number; // 1, 2...
+  frameNo: string; // "00A", "01A", "02A"...
+  index: number; // 0, 1, 2...
   url: string;
   timestamp: number;
   name: string;
@@ -91,6 +103,7 @@ export interface ContactSheetInfo {
   rollNumber: number;
   totalInRoll: number;
   frames: ContactFrame[];
+  forecast?: ForecastInfo;
 }
 
 export interface ClientStatus {
@@ -111,6 +124,7 @@ export type ServerMsg =
       timeScale: number;
       round: RoundInfo;
       doorPhoto: DoorPhotoInfo;
+      forecast: ForecastInfo;
     }
   | {
       type: 'dev';
@@ -139,5 +153,5 @@ export type ClientMsg =
   | { type: 'START_SESSION'; token?: string }
   | { type: 'AUDIO_ENERGY'; level: number }
   | { type: 'TRIGGER_FIX' }
-  | { type: 'freeze'; data: string }
+  | { type: 'freeze'; data: string; forecastData?: string }
   | { type: 'admin'; action: AdminAction; config?: Partial<AppConfig>; token?: string };

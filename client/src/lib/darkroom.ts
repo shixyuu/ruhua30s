@@ -14,6 +14,51 @@ export const DISPLAY_H = 720;
 const LW = 960;
 const LH = 540;
 const N = LW * LH;
+const FW = 320;
+const FH = 180;
+const FN = FW * FH;
+
+function drawContain(
+  g: CanvasRenderingContext2D,
+  src: CanvasImageSource,
+  sw: number,
+  sh: number,
+  dx: number,
+  dy: number,
+  dw: number,
+  dh: number,
+): void {
+  if (sw <= 0 || sh <= 0) return;
+  const scale = Math.min(dw / sw, dh / sh);
+  const w = sw * scale;
+  const h = sh * scale;
+  g.drawImage(src, dx + (dw - w) / 2, dy + (dh - h) / 2, w, h);
+}
+
+function drawCover(
+  g: CanvasRenderingContext2D,
+  src: CanvasImageSource,
+  sw: number,
+  sh: number,
+  dw: number,
+  dh: number,
+): void {
+  if (sw <= 0 || sh <= 0) return;
+  const targetRatio = dw / dh;
+  const srcRatio = sw / sh;
+  let sx = 0;
+  let sy = 0;
+  let cw = sw;
+  let ch = sh;
+  if (srcRatio > targetRatio) {
+    cw = sh * targetRatio;
+    sx = (sw - cw) / 2;
+  } else {
+    ch = sw / targetRatio;
+    sy = (sh - ch) / 2;
+  }
+  g.drawImage(src, sx, sy, cw, ch, 0, 0, dw, dh);
+}
 
 export function setupCanvas(c: HTMLCanvasElement): CanvasRenderingContext2D {
   c.width = DISPLAY_W;
@@ -34,10 +79,19 @@ export function drawIdleDarkroom(g: CanvasRenderingContext2D, ms: number): void 
   g.fillRect(0, 0, DISPLAY_W, DISPLAY_H);
 }
 
-/** SAFELIGHT_COMPOSE: pure #9A0A0A safelight field with subtle optical corner falloff */
-export function drawSafelightField(g: CanvasRenderingContext2D): void {
+/** SAFELIGHT_COMPOSE: pure #9A0A0A safelight field with optional semi-transparent deep-red forecast ghost */
+export function drawSafelightField(g: CanvasRenderingContext2D, forecastImg?: HTMLImageElement | null): void {
   g.fillStyle = '#9A0A0A';
   g.fillRect(0, 0, DISPLAY_W, DISPLAY_H);
+
+  if (forecastImg && forecastImg.complete && forecastImg.naturalWidth > 0) {
+    g.save();
+    g.globalCompositeOperation = 'multiply';
+    g.globalAlpha = 0.42;
+    drawContain(g, forecastImg, forecastImg.naturalWidth, forecastImg.naturalHeight, 0, 0, DISPLAY_W, DISPLAY_H);
+    g.restore();
+  }
+
   const v = g.createRadialGradient(
     DISPLAY_W * 0.5,
     DISPLAY_H * 0.5,
@@ -52,10 +106,23 @@ export function drawSafelightField(g: CanvasRenderingContext2D): void {
   g.fillRect(0, 0, DISPLAY_W, DISPLAY_H);
 }
 
-/** EXPOSURE: bright warm enlarger beam #F6F2E8 with subtle natural optical vignette */
-export function drawExposureBeam(g: CanvasRenderingContext2D): void {
+/** EXPOSURE: bright warm enlarger beam #F6F2E8 with optional Recursive Past video shadow overlay */
+export function drawExposureBeam(
+  g: CanvasRenderingContext2D,
+  pastVideo?: HTMLVideoElement | null,
+  pastOpacity = 0.48,
+): void {
   g.fillStyle = '#F6F2E8';
   g.fillRect(0, 0, DISPLAY_W, DISPLAY_H);
+
+  if (pastVideo && pastVideo.readyState >= 2 && pastVideo.videoWidth > 0 && pastVideo.videoHeight > 0 && !pastVideo.ended) {
+    g.save();
+    g.globalCompositeOperation = 'multiply';
+    g.globalAlpha = Math.max(0.15, Math.min(0.85, pastOpacity));
+    drawCover(g, pastVideo, pastVideo.videoWidth, pastVideo.videoHeight, DISPLAY_W, DISPLAY_H);
+    g.restore();
+  }
+
   const v = g.createRadialGradient(
     DISPLAY_W * 0.5,
     DISPLAY_H * 0.5,
@@ -78,6 +145,11 @@ export class DarkroomEngine {
   private devImg: ImageData;
   private exportCanvas: HTMLCanvasElement;
   private exportCtx: CanvasRenderingContext2D;
+  private forecastSrcCanvas: HTMLCanvasElement;
+  private forecastSrcCtx: CanvasRenderingContext2D;
+  private forecastOutCanvas: HTMLCanvasElement;
+  private forecastOutCtx: CanvasRenderingContext2D;
+  private forecastImg: ImageData;
 
   private avgAccum = new Float32Array(N);
   private minAccum = new Float32Array(N);
@@ -85,9 +157,11 @@ export class DarkroomEngine {
   private latentMap = new Float32Array(N);
   private grainMap = new Float32Array(N);
   private hist = new Uint32Array(1024);
+  private prevGray: Float32Array | null = null;
 
   private sampleCount = 0;
   private latentReady = false;
+  private roundSeed = 0;
 
   constructor() {
     this.sampleCanvas = document.createElement('canvas');
@@ -105,6 +179,17 @@ export class DarkroomEngine {
     this.exportCanvas.width = DISPLAY_W;
     this.exportCanvas.height = DISPLAY_H;
     this.exportCtx = this.exportCanvas.getContext('2d')!;
+
+    this.forecastSrcCanvas = document.createElement('canvas');
+    this.forecastSrcCanvas.width = FW;
+    this.forecastSrcCanvas.height = FH;
+    this.forecastSrcCtx = this.forecastSrcCanvas.getContext('2d', { willReadFrequently: true })!;
+
+    this.forecastOutCanvas = document.createElement('canvas');
+    this.forecastOutCanvas.width = FW;
+    this.forecastOutCanvas.height = FH;
+    this.forecastOutCtx = this.forecastOutCanvas.getContext('2d')!;
+    this.forecastImg = this.forecastOutCtx.createImageData(FW, FH);
 
     this.regenerateGrain();
   }
@@ -126,13 +211,25 @@ export class DarkroomEngine {
     }
   }
 
+  /** Reset in-memory temporal prediction baseline (called on NEW ROLL) */
+  resetMemory(): void {
+    this.prevGray = null;
+  }
+
+  /** Capture stream of sampleCanvas for local MediaRecorder fallback when no USB camera is attached */
+  getSimulatedStream(fps = 20): MediaStream | null {
+    const fn = (this.sampleCanvas as HTMLCanvasElement & { captureStream?: (f?: number) => MediaStream }).captureStream;
+    return typeof fn === 'function' ? fn.call(this.sampleCanvas, fps) : null;
+  }
+
   /** Reset accumulators at the start of each EXPOSURE round */
-  beginExposure(): void {
+  beginExposure(roundId = 0): void {
     this.avgAccum.fill(0);
     this.minAccum.fill(1);
     this.latentMap.fill(0.5);
     this.sampleCount = 0;
     this.latentReady = false;
+    this.roundSeed = roundId;
     this.regenerateGrain();
   }
 
@@ -189,8 +286,9 @@ export class DarkroomEngine {
     ctx.fillStyle = bg;
     ctx.fillRect(0, 0, LW, LH);
 
-    // 1. Held perforated board with crisp square aperture & transparency film lines (slight hand tremor)
-    const bx = LW * 0.34 + Math.sin(elapsedSec * 1.4) * 2.5;
+    // 1. Held perforated board with crisp square aperture & transparency film lines (shifts subtly per round)
+    const phaseShift = (this.roundSeed % 5) * 18;
+    const bx = LW * 0.32 + phaseShift + Math.sin(elapsedSec * 1.4) * 2.5;
     const by = LH * 0.24 + Math.cos(elapsedSec * 1.1) * 2.2;
     const bw = 200;
     const bh = 250;
@@ -374,5 +472,134 @@ export class DarkroomEngine {
   exportCleanJpeg(finalDevProgress: number, printMode: PrintMode): string {
     this.renderPrint(this.exportCtx, DISPLAY_W, DISPLAY_H, finalDevProgress, printMode, 1.0);
     return this.exportCanvas.toDataURL('image/jpeg', 0.88);
+  }
+
+  /**
+   * 320×180 pixel-level Temporal Extrapolation:
+   * - Seed round (00A / no prevGray): directional dark-shadow dilation + contrast boost -> FORECAST 01A
+   * - Subsequent rounds: predicted = clamp(current + (current - prev) * 1.15, 0, 1) + light Gaussian blur + grain
+   */
+  computeAndExportForecast(isSeedRound: boolean): string {
+    this.forecastSrcCtx.drawImage(this.exportCanvas, 0, 0, FW, FH);
+    const srcPx = this.forecastSrcCtx.getImageData(0, 0, FW, FH).data;
+    const currentGray = new Float32Array(FN);
+    for (let i = 0, p = 0; i < FN; i++, p += 4) {
+      currentGray[i] = (0.299 * srcPx[p] + 0.587 * srcPx[p + 1] + 0.114 * srcPx[p + 2]) / 255;
+    }
+
+    const rawPred = new Float32Array(FN);
+    if (isSeedRound || !this.prevGray) {
+      // Seed frame 00A: directional dark shadow dilation + contrast boost
+      for (let y = 0; y < FH; y++) {
+        for (let x = 0; x < FW; x++) {
+          const i = y * FW + x;
+          let minVal = currentGray[i];
+          for (let dy = -1; dy <= 1; dy++) {
+            const sy = Math.max(0, Math.min(FH - 1, y - 1 + dy));
+            for (let dx = -1; dx <= 1; dx++) {
+              const sx = Math.max(0, Math.min(FW - 1, x - 2 + dx));
+              const v = currentGray[sy * FW + sx];
+              if (v < minVal) minVal = v;
+            }
+          }
+          const dilated = currentGray[i] * 0.42 + minVal * 0.58;
+          rawPred[i] = Math.max(0, Math.min(1, (dilated - 0.5) * 1.28 + 0.5));
+        }
+      }
+    } else {
+      const prev = this.prevGray;
+      for (let i = 0; i < FN; i++) {
+        const v = currentGray[i] + (currentGray[i] - prev[i]) * 1.15;
+        rawPred[i] = v < 0 ? 0 : v > 1 ? 1 : v;
+      }
+    }
+
+    this.prevGray = currentGray;
+
+    // Light 3×3 Gaussian smoothing + subtle darkroom fog grain
+    const out = this.forecastImg.data;
+    for (let y = 0; y < FH; y++) {
+      const y0 = Math.max(0, y - 1) * FW;
+      const y1 = y * FW;
+      const y2 = Math.min(FH - 1, y + 1) * FW;
+      for (let x = 0; x < FW; x++) {
+        const x0 = Math.max(0, x - 1);
+        const x1 = x;
+        const x2 = Math.min(FW - 1, x + 1);
+        const blur =
+          (rawPred[y0 + x0] +
+            rawPred[y0 + x1] * 2 +
+            rawPred[y0 + x2] +
+            rawPred[y1 + x0] * 2 +
+            rawPred[y1 + x1] * 4 +
+            rawPred[y1 + x2] * 2 +
+            rawPred[y2 + x0] +
+            rawPred[y2 + x1] * 2 +
+            rawPred[y2 + x2]) /
+          16;
+        const fog = blur + (Math.random() - 0.5) * 0.04;
+        const v = fog < 0 ? 0 : fog > 1 ? 1 : fog;
+        const q = (y1 + x1) * 4;
+        out[q] = 9 + 231 * v;
+        out[q + 1] = 8 + 226 * v;
+        out[q + 2] = 8 + 212 * v;
+        out[q + 3] = 255;
+      }
+    }
+    this.forecastOutCtx.putImageData(this.forecastImg, 0, 0);
+    return this.forecastOutCanvas.toDataURL('image/jpeg', 0.86);
+  }
+
+  /**
+   * Side-by-side West Wall Reveal for regular rounds (01A+):
+   * Left = PREDICTED [FR], Right = ACTUAL [FR] (from exportCanvas)
+   */
+  drawSideBySideReveal(
+    g: CanvasRenderingContext2D,
+    predictedImg: HTMLImageElement | null,
+    frameNo: string,
+    devPct: number,
+  ): void {
+    g.fillStyle = '#080706';
+    g.fillRect(0, 0, DISPLAY_W, DISPLAY_H);
+
+    const padX = 48;
+    const gap = 32;
+    const cardW = (DISPLAY_W - padX * 2 - gap) / 2;
+    const cardH = Math.round((cardW * 9) / 16);
+    const topY = Math.round((DISPLAY_H - cardH) / 2) - 18;
+
+    const leftX = padX;
+    const rightX = padX + cardW + gap;
+
+    // Frame borders
+    g.strokeStyle = 'rgba(184, 50, 40, 0.72)';
+    g.lineWidth = 1.5;
+    g.strokeRect(leftX - 1, topY - 1, cardW + 2, cardH + 2);
+
+    g.strokeStyle = 'rgba(232, 226, 213, 0.35)';
+    g.strokeRect(rightX - 1, topY - 1, cardW + 2, cardH + 2);
+
+    // Left: PREDICTED
+    if (predictedImg && predictedImg.complete && predictedImg.naturalWidth > 0) {
+      drawContain(g, predictedImg, predictedImg.naturalWidth, predictedImg.naturalHeight, leftX, topY, cardW, cardH);
+    } else {
+      g.fillStyle = '#12100E';
+      g.fillRect(leftX, topY, cardW, cardH);
+      g.fillStyle = 'rgba(232, 226, 213, 0.4)';
+      g.font = '14px "RH Mono", monospace';
+      g.fillText('NO PRIOR FORECAST', leftX + 20, topY + cardH / 2);
+    }
+
+    // Right: ACTUAL (frozen exportCanvas)
+    g.drawImage(this.exportCanvas, rightX, topY, cardW, cardH);
+
+    // Minimalist labels below frames
+    g.font = '13px "RH Mono", monospace';
+    g.fillStyle = '#B83228';
+    g.fillText(`PREDICTED · ${frameNo}`, leftX, topY + cardH + 26);
+
+    g.fillStyle = '#E8E2D5';
+    g.fillText(`ACTUAL · ${frameNo} · DEV ${devPct}% · FIXED`, rightX, topY + cardH + 26);
   }
 }

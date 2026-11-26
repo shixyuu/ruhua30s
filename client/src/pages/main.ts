@@ -1,11 +1,11 @@
 /**
- * /main — Mac + projector + wide-angle USB camera (v3 Live Darkroom Engine)
- * - 100% live optical photogram synthesis: zero pre-recorded video files, zero fake film borders/sprockets.
+ * /main — Mac + projector + wide-angle USB camera (v3 Live Darkroom & Temporal Extrapolation Engine)
+ * - Zero pre-recorded video files: 100% live photogram + local-memory Recursive Past + 320×180 Forecast Extrapolation.
  * - ENTER_BUFFER: deep safelight red + large countdown
- * - SAFELIGHT_COMPOSE: pure #9A0A0A safelight + corner SAFELIGHT · COMPOSE + remaining sec
- * - EXPOSURE: bright warm enlarger beam #F6F2E8 + 1 Hz mechanical timer + 18 FPS dual-buffer sampling
+ * - SAFELIGHT_COMPOSE: pure #9A0A0A safelight + optional semi-transparent deep-red FORECAST ghost (01A+) or SEED EXPOSURE 00A
+ * - EXPOSURE: bright warm enlarger beam #F6F2E8 + Recursive Past overlay (pastOpacity) + MediaRecorder local capture + 18 FPS sampler
  * - DEVELOPING: chemical bath sound + live developing print driven by server devProgress
- * - FIXED_REVEAL: crisp shutter + 120ms gentle flash, silence, frozen frame, clean borderless JPEG upload + last 4s EXIT NORTH ↑
+ * - FIXED_REVEAL: crisp shutter + 120ms gentle flash, silence, clean JPEG + forecast upload, side-by-side PREDICTED vs ACTUAL (01A+) or SEED ARCHIVE 00A
  */
 import { Net, mountNetDot } from '../lib/net';
 import {
@@ -38,16 +38,25 @@ function pad2(n: number): string {
   return String(Math.max(0, Math.floor(n))).padStart(2, '0');
 }
 
+function pickRecorderMime(): string | undefined {
+  if (typeof MediaRecorder === 'undefined') return undefined;
+  for (const m of ['video/webm;codecs=vp8', 'video/webm', 'video/mp4']) {
+    if (MediaRecorder.isTypeSupported?.(m)) return m;
+  }
+  return undefined;
+}
+
 export default async function mainPage(app: HTMLElement): Promise<void> {
   document.title = `Enlarger Projector · ${TITLE_EN}`;
   app.innerHTML = `
     <canvas class="layer" id="fx"></canvas>
     <div class="main-countdown hidden" id="countdownBox"><span id="countdown">5</span></div>
-    <div class="main-corner hidden" id="safelightHud">SAFELIGHT · COMPOSE · <span id="safelightSec">5</span>S</div>
+    <div class="main-corner hidden" id="safelightHud"></div>
     <div class="main-corner hidden" id="revealHud"></div>
     <div class="main-exit" id="exitSign">EXIT NORTH ↑</div>
     <div class="flash" id="flash"></div>
-    <video id="cam" class="hidden" muted playsinline autoplay></video>`;
+    <video id="cam" class="hidden" muted playsinline autoplay></video>
+    <video id="pastVid" class="hidden" muted playsinline></video>`;
 
   const $ = <T extends HTMLElement>(s: string) => app.querySelector(s) as T;
   const fx = $<HTMLCanvasElement>('#fx');
@@ -55,11 +64,11 @@ export default async function mainPage(app: HTMLElement): Promise<void> {
   const countdownBox = $<HTMLDivElement>('#countdownBox');
   const countdown = $<HTMLSpanElement>('#countdown');
   const safelightHud = $<HTMLDivElement>('#safelightHud');
-  const safelightSecEl = $<HTMLSpanElement>('#safelightSec');
   const revealHud = $<HTMLDivElement>('#revealHud');
   const exitSign = $<HTMLDivElement>('#exitSign');
   const flashEl = $<HTMLDivElement>('#flash');
   const camV = $<HTMLVideoElement>('#cam');
+  const pastVid = $<HTMLVideoElement>('#pastVid');
 
   const engine = new DarkroomEngine();
   const net = new Net('main');
@@ -104,6 +113,94 @@ export default async function mainPage(app: HTMLElement): Promise<void> {
   }
 
   // ====================================================================
+  // Recursive Past local MediaRecorder & Forecast image preloading
+  // ====================================================================
+  let lastRoundVideoUrl: string | null = null;
+  let recorder: MediaRecorder | null = null;
+  let recChunks: Blob[] = [];
+  let trackedRollNumber: number | null = null;
+
+  let safelightForecastImg: HTMLImageElement | null = null;
+  let predictedRevealImg: HTMLImageElement | null = null;
+
+  function loadImg(url: string | null | undefined): HTMLImageElement | null {
+    if (!url) return null;
+    const img = new Image();
+    img.src = url;
+    return img;
+  }
+
+  function clearRollMemory(): void {
+    stopPastRecorder(false);
+    if (lastRoundVideoUrl) {
+      URL.revokeObjectURL(lastRoundVideoUrl);
+      lastRoundVideoUrl = null;
+    }
+    pastVid.pause();
+    pastVid.removeAttribute('src');
+    pastVid.load();
+    safelightForecastImg = null;
+    predictedRevealImg = null;
+    engine.resetMemory();
+  }
+
+  function startPastRecorder(): void {
+    stopPastRecorder(false);
+    if (typeof MediaRecorder === 'undefined') return;
+    const stream = camLive() ? camStream : engine.getSimulatedStream(20);
+    if (!stream) return;
+    try {
+      const mimeType = pickRecorderMime();
+      recorder = mimeType ? new MediaRecorder(stream, { mimeType }) : new MediaRecorder(stream);
+      recChunks = [];
+      recorder.ondataavailable = (ev) => {
+        if (ev.data && ev.data.size > 0) recChunks.push(ev.data);
+      };
+      recorder.start(250);
+    } catch (err) {
+      console.warn('MediaRecorder unavailable', err);
+      recorder = null;
+      recChunks = [];
+    }
+  }
+
+  function stopPastRecorder(save: boolean): void {
+    const rec = recorder;
+    recorder = null;
+    if (!rec) return;
+    if (!save) {
+      rec.onstop = null;
+      try {
+        if (rec.state !== 'inactive') rec.stop();
+      } catch {
+        /* ignore */
+      }
+      recChunks = [];
+      return;
+    }
+    const chunksRef = recChunks;
+    recChunks = [];
+    const mime = rec.mimeType || 'video/webm';
+    const commit = () => {
+      if (!chunksRef.length) return;
+      const blob = new Blob(chunksRef, { type: mime });
+      if (blob.size < 256) return;
+      if (lastRoundVideoUrl) URL.revokeObjectURL(lastRoundVideoUrl);
+      lastRoundVideoUrl = URL.createObjectURL(blob);
+    };
+    if (rec.state === 'inactive') {
+      commit();
+    } else {
+      rec.onstop = commit;
+      try {
+        rec.stop();
+      } catch {
+        commit();
+      }
+    }
+  }
+
+  // ====================================================================
   // gentle flash
   // ====================================================================
   function flash(ms = 120, peakOpacity = 0.45): void {
@@ -135,9 +232,9 @@ export default async function mainPage(app: HTMLElement): Promise<void> {
     }
   }
 
-  function startSampler(): void {
+  function startSampler(roundId: number): void {
     stopSampler();
-    engine.beginExposure();
+    engine.beginExposure(roundId);
     const sampleOnce = () => {
       if (net.phase !== 'EXPOSURE') return stopSampler();
       const totalSec = net.config?.exposureSec ?? 15;
@@ -171,9 +268,14 @@ export default async function mainPage(app: HTMLElement): Promise<void> {
   async function onPhase(phase: Phase, fresh: boolean): Promise<void> {
     const st = net.state!;
     const roundId = st.round.id;
+    const isSeed = st.round.frameNumber === 0;
     activePrintMode = st.round.printMode ?? net.config?.printMode ?? 'photogram_negative';
     hideOverlays();
     stopSampler();
+    if (phase !== 'EXPOSURE') {
+      stopPastRecorder(phase === 'DEVELOPING' || phase === 'FIXED_REVEAL');
+      pastVid.pause();
+    }
 
     switch (phase) {
       case 'IDLE':
@@ -183,6 +285,13 @@ export default async function mainPage(app: HTMLElement): Promise<void> {
       case 'ENTER_BUFFER':
         stopAllLoops();
         liveDevProgress = 0;
+        if (!isSeed) {
+          safelightForecastImg = loadImg(st.forecast?.has ? st.forecast.url : st.round.predictedUrl);
+          predictedRevealImg = loadImg(st.round.predictedUrl || (st.forecast?.has ? st.forecast.url : null));
+        } else {
+          safelightForecastImg = null;
+          predictedRevealImg = null;
+        }
         countdownBox.classList.remove('hidden');
         await ensureCamera();
         break;
@@ -190,6 +299,13 @@ export default async function mainPage(app: HTMLElement): Promise<void> {
       case 'SAFELIGHT_COMPOSE':
         stopAllLoops();
         if (fresh) safelightClick();
+        if (!isSeed) {
+          safelightForecastImg = loadImg(st.forecast?.has ? st.forecast.url : st.round.predictedUrl);
+          predictedRevealImg = loadImg(st.round.predictedUrl || (st.forecast?.has ? st.forecast.url : null));
+        } else {
+          safelightForecastImg = null;
+          predictedRevealImg = null;
+        }
         safelightHud.classList.remove('hidden');
         await ensureCamera();
         break;
@@ -198,8 +314,16 @@ export default async function mainPage(app: HTMLElement): Promise<void> {
         stopAllLoops();
         if (fresh) relayClick(true);
         enlargerTimer.start(0.85, 0.1);
+        if (!isSeed && lastRoundVideoUrl) {
+          pastVid.src = lastRoundVideoUrl;
+          pastVid.currentTime = 0;
+          void pastVid.play().catch(() => {});
+        }
         await ensureCamera();
-        if (net.phase === 'EXPOSURE') startSampler();
+        if (net.phase === 'EXPOSURE') {
+          startSampler(roundId);
+          startPastRecorder();
+        }
         break;
 
       case 'DEVELOPING':
@@ -219,21 +343,42 @@ export default async function mainPage(app: HTMLElement): Promise<void> {
           shutter();
           flash(120, 0.45);
         }
-        // Render & freeze exact final print and upload clean borderless JPEG
+        // Export clean borderless ACTUAL JPEG + 320×180 extrapolated NEXT FORECAST JPEG
         const jpegData = engine.exportCleanJpeg(frozenDevProgress, activePrintMode);
+        const forecastData = engine.computeAndExportForecast(isSeed);
         if (freezeUploadedRound !== roundId) {
           freezeUploadedRound = roundId;
-          net.send({ type: 'freeze', data: jpegData });
+          net.send({ type: 'freeze', data: jpegData, forecastData });
         }
-        const devPct = Math.round(frozenDevProgress * 100);
-        revealHud.textContent = `ROLL ${pad2(st.round.rollNumber)} · FR ${pad2(st.round.frameNumber)}A · DEV ${devPct}% · FIXED`;
-        revealHud.classList.remove('hidden');
+        if (isSeed) {
+          revealHud.textContent = 'SEED ARCHIVE 00A · BASELINE ESTABLISHED';
+          revealHud.classList.remove('hidden');
+        } else if (st.round.predictedUrl && !predictedRevealImg) {
+          predictedRevealImg = loadImg(st.round.predictedUrl);
+        }
         break;
       }
     }
   }
 
+  net.on('config', (m) => {
+    if (trackedRollNumber !== null && m.config.rollNumber !== trackedRollNumber) {
+      clearRollMemory();
+    }
+    trackedRollNumber = m.config.rollNumber;
+  });
+
+  net.on('contact-sheet', (m) => {
+    if (m.sheet.totalInRoll === 0 && net.phase === 'IDLE' && lastRoundVideoUrl !== null) {
+      clearRollMemory();
+    }
+  });
+
   net.on('state', (m) => {
+    if (trackedRollNumber !== null && m.round.rollNumber !== trackedRollNumber) {
+      clearRollMemory();
+    }
+    trackedRollNumber = m.round.rollNumber;
     activePrintMode = m.round.printMode ?? net.config?.printMode ?? activePrintMode;
     const fresh = m.state !== curPhase || m.round.id !== curRound;
     if (!fresh) return;
@@ -247,6 +392,8 @@ export default async function mainPage(app: HTMLElement): Promise<void> {
   // ====================================================================
   function frame(): void {
     const phase = net.phase;
+    const st = net.state;
+    const isSeed = (st?.round.frameNumber ?? 0) === 0;
     switch (phase) {
       case 'IDLE':
         drawIdleDarkroom(g, net.now());
@@ -260,22 +407,32 @@ export default async function mainPage(app: HTMLElement): Promise<void> {
       }
 
       case 'SAFELIGHT_COMPOSE': {
-        drawSafelightField(g);
+        drawSafelightField(g, isSeed ? null : safelightForecastImg);
         const remain = Math.max(1, Math.ceil(net.remainingMs() / 1000 / net.timeScale));
-        safelightSecEl.textContent = String(remain);
+        safelightHud.textContent = isSeed
+          ? `SAFELIGHT · SEED EXPOSURE 00A · ${remain}S`
+          : `SAFELIGHT · PREDICTED NEXT FRAME · ${remain}S`;
         break;
       }
 
-      case 'EXPOSURE':
-        drawExposureBeam(g);
+      case 'EXPOSURE': {
+        const pastOpacity = net.config?.pastOpacity ?? 0.48;
+        drawExposureBeam(g, !isSeed && lastRoundVideoUrl ? pastVid : null, pastOpacity);
         break;
+      }
 
       case 'DEVELOPING':
         engine.renderPrint(g, g.canvas.width, g.canvas.height, liveDevProgress, activePrintMode, 0.93);
         break;
 
       case 'FIXED_REVEAL': {
-        engine.renderPrint(g, g.canvas.width, g.canvas.height, frozenDevProgress, activePrintMode, 1.0);
+        if (isSeed) {
+          engine.renderPrint(g, g.canvas.width, g.canvas.height, frozenDevProgress, activePrintMode, 1.0);
+        } else {
+          const frNo = `${pad2(st?.round.frameNumber ?? 1)}A`;
+          const devPct = Math.round(frozenDevProgress * 100);
+          engine.drawSideBySideReveal(g, predictedRevealImg, frNo, devPct);
+        }
         const remainStorySec = net.remainingMs() / 1000 / net.timeScale;
         exitSign.classList.toggle('show', remainStorySec <= 4.0);
         break;
@@ -310,7 +467,7 @@ export default async function mainPage(app: HTMLElement): Promise<void> {
           <div class="fields">
             <label><span class="no">01 / CAMERA</span>External USB wide-angle camera<select id="camSel"></select></label>
             <label><span class="no">02 / AUDIO OUT</span>Audio output device<select id="sinkSel"></select></label>
-            <div class="hint" id="camHint">Camera stream stays strictly local for live photogram accumulation.</div>
+            <div class="hint" id="camHint">Camera stream stays strictly local for live photogram accumulation &amp; recursive past overlay.</div>
           </div>
           <div class="fields">
             <div class="pv"><video id="pv" muted playsinline autoplay></video><span class="mono">LIVE CAMERA PREVIEW</span></div>

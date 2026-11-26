@@ -91,6 +91,7 @@ async function main() {
       revealSec: 99,
       noiseFloor: 0.9,
       devSpeed: 5,
+      pastOpacity: 0.99,
       printMode: 'positive_print',
     },
     token: TOKEN,
@@ -104,6 +105,7 @@ async function main() {
       cfg.config.revealSec === 25 &&
       cfg.config.noiseFloor === 0.5 &&
       cfg.config.devSpeed === 0.8 &&
+      cfg.config.pastOpacity === 0.85 &&
       cfg.config.printMode === 'positive_print',
     `配置超界限幅正确 ${JSON.stringify(cfg.config)}`,
   );
@@ -120,7 +122,8 @@ async function main() {
       maxDevelopSec: 25,
       revealSec: 12,
       noiseFloor: 0.08,
-      devSpeed: 0.25,
+      devSpeed: 0.2,
+      pastOpacity: 0.48,
       printMode: 'photogram_negative',
     },
     token: TOKEN,
@@ -172,12 +175,20 @@ async function main() {
     `station2 定影锁定 finalDevProgress=${reveal.round.finalDevProgress}`,
   );
 
-  // main 上传纯净 JPEG → 写入磁盘并更新 contact-sheet
+  // main 上传纯净 JPEG + 下一轮预测 JPEG → 写入磁盘并更新 contact-sheet 与 forecast
   const jpeg = Buffer.concat([Buffer.from([0xff, 0xd8, 0xff, 0xe0]), Buffer.alloc(2000, 1), Buffer.from([0xff, 0xd9])]);
+  const forecastJpeg = Buffer.concat([Buffer.from([0xff, 0xd8, 0xff, 0xe0]), Buffer.alloc(1200, 2), Buffer.from([0xff, 0xd9])]);
   door.clear();
-  mainC.send({ type: 'freeze', data: 'data:image/jpeg;base64,' + jpeg.toString('base64') });
+  mainC.send({
+    type: 'freeze',
+    data: 'data:image/jpeg;base64,' + jpeg.toString('base64'),
+    forecastData: 'data:image/jpeg;base64,' + forecastJpeg.toString('base64'),
+  });
   const cs = await door.wait((m) => m.type === 'contact-sheet' && m.sheet.totalInRoll >= 1, 5000, 'contact-sheet');
-  ok(cs.sheet.frames.length >= 1, `定格照已加入当前卷接触印相表（ROLL ${cs.sheet.rollNumber}, 共 ${cs.sheet.totalInRoll} 张）`);
+  ok(
+    cs.sheet.frames.length >= 1 && cs.sheet.forecast?.has === true && !!cs.sheet.forecast?.url,
+    `定格照与下一轮 FORECAST 已加入当前卷接触印相表（ROLL ${cs.sheet.rollNumber}, 共 ${cs.sheet.totalInRoll} 张, forecast=${cs.sheet.forecast?.targetFrameNo}）`,
+  );
 
   await mainC.wait(isState('IDLE'), 10000, 'auto IDLE');
   await admin.wait(isState('IDLE'), 5000, 'admin IDLE');

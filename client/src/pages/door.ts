@@ -1,25 +1,19 @@
 /**
- * /door — tablet 1: entrance 35mm contact sheet (pure display, zero front camera)
- * - Pure #080706 background, adaptive 3×2 (<=6) or 4×3 (7..12 latest frames) contact sheet grid.
- * - Each frame uses strict `object-fit: contain` (16:9 preserved) with only frame number (01A, 02A...) below.
- * - Latest frame is circled with a fine red china-marker stroke; remaining empty slots show dim hairline frames.
- * - ENTER_BUFFER shows centered minimalist safelight-red prompt: LIFT CURTAIN · ENTER TOGETHER.
- * - Fixed opaque dark bottom bar: ROLL XX · CONTACT SHEET.
+ * /door — tablet 1: entrance 35mm contact sheet + extrapolated FORECAST slot (pure display, zero front camera)
+ * - Pure #080706 background, adaptive 3×2 (<=6) or 4×3 (7..12) contact sheet grid.
+ * - Shows chronological history frames (00A, 01A, 02A...) with strict `object-fit: contain`.
+ * - Immediately after history frames, a dark-red bordered FORECAST cell shows the server-pushed `currentForecast`
+ *   labeled `FORECAST · [NEXT FR]`.
+ * - ENTER_BUFFER shows centered minimalist safelight-red prompt: SHUTTER RELEASED · LIFT CURTAIN & ENTER.
+ * - Fixed opaque dark bottom bar: ROLL XX · HISTORY & EXTRAPOLATED NEXT FRAME.
  */
 import { Net, mountNetDot } from '../lib/net';
 import { escapeHtml, showStartOverlay } from '../lib/unlock';
 import { TITLE_EN } from '../lib/brand';
-import type { ContactSheetInfo, Phase } from '../../../shared/protocol';
+import type { ContactSheetInfo, ForecastInfo, Phase } from '../../../shared/protocol';
 
 function pad2(n: number): string {
   return String(Math.max(0, Math.floor(n))).padStart(2, '0');
-}
-
-function waxCircleSvg(): string {
-  return `<svg class="wax-ring" viewBox="0 0 200 130" preserveAspectRatio="none" aria-hidden="true">
-    <path d="M 18,64 C 16,24 58,9 103,10 C 152,11 187,27 186,65 C 185,103 147,120 98,119 C 48,118 15,100 22,58"
-      fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" />
-  </svg>`;
 }
 
 export default async function door(app: HTMLElement): Promise<void> {
@@ -31,11 +25,11 @@ export default async function door(app: HTMLElement): Promise<void> {
         <div class="cs-grid cols-3" id="grid"></div>
       </main>
       <footer class="cs-foot">
-        <span id="footText">ROLL 01 · CONTACT SHEET</span>
+        <span id="footText">ROLL 01 · HISTORY &amp; EXTRAPOLATED NEXT FRAME</span>
       </footer>
     </div>
     <div class="door-enter" id="enterModal">
-      <div class="door-enter-txt">LIFT CURTAIN · ENTER TOGETHER</div>
+      <div class="door-enter-txt">SHUTTER RELEASED · LIFT CURTAIN &amp; ENTER</div>
     </div>`;
 
   const sheetWrap = app.querySelector('#sheetWrap') as HTMLDivElement;
@@ -48,36 +42,55 @@ export default async function door(app: HTMLElement): Promise<void> {
 
   let sheetKey = '';
 
-  function renderSheet(sheet?: ContactSheetInfo | null): void {
+  function renderSheet(sheet?: ContactSheetInfo | null, stateForecast?: ForecastInfo | null): void {
     const rollNo = sheet?.rollNumber ?? net.config?.rollNumber ?? net.round?.rollNumber ?? 1;
     const allFrames = sheet?.frames ?? [];
+    const forecast = sheet?.forecast ?? stateForecast ?? net.state?.forecast ?? null;
     const totalExposed = sheet?.totalInRoll ?? allFrames.length;
-    const key = JSON.stringify([rollNo, totalExposed, allFrames.map((f) => f.url)]);
-    footText.textContent = `ROLL ${pad2(rollNo)} · CONTACT SHEET`;
+    const fcKey = forecast ? `${forecast.has}:${forecast.version}:${forecast.targetFrameNo}:${forecast.url ?? ''}` : 'none';
+    const key = JSON.stringify([rollNo, totalExposed, allFrames.map((f) => f.url), fcKey]);
+    footText.textContent = `ROLL ${pad2(rollNo)} · HISTORY & EXTRAPOLATED NEXT FRAME`;
 
     if (key === sheetKey) return;
     sheetKey = key;
 
-    const visible = allFrames.slice(-12);
-    const totalSlots = visible.length <= 6 ? 6 : 12;
+    // Leave at least 1 slot for the trailing FORECAST cell (up to 11 history + 1 forecast = 12)
+    const visible = allFrames.slice(-11);
+    const totalSlots = visible.length + 1 <= 6 ? 6 : 12;
     grid.className = `cs-grid ${totalSlots === 6 ? 'cols-3' : 'cols-4'}`;
 
     const cells: string[] = [];
-    visible.forEach((f, idx) => {
-      const isLatest = idx === visible.length - 1;
+    visible.forEach((f) => {
       cells.push(`
-        <div class="cs-cell filled${isLatest ? ' latest' : ''}">
+        <div class="cs-cell filled">
           <div class="cs-imgbox">
             <img src="${escapeHtml(f.url)}" alt="${escapeHtml(f.frameNo)}" loading="eager" />
-            ${isLatest ? waxCircleSvg() : ''}
           </div>
           <div class="cs-label">${escapeHtml(f.frameNo)}</div>
         </div>`);
     });
 
-    const lastIndex = visible[visible.length - 1]?.index ?? visible.length;
-    for (let k = visible.length; k < totalSlots; k++) {
-      const nextNo = lastIndex + (k - visible.length + 1);
+    // Trailing FORECAST slot highlighted in fine dark-red border
+    const targetNo = forecast?.targetFrameNo || `${pad2(visible.length)}A`;
+    if (forecast?.has && forecast.url) {
+      cells.push(`
+        <div class="cs-cell forecast">
+          <div class="cs-imgbox">
+            <img src="${escapeHtml(forecast.url)}" alt="Forecast ${escapeHtml(targetNo)}" loading="eager" />
+          </div>
+          <div class="cs-label">FORECAST · ${escapeHtml(targetNo)}</div>
+        </div>`);
+    } else {
+      cells.push(`
+        <div class="cs-cell forecast empty">
+          <div class="cs-imgbox"></div>
+          <div class="cs-label">${visible.length === 0 ? 'SEED · 00A' : `FORECAST · ${escapeHtml(targetNo)}`}</div>
+        </div>`);
+    }
+
+    const startIdx = visible.length === 0 ? 1 : (visible[visible.length - 1]?.index ?? visible.length - 1) + 2;
+    for (let k = visible.length + 1; k < totalSlots; k++) {
+      const nextNo = startIdx + (k - (visible.length + 1));
       cells.push(`
         <div class="cs-cell empty">
           <div class="cs-imgbox"></div>
@@ -106,14 +119,14 @@ export default async function door(app: HTMLElement): Promise<void> {
     enterModal.classList.toggle('show', isEnter);
     sheetWrap.classList.toggle('dim-deep', isEnter);
     sheetWrap.classList.toggle('dim', isDim);
-    renderSheet(net.contactSheet);
+    renderSheet(net.contactSheet, net.state?.forecast ?? null);
   }
 
   net.on('state', (m) => renderPhase(m.state));
   net.on('contact-sheet', (m) => renderSheet(m.sheet));
   net.on('config', () => renderSheet(net.contactSheet));
   net.on('open', () => {
-    renderSheet(net.contactSheet);
+    renderSheet(net.contactSheet, net.state?.forecast ?? null);
     void refreshSheetHttp();
   });
 

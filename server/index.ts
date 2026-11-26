@@ -22,16 +22,20 @@ import {
   ASSETS_DIR,
   DATA_DIR,
   countRollFramesSync,
+  currentForecastArchiveUrl,
   decodeJpeg,
   doorPhotoInfo,
   ensureDirs,
+  forecastInfo,
   getContactSheet,
   listArchive,
   loadConfig,
   pad,
   resetDoorPhoto,
+  resetForecast,
   sanitizeConfig,
   saveConfig,
+  saveForecast,
   saveFreeze,
 } from './storage.js';
 
@@ -123,6 +127,12 @@ app.use('/data', (req: Request, res: Response, next: NextFunction) => {
   if (/\.tmp$/i.test(req.path)) return void res.status(404).end();
   if (req.path.startsWith('/archive')) {
     const curPrefix = `/archive/roll-${pad(config.rollNumber, 2)}/`;
+    if (!req.path.startsWith(curPrefix) && !tokenOk(req)) {
+      return void res.status(401).end();
+    }
+  }
+  if (req.path.startsWith('/forecasts')) {
+    const curPrefix = `/forecasts/roll-${pad(config.rollNumber, 2)}/`;
     if (!req.path.startsWith(curPrefix) && !tokenOk(req)) {
       return void res.status(401).end();
     }
@@ -339,7 +349,7 @@ function handleMessage(ws: WebSocket, peer: Peer, msg: ClientMsg): void {
       return onTriggerFix(ws);
     case 'freeze':
       if (peer.role !== 'main') return;
-      return void onFreeze(ws, msg.data);
+      return void onFreeze(ws, msg.data, msg.forecastData);
     case 'admin': {
       if (peer.role !== 'admin' || !(peer.isAdmin || (ADMIN_TOKEN && msg.token === ADMIN_TOKEN))) {
         return send(ws, { type: 'ack', what: msg.action, ok: false, message: 'Not authorised (ADMIN_TOKEN)' });
@@ -364,7 +374,7 @@ let lastEnergyAt = 0;
 let lastFixedRoundEndAt = 0;
 let freezeSaving = false;
 
-function freshRound(id: number, rollNumber: number, frameNumber: number): RoundInfo {
+function freshRound(id: number, rollNumber: number, frameNumber: number, predictedUrl: string | null = null): RoundInfo {
   return {
     id,
     rollNumber,
@@ -374,11 +384,12 @@ function freshRound(id: number, rollNumber: number, frameNumber: number): RoundI
     finalDevProgress: null,
     fixTriggeredBy: null,
     hasFreeze: false,
+    predictedUrl,
     trigger: null,
   };
 }
 
-let round: RoundInfo = freshRound(0, config.rollNumber, countRollFramesSync(config.rollNumber) + 1);
+let round: RoundInfo = freshRound(0, config.rollNumber, countRollFramesSync(config.rollNumber));
 
 function nextPhaseAfter(cur: Phase): Phase {
   switch (cur) {
@@ -432,6 +443,7 @@ function stateMsg(): ServerMsg {
     timeScale: TIME_SCALE,
     round,
     doorPhoto: doorPhotoInfo(),
+    forecast: forecastInfo(config.rollNumber),
   };
 }
 
@@ -533,8 +545,9 @@ function schedule(atMs: number): void {
 
 function tryStart(trigger: string): boolean {
   if (state !== 'IDLE') return false;
-  const nextFrame = countRollFramesSync(config.rollNumber) + 1;
-  round = freshRound(round.id + 1, config.rollNumber, nextFrame);
+  const nextFrame = countRollFramesSync(config.rollNumber);
+  const predictedUrl = nextFrame > 0 ? currentForecastArchiveUrl(config.rollNumber) : null;
+  round = freshRound(round.id + 1, config.rollNumber, nextFrame, predictedUrl);
   round.trigger = trigger;
   enter('ENTER_BUFFER');
   return true;
@@ -558,7 +571,7 @@ function onTriggerFix(ws: WebSocket): void {
   send(ws, { type: 'ack', what: 'TRIGGER_FIX', ok: true, message: 'Fixed' });
 }
 
-async function onFreeze(ws: WebSocket, data: string): Promise<void> {
+async function onFreeze(ws: WebSocket, data: string, forecastData?: string): Promise<void> {
   const buf = typeof data === 'string' ? decodeJpeg(data) : null;
   if (!buf) return send(ws, { type: 'ack', what: 'freeze', ok: false, message: 'Not a valid JPEG' });
   if (round.hasFreeze || freezeSaving) {
@@ -571,10 +584,14 @@ async function onFreeze(ws: WebSocket, data: string): Promise<void> {
   freezeSaving = true;
   try {
     const devPct = (round.finalDevProgress ?? round.devProgress) * 100;
+    const fBuf = typeof forecastData === 'string' ? decodeJpeg(forecastData) : null;
+    if (fBuf) {
+      await saveForecast(fBuf, round.rollNumber, round.frameNumber + 1);
+    }
     const { photo, archiveName, sheet } = await saveFreeze(buf, round.rollNumber, round.frameNumber, round.id, devPct);
     round.hasFreeze = true;
     currentSheet = sheet;
-    console.log(`[round ${round.id}] 底片已入档 ${archiveName} (${(buf.length / 1024).toFixed(0)}KB, dev=${Math.round(devPct)}%)`);
+    console.log(`[round ${round.id}] 底片已入档 ${archiveName} (${(buf.length / 1024).toFixed(0)}KB, dev=${Math.round(devPct)}%${fBuf ? ', forecast updated' : ''})`);
     send(ws, { type: 'ack', what: 'freeze', ok: true, message: archiveName });
     broadcast({ type: 'door-photo', photo, serverTime: Date.now() });
     broadcast({ type: 'contact-sheet', sheet, serverTime: Date.now() });
@@ -613,10 +630,12 @@ async function onAdmin(ws: WebSocket, action: string, cfg?: Partial<AppConfig>):
         console.error('[config] 保存新胶卷号失败', err);
       }
       const photo = await resetDoorPhoto();
+      await resetForecast();
       currentSheet = await getContactSheet(config.rollNumber);
       if (state === 'IDLE') {
         round.rollNumber = config.rollNumber;
-        round.frameNumber = 1;
+        round.frameNumber = 0;
+        round.predictedUrl = null;
       }
       console.log(`[admin] 开启新胶卷 ROLL ${pad(config.rollNumber, 2)}（历史归档完整保留）`);
       broadcast({ type: 'config', config });
@@ -627,7 +646,7 @@ async function onAdmin(ws: WebSocket, action: string, cfg?: Partial<AppConfig>):
         type: 'ack',
         what: 'newRoll',
         ok: true,
-        message: `Started Roll ${pad(config.rollNumber, 2)} · contact sheet cleared (archive preserved)`,
+        message: `Started Roll ${pad(config.rollNumber, 2)} · contact sheet & forecast cleared (archive preserved)`,
       });
     }
 
@@ -658,6 +677,7 @@ async function onAdmin(ws: WebSocket, action: string, cfg?: Partial<AppConfig>):
         revealSec: cfg?.revealSec ?? config.revealSec,
         noiseFloor: cfg?.noiseFloor ?? config.noiseFloor,
         devSpeed: cfg?.devSpeed ?? config.devSpeed,
+        pastOpacity: cfg?.pastOpacity ?? config.pastOpacity,
         printMode: cfg?.printMode ?? config.printMode,
         rollNumber: cfg?.rollNumber ?? config.rollNumber,
       };

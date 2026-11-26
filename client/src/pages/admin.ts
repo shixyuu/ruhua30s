@@ -48,7 +48,7 @@ export default function admin(app: HTMLElement): void {
       <!-- 1. Trigger & Live Phase -->
       <section class="card trigger-card">
         <button class="shutter-v3" id="shutter" type="button" disabled>
-          <span class="s-meta"><span id="shutterRoll">ROLL 01 · NEXT FR 01A</span><span class="kbd">SPACE</span></span>
+          <span class="s-meta"><span id="shutterRoll">ROLL 01 · NEXT: FR 00A (SEED)</span><span class="kbd">SPACE</span></span>
           <span class="s-main">PRESS SHUTTER · START</span>
           <span class="s-hint" id="shutterHint">Connecting…</span>
         </button>
@@ -77,6 +77,16 @@ export default function admin(app: HTMLElement): void {
         <div class="instax-pv">
           <img id="latest" alt="Latest archival print" class="hidden" />
           <div class="instax-empty" id="latestNone">No print fixed yet. Trigger a round to capture a clean borderless Instax print.</div>
+        </div>
+        <div class="instax-compare" id="compareStrip">
+          <div class="cmp-box">
+            <div class="cmp-img"><img id="cmpPredicted" alt="Predicted" class="hidden" /><span id="cmpPredNone">—</span></div>
+            <div class="cmp-lbl">THIS ROUND PREDICTED</div>
+          </div>
+          <div class="cmp-box forecast">
+            <div class="cmp-img"><img id="cmpForecast" alt="Next Forecast" class="hidden" /><span id="cmpFcNone">—</span></div>
+            <div class="cmp-lbl" id="cmpFcLbl">NEXT FORECAST</div>
+          </div>
         </div>
         <button class="btn-instax" id="shareInstax" type="button" disabled>SAVE / SHARE FOR INSTAX</button>
       </section>
@@ -111,8 +121,12 @@ export default function admin(app: HTMLElement): void {
             <input id="floorRange" type="range" min="${CONFIG_BOUNDS.noiseFloor.min}" max="${CONFIG_BOUNDS.noiseFloor.max}" step="0.01" value="0.08" />
           </label>
           <label class="slider-ctl">
-            <div class="sl-head"><span>Develop Speed</span><span class="mono" id="speedVal">0.18</span></div>
-            <input id="speedRange" type="range" min="${CONFIG_BOUNDS.devSpeed.min}" max="${CONFIG_BOUNDS.devSpeed.max}" step="0.01" value="0.18" />
+            <div class="sl-head"><span>Develop Speed</span><span class="mono" id="speedVal">0.20</span></div>
+            <input id="speedRange" type="range" min="${CONFIG_BOUNDS.devSpeed.min}" max="${CONFIG_BOUNDS.devSpeed.max}" step="0.01" value="0.20" />
+          </label>
+          <label class="slider-ctl">
+            <div class="sl-head"><span>Past Opacity (Recursive Overlay)</span><span class="mono" id="pastVal">0.48</span></div>
+            <input id="pastRange" type="range" min="${CONFIG_BOUNDS.pastOpacity.min}" max="${CONFIG_BOUNDS.pastOpacity.max}" step="0.01" value="0.48" />
           </label>
         </div>
 
@@ -173,6 +187,11 @@ export default function admin(app: HTMLElement): void {
   const latestImg = $<HTMLImageElement>('#latest');
   const latestNone = $<HTMLDivElement>('#latestNone');
   const latestSlug = $<HTMLSpanElement>('#latestSlug');
+  const cmpPredicted = $<HTMLImageElement>('#cmpPredicted');
+  const cmpPredNone = $<HTMLSpanElement>('#cmpPredNone');
+  const cmpForecast = $<HTMLImageElement>('#cmpForecast');
+  const cmpFcNone = $<HTMLSpanElement>('#cmpFcNone');
+  const cmpFcLbl = $<HTMLDivElement>('#cmpFcLbl');
   const shareBtn = $<HTMLButtonElement>('#shareInstax');
   const devReadout = $<HTMLSpanElement>('#devReadout');
   const micPct = $<HTMLSpanElement>('#micPct');
@@ -184,6 +203,8 @@ export default function admin(app: HTMLElement): void {
   const floorVal = $<HTMLSpanElement>('#floorVal');
   const speedRange = $<HTMLInputElement>('#speedRange');
   const speedVal = $<HTMLSpanElement>('#speedVal');
+  const pastRange = $<HTMLInputElement>('#pastRange');
+  const pastVal = $<HTMLSpanElement>('#pastVal');
   const modeNegBtn = $<HTMLButtonElement>('#modeNeg');
   const modePosBtn = $<HTMLButtonElement>('#modePos');
   const testDevBtn = $<HTMLButtonElement>('#testDev');
@@ -332,6 +353,11 @@ export default function admin(app: HTMLElement): void {
     speedVal.textContent = v.toFixed(2);
     sendConfigPatch({ devSpeed: v });
   });
+  pastRange.addEventListener('input', () => {
+    const v = Number(pastRange.value);
+    pastVal.textContent = v.toFixed(2);
+    sendConfigPatch({ pastOpacity: v });
+  });
 
   function setPrintMode(mode: PrintMode): void {
     modeNegBtn.classList.toggle('active', mode === 'photogram_negative');
@@ -365,6 +391,8 @@ export default function admin(app: HTMLElement): void {
     floorLine.style.left = `${Math.round(c.noiseFloor * 100)}%`;
     speedRange.value = String(c.devSpeed);
     speedVal.textContent = c.devSpeed.toFixed(2);
+    pastRange.value = String(c.pastOpacity ?? 0.48);
+    pastVal.textContent = (c.pastOpacity ?? 0.48).toFixed(2);
     modeNegBtn.classList.toggle('active', c.printMode === 'photogram_negative');
     modePosBtn.classList.toggle('active', c.printMode === 'positive_print');
 
@@ -419,22 +447,51 @@ export default function admin(app: HTMLElement): void {
     lights.querySelectorAll('.light').forEach((l) => l.classList.remove('on'));
   });
 
+  function updateForecastCompare(sheet?: ContactSheetInfo | null): void {
+    const predUrl = net.round?.predictedUrl ?? null;
+    if (predUrl) {
+      cmpPredicted.src = predUrl;
+      cmpPredicted.classList.remove('hidden');
+      cmpPredNone.classList.add('hidden');
+    } else {
+      cmpPredicted.classList.add('hidden');
+      cmpPredicted.removeAttribute('src');
+      cmpPredNone.classList.remove('hidden');
+    }
+    const fc = sheet?.forecast ?? net.state?.forecast ?? null;
+    if (fc?.has && fc.url) {
+      cmpForecast.src = fc.url;
+      cmpForecast.classList.remove('hidden');
+      cmpFcNone.classList.add('hidden');
+      cmpFcLbl.textContent = `NEXT FORECAST (${fc.targetFrameNo})`;
+    } else {
+      cmpForecast.classList.add('hidden');
+      cmpForecast.removeAttribute('src');
+      cmpFcNone.classList.remove('hidden');
+      cmpFcLbl.textContent = 'NEXT FORECAST';
+    }
+  }
+
   // ---------------- Archive & Latest Proof ----------------
   function renderArchive(sheet?: ContactSheetInfo | null): void {
     const rollNo = sheet?.rollNumber ?? net.config?.rollNumber ?? 1;
     const frames = sheet?.frames ?? [];
     archTitle.textContent = `ROLL ${pad2(rollNo)} ARCHIVE (${frames.length})`;
     if (net.phase === 'IDLE') {
-      shutterRoll.textContent = `ROLL ${pad2(rollNo)} · NEXT FR ${pad2(frames.length + 1)}A`;
+      shutterRoll.textContent =
+        frames.length === 0
+          ? `ROLL ${pad2(rollNo)} · NEXT: FR 00A (SEED)`
+          : `ROLL ${pad2(rollNo)} · NEXT: FR ${pad2(frames.length)}A`;
     }
+    updateForecastCompare(sheet);
 
     if (frames.length === 0) {
-      archive.innerHTML = `<div class="arch-empty">Roll ${pad2(rollNo)} is empty.</div>`;
+      archive.innerHTML = `<div class="arch-empty">Roll ${pad2(rollNo)} is empty. Next shutter releases seed frame 00A.</div>`;
       return;
     }
 
     const latestFrame = frames[frames.length - 1];
-    const dlName = `RH30-R${pad2(rollNo)}-${latestFrame.frameNo}.jpg`;
+    const dlName = `RH30_R${pad2(rollNo)}_FR${latestFrame.frameNo}.jpg`;
     latestImg.src = latestFrame.url;
     latestImg.classList.remove('hidden');
     latestNone.classList.add('hidden');
@@ -444,7 +501,7 @@ export default function admin(app: HTMLElement): void {
     const reversed = [...frames].reverse();
     archive.innerHTML = reversed
       .map((f, idx) => {
-        const fn = `RH30-R${pad2(rollNo)}-${f.frameNo}.jpg`;
+        const fn = `RH30_R${pad2(rollNo)}_FR${f.frameNo}.jpg`;
         return `<div class="arch-item${idx === 0 ? ' latest' : ''}">
           <a href="${escapeHtml(f.url)}" download="${escapeHtml(fn)}" title="Download ${escapeHtml(fn)}">
             <img src="${escapeHtml(f.url)}" loading="lazy" alt="${escapeHtml(f.frameNo)}" />
@@ -494,8 +551,9 @@ export default function admin(app: HTMLElement): void {
       const p = st.state;
       phaseEl.textContent = p;
       const r = st.round;
-      roundMeta.textContent = `ROUND ${String(r.id).padStart(3, '0')} · ROLL ${pad2(r.rollNumber)} · ${pad2(r.frameNumber)}A`;
+      roundMeta.textContent = `ROUND ${String(r.id).padStart(3, '0')} · ROLL ${pad2(r.rollNumber)} · ${pad2(r.frameNumber)}A${r.frameNumber === 0 ? ' (SEED)' : ''}`;
       if (p !== 'IDLE') shutterRoll.textContent = `ROLL ${pad2(r.rollNumber)} · FR ${pad2(r.frameNumber)}A`;
+      else updateForecastCompare(net.contactSheet);
 
       const el = net.elapsedMs() / 1000;
       const dur = st.phaseDurationMs / 1000;
