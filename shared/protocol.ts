@@ -153,9 +153,19 @@ export interface PersistedState {
   rollNumber: number;
   frames: ContactFrame[];
   latestFrameUrl: string | null;
-  hasQueuedPhoto: boolean;
-  queuedPhotoUrl: string | null;
-  queuedAt: number | null;
+  hasQueuedPhoto: boolean; // queue head exists
+  queuedPhotoUrl: string | null; // queue head URL
+  queuedAt: number | null; // queue head upload time
+  /** FIFO upload queue (oldest first), max QUEUE_MAX */
+  queue: QueuedPhoto[];
+  queueLength: number;
+  queueMax: number;
+}
+
+export interface QueuedPhoto {
+  file: string; // file name inside data/queue/
+  url: string;
+  at: number;
 }
 
 export interface StorageStats {
@@ -197,6 +207,7 @@ export type ServerMsg =
   | { type: 'REQUEST_SNAPSHOT' }
   | { type: 'SNAPSHOT_READY'; imageData: string; ts: number }
   | { type: 'DETECT_VIEW'; on: boolean; reref?: boolean }
+  | { type: 'REREF_EVENT'; kind: 'round' | 'preview'; reason: string; frames: number; ts: number }
   | { type: 'DETECT_FRAME'; imageData: string; stats: DetectStatsMsg; ts: number }
   | { type: 'door-photo'; photo: DoorPhotoInfo; serverTime: number }
   | { type: 'contact-sheet'; sheet: ContactSheetInfo; serverTime: number }
@@ -219,6 +230,7 @@ export type ClientMsg =
   | { type: 'REQUEST_SNAPSHOT'; token?: string }
   | { type: 'SNAPSHOT_DATA'; imageData: string }
   | { type: 'DETECT_VIEW'; on: boolean; reref?: boolean; token?: string }
+  | { type: 'REREF_EVENT'; kind: 'round' | 'preview'; reason: string; frames: number }
   | { type: 'DETECT_FRAME'; imageData: string; stats: DetectStatsMsg }
   | { type: 'TEST_FLASH'; token?: string }
   | { type: 'AUDIO_ENERGY'; level: number }

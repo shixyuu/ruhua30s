@@ -36,7 +36,10 @@ import {
   loadPersistedState,
   nextFrameNumber,
   pad,
-  purgeQueuedPhoto,
+  consumeQueuedPhoto,
+  withLiveQueue,
+  QueueFullError,
+  QUEUE_MAX,
   resetDoorPhoto,
   rollDirName,
   sanitizeConfig,
@@ -59,6 +62,7 @@ const DEV_TICK_MS = 50;
 /** Admin DETECT VIEW auto-expires so /main stops streaming if the admin tab is closed */
 const DETECT_VIEW_TTL_MS = 10 * 60_000;
 let detectViewOn = false;
+let lastReref: Extract<ServerMsg, { type: 'REREF_EVENT' }> | null = null;
 let detectViewUntil = 0;
 const detectViewTimer = setInterval(() => {
   if (detectViewOn && Date.now() > detectViewUntil) {
@@ -99,7 +103,9 @@ app.get('/api/health', (_req, res) => {
     clients: clientCounts(),
     round: round.id,
     rollNumber: config.rollNumber,
-    hasQueuedPhoto: persisted.hasQueuedPhoto,
+    hasQueuedPhoto: withLiveQueue(persisted).hasQueuedPhoto,
+    queueLength: withLiveQueue(persisted).queueLength,
+    queueMax: QUEUE_MAX,
     timeScale: TIME_SCALE,
     uptime: Math.round(process.uptime()),
     serverTime: Date.now(),
@@ -107,6 +113,7 @@ app.get('/api/health', (_req, res) => {
 });
 
 app.get('/api/state', async (_req, res) => {
+  persisted = withLiveQueue(persisted);
   const storage = await computeStorageStats(persisted);
   res.set('Cache-Control', 'no-store');
   res.json({
@@ -143,10 +150,24 @@ app.post('/api/upload', async (req, res) => {
   const { imageData } = req.body || {};
   const buf = decodeJpeg(imageData);
   if (!buf) return void res.status(400).json({ ok: false, error: 'Invalid JPEG photo' });
-  persisted = await saveQueuedPhoto(persisted, buf);
+  try {
+    persisted = await saveQueuedPhoto(persisted, buf);
+  } catch (err) {
+    if (err instanceof QueueFullError) {
+      return void res.status(429).json({
+        ok: false,
+        error: 'queue_full',
+        message: `The darkroom queue is full (${QUEUE_MAX} photos). Please try again in a few minutes.`,
+        queueLength: QUEUE_MAX,
+        queueMax: QUEUE_MAX,
+      });
+    }
+    console.error('[upload] save failed', err);
+    return void res.status(500).json({ ok: false, error: 'Upload failed' });
+  }
   await broadcastSync();
-  console.log(`[upload] 观众已上传照片至队列 (${(buf.length / 1024).toFixed(0)}KB)`);
-  res.json({ ok: true, queuedPhotoUrl: persisted.queuedPhotoUrl });
+  console.log(`[upload] 观众已上传照片至队列 (${(buf.length / 1024).toFixed(0)}KB, queue ${persisted.queueLength}/${QUEUE_MAX})`);
+  res.json({ ok: true, queuedPhotoUrl: persisted.queuedPhotoUrl, queueLength: persisted.queueLength, queueMax: QUEUE_MAX });
 });
 
 app.get('/api/archive', async (req, res) => {
@@ -292,6 +313,7 @@ function pushClients(): void {
 }
 
 async function broadcastSync(): Promise<void> {
+  persisted = withLiveQueue(persisted);
   const storage = await computeStorageStats(persisted);
   broadcast({ type: 'door-photo', photo: doorPhotoInfo(), serverTime: Date.now() });
   broadcast({ type: 'contact-sheet', sheet: contactSheetFromState(persisted), serverTime: Date.now() });
@@ -352,11 +374,13 @@ wss.on('connection', (ws, req) => {
 });
 
 async function sendFullSync(ws: WebSocket, peer: Peer): Promise<void> {
+  persisted = withLiveQueue(persisted);
   send(ws, { type: 'time', clientTime: 0, serverTime: Date.now() });
   send(ws, stateMsg());
   send(ws, { type: 'config', config });
   send(ws, { type: 'calibration', calibration });
   if (detectViewOn && (peer.role === 'main' || peer.role === 'admin')) send(ws, { type: 'DETECT_VIEW', on: true });
+  if (lastReref && peer.role === 'admin') send(ws, lastReref);
   send(ws, { type: 'door-photo', photo: doorPhotoInfo(), serverTime: Date.now() });
   send(ws, { type: 'contact-sheet', sheet: contactSheetFromState(persisted), serverTime: Date.now() });
   const storage = await computeStorageStats(persisted);
@@ -431,6 +455,16 @@ function handleMessage(ws: WebSocket, peer: Peer, msg: ClientMsg): void {
       detectViewOn = !!msg.on;
       detectViewUntil = detectViewOn ? Date.now() + DETECT_VIEW_TTL_MS : 0;
       broadcast({ type: 'DETECT_VIEW', on: detectViewOn, reref: !!msg.reref }, (p) => p.role === 'main' || p.role === 'admin');
+      return;
+    }
+    case 'REREF_EVENT': {
+      if (peer.role !== 'main') return;
+      const reason = String(msg.reason ?? '').slice(0, 120);
+      const kind = msg.kind === 'preview' ? 'preview' : 'round';
+      const frames = Math.max(0, Math.min(99, Number(msg.frames) || 0));
+      console.log(`[reref] ${kind === 'round' ? 'round clean plate' : 'preview reference'} captured (${frames} frame${frames === 1 ? '' : 's'}) · ${reason}`);
+      lastReref = { type: 'REREF_EVENT', kind, reason, frames, ts: Date.now() };
+      broadcast(lastReref, (p) => p.role === 'admin');
       return;
     }
     case 'DETECT_FRAME': {
@@ -536,7 +570,7 @@ function durationFor(p: Phase): number {
     case 'CALIBRATING':
       return 0;
     case 'CAPTURE_CLEAN':
-      sec = 0.8;
+      sec = 1.6; // new image shown -> camera settle (~0.5s) -> average clean frames
       break;
     case 'OBSERVE':
       sec = config.observeSec;
@@ -637,8 +671,8 @@ function enter(next: Phase, fixSource: 'station2' | 'timeout' | 'admin' = 'timeo
   if (prev === 'REVEAL' && next === 'IDLE') {
     lastFixedRoundEndAt = Date.now();
     // Privacy: ensure user's uploaded original photo is permanently deleted after round ends
-    if (persisted.hasQueuedPhoto && round.sampleIndex === 0) {
-      void purgeQueuedPhoto(persisted).then((nextSt) => {
+    if (round.sampleIndex === 0 && round.sourceUrl) {
+      void consumeQueuedPhoto(persisted, round.sourceUrl).then((nextSt) => {
         persisted = nextSt;
         void broadcastSync();
       });
@@ -684,6 +718,7 @@ function schedule(atMs: number): void {
 
 function tryStart(trigger: string): boolean {
   if (state !== 'IDLE') return false;
+  persisted = withLiveQueue(persisted);
   const nextFrame = nextFrameNumber(persisted);
   let sourceUrl: string | null = null;
   let sampleIndex = 0;
@@ -748,8 +783,8 @@ async function onFreeze(ws: WebSocket, data: string): Promise<void> {
     persisted = saved.next;
     round.hasFreeze = true;
     // Immediately purge user's uploaded original photo once final print is archived
-    if (persisted.hasQueuedPhoto && round.sampleIndex === 0) {
-      persisted = await purgeQueuedPhoto(persisted);
+    if (round.sampleIndex === 0 && round.sourceUrl) {
+      persisted = await consumeQueuedPhoto(persisted, round.sourceUrl);
     }
     console.log(`[round ${round.id}] 彩色暗房成品已入档 ${saved.archiveName} (${(buf.length / 1024).toFixed(0)}KB, dev=${Math.round(devPct)}%, outcome=${round.outcome ?? 'FIXED_OPTIMAL'})`);
     send(ws, { type: 'ack', what: 'freeze', ok: true, message: saved.archiveName });
@@ -771,12 +806,7 @@ async function performNewRoll(): Promise<void> {
     console.error('[config] 保存新胶卷号失败', err);
   }
   await resetDoorPhoto();
-  persisted = {
-    ...emptyPersistedState(config.rollNumber),
-    hasQueuedPhoto: persisted.hasQueuedPhoto,
-    queuedPhotoUrl: persisted.queuedPhotoUrl,
-    queuedAt: persisted.queuedAt,
-  };
+  persisted = withLiveQueue(emptyPersistedState(config.rollNumber));
   await savePersistedState(persisted);
   if (state === 'IDLE') {
     round = freshRound(round.id, config.rollNumber, 1);

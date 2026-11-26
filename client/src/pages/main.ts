@@ -38,7 +38,7 @@ const LS_CAM = 'ruhua.main.camera';
 const LS_SINK = 'ruhua.main.sink';
 const EXPOSE_SAMPLE_MS = 140; // ~7 FPS camera dodge integration
 const CLEAN_SAMPLE_MS = 150;
-const CLEAN_SETTLE_MS = 300; // ignore camera frames right after the projection changes
+const CLEAN_SETTLE_MS = 500; // ignore camera frames right after the projection changes (latency + auto-exposure)
 const DETECT_VIEW_MS = 400; // admin detect view stream (~2.5 fps)
 
 export default async function mainPage(app: HTMLElement): Promise<void> {
@@ -286,7 +286,11 @@ export default async function mainPage(app: HTMLElement): Promise<void> {
         liveDevProgress = 0;
         timelineBar.classList.add('hidden');
         engine.beginRound();
+        engine.setRoundRefReason(
+          `new image · round ${roundId} · ${st.round.sampleIndex === 0 ? 'upload' : st.round.sampleIndex === 7 ? 'last print' : `sample #${st.round.sampleIndex || 1}`}`,
+        );
         await engine.loadSource(st.round.sourceUrl, st.round.sampleIndex || 1);
+        engine.resetPreviewRef('new image loaded');
         await ensureCamera();
         if (net.phase === 'CAPTURE_CLEAN') startCleanSampler();
         break;
@@ -391,7 +395,7 @@ export default async function mainPage(app: HTMLElement): Promise<void> {
       const phase = net.phase ?? 'IDLE';
       if (phase !== detectPhase) {
         detectPhase = phase;
-        engine.resetPreviewRef(); // projection changed: new preview reference
+        engine.resetPreviewRef(`projection changed → ${phase}`);
       }
       const stats =
         phase === 'EXPOSE' && !net.config?.mouseSimulator
@@ -407,10 +411,30 @@ export default async function mainPage(app: HTMLElement): Promise<void> {
   }
   net.on('DETECT_VIEW', (m) => {
     if (!m.on) return stopDetectView();
-    if (m.reref) engine.resetPreviewRef();
+    if (m.reref) engine.resetPreviewRef('admin RE-REFERENCE');
     if (detectTimer === null) startDetectView();
   });
   net.on('close', stopDetectView);
+
+  // Re-reference whenever the image that will be projected changes (sample switch / queue head change)
+  let lastImageKey = '';
+  const imageKey = () => `${net.config?.sampleFallback ?? 0}|${net.persisted?.queuedPhotoUrl ?? ''}`;
+  const checkImageChange = () => {
+    const k = imageKey();
+    if (lastImageKey && k !== lastImageKey) engine.resetPreviewRef('next image changed');
+    lastImageKey = k;
+  };
+  net.on('config', checkImageChange);
+  net.on('STATE_SYNC', checkImageChange);
+
+  // Report every reference capture to the server log + /admin
+  let lastRefSentAt = 0;
+  window.setInterval(() => {
+    const r = engine.lastRef;
+    if (!r || r.at === lastRefSentAt) return;
+    lastRefSentAt = r.at;
+    net.send({ type: 'REREF_EVENT', kind: r.kind, reason: r.reason, frames: r.frames });
+  }, 300);
 
   // ====================================================================
   // render loop

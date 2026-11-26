@@ -127,6 +127,7 @@ export default function admin(app: HTMLElement): void {
         </div>
         <div class="det-view">
           <img id="detImg" alt="detection view from /main" class="hidden" />
+          <div class="cal-hint mono" id="rerefInfo">LAST RE-REFERENCE: —</div>
           <div class="cal-hint mono" id="detHint">Turn DETECT VIEW on: /main streams its camera (~2.5 fps). Left: camera + calibrated quad. Right: easel grid, red = above threshold, amber = accumulated dodge, dashed = photo area.</div>
         </div>
         <div class="meter-row det-meter">
@@ -225,7 +226,7 @@ export default function admin(app: HTMLElement): void {
         </div>
         <div class="storage-stat mono" id="storageStat">VPS STORAGE: 0.0 MB · 0 ROLLS · 0 FRAMES</div>
         <div class="cache-actions">
-          <button class="btn-act" id="clearTemp" type="button">CLEAR TEMP CACHE</button>
+          <button class="btn-act" id="clearTemp" type="button">CLEAR QUEUE</button>
           <button class="btn-act danger" id="purgeAll" type="button">PURGE ALL DATA</button>
         </div>
       </section>
@@ -264,6 +265,7 @@ export default function admin(app: HTMLElement): void {
   const detRerefBtn = $<HTMLButtonElement>('#detRerefBtn');
   const detImg = $<HTMLImageElement>('#detImg');
   const detHint = $<HTMLDivElement>('#detHint');
+  const rerefInfo = $<HTMLDivElement>('#rerefInfo');
   const detFill = $<HTMLDivElement>('#detFill');
   const detLine = $<HTMLDivElement>('#detLine');
   const detReadout = $<HTMLSpanElement>('#detReadout');
@@ -368,7 +370,7 @@ export default function admin(app: HTMLElement): void {
 
   wireTwoTap(resetBtn, 'RESET TO IDLE', 'CONFIRM RESET?', () => net.send({ type: 'admin', action: 'reset', token }));
   wireTwoTap(newRollBtn, 'NEW ROLL', 'CONFIRM NEW ROLL?', () => net.send({ type: 'admin', action: 'newRoll', token }));
-  wireTwoTap(clearTempBtn, 'CLEAR TEMP CACHE', 'CONFIRM CLEAR?', async () => {
+  wireTwoTap(clearTempBtn, 'CLEAR QUEUE', 'CONFIRM CLEAR QUEUE?', async () => {
     const r = await fetch('/api/cache/clear', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
@@ -377,7 +379,7 @@ export default function admin(app: HTMLElement): void {
     const j = await r.json();
     if (j.ok) {
       updatePersistedUi(j.state, j.storage);
-      toast('✓ Queue cache cleared');
+      toast('✓ Upload queue cleared');
     }
   });
   wireTwoTap(purgeAllBtn, 'PURGE ALL DATA', 'CONFIRM PURGE ALL?', async () => {
@@ -616,6 +618,17 @@ export default function admin(app: HTMLElement): void {
     toast('Reference re-captured on /main (keep the easel empty)');
   });
   net.on('DETECT_VIEW', (m) => setDetOn(m.on));
+  let lastRerefTs = 0;
+  let lastRerefText = '';
+  net.on('REREF_EVENT', (m) => {
+    lastRerefTs = m.ts;
+    const t = new Date(m.ts).toLocaleTimeString([], { hour12: false });
+    lastRerefText = `${m.kind === 'round' ? 'ROUND CLEAN PLATE' : 'PREVIEW REF'} @ ${t} · ${m.frames} FR · ${m.reason.toUpperCase()}`;
+    rerefInfo.textContent = `LAST RE-REFERENCE: ${lastRerefText} · 0s AGO`;
+  });
+  window.setInterval(() => {
+    if (lastRerefTs) rerefInfo.textContent = `LAST RE-REFERENCE: ${lastRerefText} · ${Math.round((Date.now() - lastRerefTs) / 1000)}s AGO`;
+  }, 1000);
   net.on('DETECT_FRAME', (m) => {
     if (!detOn) setDetOn(true);
     detLastFrameAt = Date.now();
@@ -804,13 +817,15 @@ export default function admin(app: HTMLElement): void {
 
   function updatePersistedUi(st?: PersistedState | null, storage?: StorageStats | null): void {
     if (st) {
-      queueState.textContent = st.hasQueuedPhoto ? 'QUEUE: READY (UPLOADED)' : 'QUEUE: WAITING FOR UPLOAD';
+      const qn = st.queueLength ?? (st.hasQueuedPhoto ? 1 : 0);
+      const qm = st.queueMax ?? 10;
+      queueState.textContent = st.hasQueuedPhoto ? `QUEUE: ${qn}/${qm} · NEXT READY (UPLOADED)` : `QUEUE: 0/${qm} · WAITING FOR UPLOAD`;
       queueState.classList.toggle('q-ready', st.hasQueuedPhoto);
     }
     if (storage) {
       const mb = (storage.totalBytes / (1024 * 1024)).toFixed(2);
       storageStat.textContent = `VPS STORAGE: ${mb} MB · ${storage.rollsCount} ROLLS · ${storage.framesCount} FRAMES`;
-      queueStat.textContent = `QUEUE: ${storage.queueCount}`;
+      queueStat.textContent = `QUEUE: ${storage.queueCount}/${st?.queueMax ?? net.persisted?.queueMax ?? 10}`;
     }
   }
 

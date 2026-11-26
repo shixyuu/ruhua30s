@@ -11,6 +11,7 @@ import {
   DEFAULT_CONFIG,
   DoorPhotoInfo,
   PersistedState,
+  QueuedPhoto,
   Point2D,
   StorageStats,
   outcomeShortCode,
@@ -25,6 +26,8 @@ const CONFIG_FILE = path.join(DATA_DIR, 'config.json');
 const STATE_FILE = path.join(DATA_DIR, 'state.json');
 const CALIBRATION_FILE = path.join(DATA_DIR, 'calibration.json');
 const DOOR_FILE = path.join(DATA_DIR, 'latest-door.jpg');
+/** Max photos waiting in the upload queue (env QUEUE_MAX, default 10) */
+export const QUEUE_MAX = Math.max(1, Math.min(100, Math.floor(Number(process.env.QUEUE_MAX) || 10)));
 
 export function ensureDirs(): void {
   for (const d of [ASSETS_DIR, DATA_DIR, ROLLS_DIR, QUEUE_DIR]) {
@@ -211,34 +214,86 @@ export function emptyPersistedState(rollNumber: number): PersistedState {
     hasQueuedPhoto: false,
     queuedPhotoUrl: null,
     queuedAt: null,
+    queue: [],
+    queueLength: 0,
+    queueMax: QUEUE_MAX,
   };
+}
+
+/** Recompute queue head / length fields from st.queue */
+function withQueue(st: PersistedState, queue: QueuedPhoto[]): PersistedState {
+  const head = queue[0] ?? null;
+  return {
+    ...st,
+    queue,
+    queueLength: queue.length,
+    queueMax: QUEUE_MAX,
+    hasQueuedPhoto: !!head,
+    queuedPhotoUrl: head ? head.url : null,
+    queuedAt: head ? head.at : null,
+  };
+}
+
+/** Authoritative in-memory queue (mutated synchronously, so concurrent uploads/rounds never lose entries) */
+let liveQueue: QueuedPhoto[] = [];
+
+/** Merge the authoritative queue into any state object before use/broadcast */
+export function withLiveQueue(st: PersistedState): PersistedState {
+  return withQueue(st, liveQueue);
+}
+
+let queueSeq = 0;
+function queueFileName(ts: number): string {
+  return `${ts}-${(++queueSeq).toString(36)}${Math.random().toString(36).slice(2, 6)}.jpg`;
+}
+
+/** Keep only queue entries whose files exist; migrate a legacy next.jpg into the queue */
+function loadQueueSync(raw: Partial<PersistedState>): QueuedPhoto[] {
+  const list: QueuedPhoto[] = Array.isArray(raw.queue)
+    ? raw.queue.filter(
+        (q): q is QueuedPhoto =>
+          !!q && typeof q.file === 'string' && /^[\w.-]+\.jpg$/.test(q.file) && fs.existsSync(path.join(QUEUE_DIR, q.file)),
+      )
+    : [];
+  const legacy = path.join(QUEUE_DIR, 'next.jpg');
+  if (fs.existsSync(legacy)) {
+    try {
+      const at = typeof raw.queuedAt === 'number' ? raw.queuedAt : Math.floor(fs.statSync(legacy).mtimeMs);
+      const file = queueFileName(at);
+      fs.renameSync(legacy, path.join(QUEUE_DIR, file));
+      list.push({ file, url: `/data/queue/${file}`, at });
+      console.log(`[queue] migrated legacy next.jpg -> ${file}`);
+    } catch (err) {
+      console.error('[queue] legacy next.jpg migration failed', err);
+    }
+  }
+  return list.sort((a, b) => a.at - b.at).slice(0, Math.max(QUEUE_MAX, list.length));
 }
 
 export function loadPersistedState(rollNumber: number): PersistedState {
   try {
     const raw = JSON.parse(fs.readFileSync(STATE_FILE, 'utf8')) as Partial<PersistedState>;
     const rNo = typeof raw.rollNumber === 'number' && raw.rollNumber >= 1 ? Math.floor(raw.rollNumber) : rollNumber;
-    const qPath = path.join(QUEUE_DIR, 'next.jpg');
-    const qExists = fs.existsSync(qPath);
-    const st: PersistedState = {
-      ...emptyPersistedState(rNo),
-      ...raw,
-      rollNumber: rNo,
-      frames: Array.isArray(raw.frames) ? raw.frames : [],
-      hasQueuedPhoto: qExists && !!raw.hasQueuedPhoto,
-      queuedPhotoUrl: qExists ? raw.queuedPhotoUrl ?? null : null,
-    };
+    const st: PersistedState = withQueue(
+      {
+        ...emptyPersistedState(rNo),
+        ...raw,
+        rollNumber: rNo,
+        frames: Array.isArray(raw.frames) ? raw.frames : [],
+      },
+      (liveQueue = loadQueueSync(raw)),
+    );
     atomicWriteJsonSync(STATE_FILE, st);
     return st;
   } catch {
-    const st = emptyPersistedState(rollNumber);
+    const st = withQueue(emptyPersistedState(rollNumber), (liveQueue = loadQueueSync({})));
     atomicWriteJsonSync(STATE_FILE, st);
     return st;
   }
 }
 
 export async function savePersistedState(st: PersistedState): Promise<void> {
-  await atomicWriteJson(STATE_FILE, st);
+  await atomicWriteJson(STATE_FILE, withQueue(st, liveQueue));
 }
 
 // ======================================================================
@@ -252,26 +307,45 @@ export function decodeJpeg(data: string): Buffer | null {
   return buf;
 }
 
-export async function saveQueuedPhoto(st: PersistedState, buf: Buffer): Promise<PersistedState> {
-  await fsp.mkdir(QUEUE_DIR, { recursive: true });
-  const ts = Date.now();
-  const target = path.join(QUEUE_DIR, 'next.jpg');
-  const tmp = tmpName(target);
-  await fsp.writeFile(tmp, buf);
-  await fsp.rename(tmp, target);
+export class QueueFullError extends Error {}
 
-  const next: PersistedState = {
-    ...st,
-    hasQueuedPhoto: true,
-    queuedPhotoUrl: `/data/queue/next.jpg?v=${ts}`,
-    queuedAt: ts,
-  };
+/** Append an uploaded photo to the FIFO queue (throws QueueFullError when QUEUE_MAX reached) */
+export async function saveQueuedPhoto(st: PersistedState, buf: Buffer): Promise<PersistedState> {
+  if (liveQueue.length >= QUEUE_MAX) throw new QueueFullError(`Queue full (${QUEUE_MAX})`);
+  const ts = Date.now();
+  const file = queueFileName(ts);
+  const entry: QueuedPhoto = { file, url: `/data/queue/${file}`, at: ts };
+  liveQueue = [...liveQueue, entry]; // reserve the slot synchronously
+  try {
+    await fsp.mkdir(QUEUE_DIR, { recursive: true });
+    const target = path.join(QUEUE_DIR, file);
+    const tmp = tmpName(target);
+    await fsp.writeFile(tmp, buf);
+    await fsp.rename(tmp, target);
+  } catch (err) {
+    liveQueue = liveQueue.filter((q) => q !== entry);
+    throw err;
+  }
+  const next = withQueue(st, liveQueue);
   await savePersistedState(next);
   return next;
 }
 
-/** Permanently delete user's original uploaded photo after round finishes (privacy guarantee) */
+/** Remove (and delete) the queued photo a finished round used, identified by its URL (privacy guarantee) */
+export async function consumeQueuedPhoto(st: PersistedState, url: string | null): Promise<PersistedState> {
+  const clean = (url || '').split('?')[0];
+  const entry = clean ? liveQueue.find((q) => q.url === clean) : undefined;
+  if (!entry) return withQueue(st, liveQueue);
+  liveQueue = liveQueue.filter((q) => q !== entry);
+  await fsp.rm(path.join(QUEUE_DIR, entry.file), { force: true });
+  const next = withQueue(st, liveQueue);
+  await savePersistedState(next);
+  return next;
+}
+
+/** Clear the whole queue (admin CLEAR QUEUE / purge) */
 export async function purgeQueuedPhoto(st: PersistedState): Promise<PersistedState> {
+  liveQueue = [];
   try {
     for (const f of await fsp.readdir(QUEUE_DIR)) {
       await fsp.rm(path.join(QUEUE_DIR, f), { recursive: true, force: true });
@@ -279,12 +353,7 @@ export async function purgeQueuedPhoto(st: PersistedState): Promise<PersistedSta
   } catch {
     /* ignore */
   }
-  const next: PersistedState = {
-    ...st,
-    hasQueuedPhoto: false,
-    queuedPhotoUrl: null,
-    queuedAt: null,
-  };
+  const next = withQueue(st, liveQueue);
   await savePersistedState(next);
   return next;
 }
@@ -358,7 +427,7 @@ export async function saveArchivedFrame(
     latestFrameUrl: frameUrl,
   };
   await savePersistedState(next);
-  return { next, archiveName: `${rFolder}/${fileName}` };
+  return { next: withQueue(next, liveQueue), archiveName: `${rFolder}/${fileName}` };
 }
 
 export async function clearCache(
@@ -391,7 +460,7 @@ export async function clearCache(
   return { config: nextCfg, state: nextState };
 }
 
-export async function computeStorageStats(st: PersistedState): Promise<StorageStats> {
+export async function computeStorageStats(_st: PersistedState): Promise<StorageStats> {
   async function walkBytes(dir: string): Promise<number> {
     let sum = 0;
     let entries: fs.Dirent[] = [];
@@ -435,7 +504,7 @@ export async function computeStorageStats(st: PersistedState): Promise<StorageSt
     totalBytes,
     rollsCount,
     framesCount,
-    queueCount: st.hasQueuedPhoto ? 1 : 0,
+    queueCount: liveQueue.length,
   };
 }
 

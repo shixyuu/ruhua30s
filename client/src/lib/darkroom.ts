@@ -41,6 +41,9 @@ export interface DetectStats {
   aeScale: number;
 }
 
+/** Ignore camera frames for this long after the projected image changes before taking a reference */
+export const PREVIEW_SETTLE_MS = 600;
+
 export const DISPLAY_W = 1280;
 export const DISPLAY_H = 720;
 const CAM_W = 640;
@@ -185,6 +188,11 @@ export class DarkroomEngine {
   private lastMask = new Uint8Array(GRID_N);
   private previewRef = new Float32Array(GRID_N);
   private hasPreviewRef = false;
+  private previewResetAt = 0;
+  private previewResetReason = 'detect view start';
+  /** Last reference (empty-easel) capture: round clean plate or admin preview reference */
+  lastRef: { kind: 'round' | 'preview'; reason: string; at: number; frames: number } | null = null;
+  private roundRefReason = 'new round';
   private marginPct = 6;
   private lastStats: DetectStats = {
     camLive: false,
@@ -389,6 +397,12 @@ export class DarkroomEngine {
     if (this.cleanCount === 0) return;
     const inv = 1 / this.cleanCount;
     for (let i = 0; i < GRID_N; i++) this.camClean[i] = this.cleanAccum[i] * inv;
+    this.lastRef = { kind: 'round', reason: this.roundRefReason, at: Date.now(), frames: this.cleanCount };
+  }
+
+  /** Label for the next round clean-plate capture (shown in admin / server log) */
+  setRoundRefReason(reason: string): void {
+    this.roundRefReason = reason;
   }
 
   /** Photo rect inside the calibrated 16:9 grid, in grid px (photo is letterboxed at its own aspect) */
@@ -501,6 +515,7 @@ export class DarkroomEngine {
       // Camera came up after CAPTURE_CLEAN: bootstrap the clean plate from the first live frame
       this.camClean.set(this.currGray);
       this.cleanCount = 1;
+      this.lastRef = { kind: 'round', reason: `${this.roundRefReason} (late camera: taken at EXPOSE start)`, at: Date.now(), frames: 1 };
       console.warn('[darkroom] no clean plate captured; bootstrapped from first EXPOSE frame');
       return;
     }
@@ -525,15 +540,24 @@ export class DarkroomEngine {
     }
     if (useRoundClean && this.cleanCount > 0) return this.computeDiff(this.camClean, opts, 'round');
     if (!this.hasPreviewRef) {
+      // Wait for the camera to settle after the projection / image changed before taking the reference
+      if (Date.now() - this.previewResetAt < PREVIEW_SETTLE_MS) {
+        this.lastMask.fill(0);
+        this.lastStats = { ...this.lastStats, camLive: true, hasRef: false, refKind: 'preview', triggered: false, activePct: 0, photoActivePct: 0 };
+        return this.lastStats;
+      }
       this.previewRef.set(this.currGray);
       this.hasPreviewRef = true;
+      this.lastRef = { kind: 'preview', reason: this.previewResetReason, at: Date.now(), frames: 1 };
     }
     return this.computeDiff(this.previewRef, opts, 'preview');
   }
 
-  /** Drop the preview reference so the next preview frame becomes the new reference */
-  resetPreviewRef(): void {
+  /** Drop the preview reference; a new one is taken after the settle delay */
+  resetPreviewRef(reason = 'manual'): void {
     this.hasPreviewRef = false;
+    this.previewResetAt = Date.now();
+    this.previewResetReason = reason;
   }
 
   getDetectStats(): DetectStats {

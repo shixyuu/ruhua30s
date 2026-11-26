@@ -1,7 +1,7 @@
 /**
  * /upload — Mobile Audience Photo Upload (Color Darkroom Queue)
  * - Compresses selected image long edge to 1600px (preserving original color & aspect ratio, JPEG q=0.90)
- * - Uploads via POST /api/upload -> ./data/queue/next.jpg
+ * - Uploads via POST /api/upload -> FIFO queue in ./data/queue/ (max QUEUE_MAX, 429 when full)
  */
 import { TITLE_EN } from '../lib/brand';
 
@@ -86,13 +86,17 @@ export default function upload(app: HTMLElement): void {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ imageData: dataUrl }),
       });
-      const json = await res.json();
-      if (!res.ok || !json.ok) throw new Error(json.error || 'Upload failed');
+      const json = await res.json().catch(() => ({}));
+      if (res.status === 429 || json.error === 'queue_full') {
+        throw new Error(json.message || 'The darkroom queue is full. Please try again in a few minutes.');
+      }
+      if (!res.ok || !json.ok) throw new Error(json.message || json.error || 'Upload failed');
 
       previewImg.src = dataUrl;
       previewBox.classList.remove('hidden');
       statusBox.classList.remove('hidden');
-      metaText.textContent = `${width} × ${height} PX · STORED FOR NEXT EXPOSURE ONLY`;
+      const pos = typeof json.queueLength === 'number' ? ` · POSITION ${json.queueLength} IN QUEUE` : '';
+      metaText.textContent = `${width} × ${height} PX${pos} · USED FOR ONE EXPOSURE, THEN DELETED`;
       pickText.textContent = 'REPLACE PHOTOGRAPH';
     } catch (err) {
       errBox.textContent = (err as Error).message;

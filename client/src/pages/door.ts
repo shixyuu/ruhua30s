@@ -54,7 +54,8 @@ export default async function door(app: HTMLElement): Promise<void> {
   function updateQueueStatus(st?: PersistedState | null): void {
     const sampleIdx = net.config?.sampleFallback ?? 0;
     if (st?.hasQueuedPhoto) {
-      queuePill.textContent = 'NEXT PHOTO: READY (UPLOADED)';
+      const n = st.queueLength ?? 1;
+      queuePill.textContent = `NEXT PHOTO: READY (UPLOADED) · ${n} IN QUEUE`;
       queuePill.className = 'mono q-ready';
     } else if (sampleIdx > 0) {
       queuePill.textContent = sampleIdx === 7 ? 'NEXT PHOTO: LAST PRINT' : `NEXT PHOTO: BUILT-IN SAMPLE #${sampleIdx}`;
