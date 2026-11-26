@@ -8,7 +8,7 @@
  * - New Roll (2-tap, keeps ./data/archive/ intact), 5 phase duration steppers, device heartbeat lamps & roll archive
  */
 import { Net, mountFlashOverlay } from '../lib/net';
-import type { ContactSheetInfo, PrintMode, Role } from '../../../shared/protocol';
+import type { ContactSheetInfo, PersistedState, PrintMode, Role, StorageStats } from '../../../shared/protocol';
 import { CONFIG_BOUNDS, outcomeShortCode } from '../../../shared/protocol';
 import { TITLE_EN } from '../lib/brand';
 import { triggerDownload } from '../lib/media';
@@ -138,11 +138,24 @@ export default function admin(app: HTMLElement): void {
         <button class="btn-act btn-pulse" id="testDev" type="button" disabled>TEST DEVELOP PULSE (SOLO CAL)</button>
       </section>
 
-      <!-- 4. Phase Durations & Roll Management -->
+      <!-- 4. Phase Durations & Roll / Base Capture -->
       <section class="card timing-card">
         <div class="card-h">
           <span>PHASE TIMINGS &amp; ROLL</span>
-          <button class="btn-mini amber" id="newRoll" type="button">NEW ROLL (CLEAR SHEET)</button>
+          <div class="roll-actions">
+            <button class="btn-mini amber" id="newRoll" type="button">NEW ROLL</button>
+            <button class="btn-mini base-btn needs-base" id="captureBase" type="button" disabled>CAPTURE BASE (00A)</button>
+          </div>
+        </div>
+        <div class="base-status" id="baseStatus">
+          <div class="base-thumb">
+            <img id="baseImg" alt="00A Baseline" class="hidden" />
+            <span id="baseNone">00A</span>
+          </div>
+          <div class="base-meta">
+            <div class="base-ttl" id="baseTitle">NO 00A BASELINE YET</div>
+            <div class="base-sub" id="baseTime">Clear beam &amp; tap CAPTURE BASE (00A)</div>
+          </div>
         </div>
         <div class="steppers">
           ${stepperHtml('enterBufferSec', 'ENTER BUFFER', '2–10s', 5)}
@@ -168,6 +181,19 @@ export default function admin(app: HTMLElement): void {
           <span class="mono" id="totalDisk">0 TOTAL</span>
         </div>
         <div class="archive-v3" id="archive"></div>
+      </section>
+
+      <!-- 6. VPS Storage & Cache Management -->
+      <section class="card storage-card">
+        <div class="card-h">
+          <span>VPS STORAGE &amp; CACHE</span>
+          <span class="mono" id="ghostStatus">GHOST CACHE: EMPTY</span>
+        </div>
+        <div class="storage-stat mono" id="storageStat">VPS STORAGE: 0.0 MB · 0 ROLLS · 0 FRAMES</div>
+        <div class="cache-actions">
+          <button class="btn-act" id="clearTemp" type="button">CLEAR TEMP CACHE</button>
+          <button class="btn-act danger" id="purgeAll" type="button">PURGE ALL DATA</button>
+        </div>
       </section>
     </main>
   </div>
@@ -210,11 +236,20 @@ export default function admin(app: HTMLElement): void {
   const modePosBtn = $<HTMLButtonElement>('#modePos');
   const testDevBtn = $<HTMLButtonElement>('#testDev');
   const newRollBtn = $<HTMLButtonElement>('#newRoll');
+  const captureBaseBtn = $<HTMLButtonElement>('#captureBase');
+  const baseImg = $<HTMLImageElement>('#baseImg');
+  const baseNone = $<HTMLSpanElement>('#baseNone');
+  const baseTitle = $<HTMLDivElement>('#baseTitle');
+  const baseTime = $<HTMLDivElement>('#baseTime');
   const lights = $<HTMLDivElement>('#lights');
   const onlineCount = $<HTMLSpanElement>('#onlineCount');
   const archTitle = $<HTMLSpanElement>('#archTitle');
   const totalDisk = $<HTMLSpanElement>('#totalDisk');
   const archive = $<HTMLDivElement>('#archive');
+  const ghostStatus = $<HTMLSpanElement>('#ghostStatus');
+  const storageStat = $<HTMLDivElement>('#storageStat');
+  const clearTempBtn = $<HTMLButtonElement>('#clearTemp');
+  const purgeAllBtn = $<HTMLButtonElement>('#purgeAll');
   const toastEl = document.getElementById('toast')!;
 
   const net = new Net('admin', token);
@@ -278,12 +313,12 @@ export default function admin(app: HTMLElement): void {
     net.send({ type: 'admin', action: 'reset', token });
   });
 
-  // ---------------- two-tap NEW ROLL ----------------
+  // ---------------- two-tap NEW ROLL + CAPTURE BASE (00A) ----------------
   let rollTimer = 0;
   function disarmRoll(): void {
     clearTimeout(rollTimer);
     newRollBtn.classList.remove('armed');
-    newRollBtn.textContent = 'NEW ROLL (CLEAR SHEET)';
+    newRollBtn.textContent = 'NEW ROLL';
   }
   newRollBtn.addEventListener('click', () => {
     if (!newRollBtn.classList.contains('armed')) {
@@ -295,6 +330,65 @@ export default function admin(app: HTMLElement): void {
     }
     disarmRoll();
     net.send({ type: 'admin', action: 'newRoll', token });
+  });
+
+  captureBaseBtn.addEventListener('click', () => {
+    if (net.phase !== 'IDLE' || !net.connected) return;
+    net.send({ type: 'CAPTURE_BASE', token });
+  });
+
+  // ---------------- two-tap CLEAR TEMP CACHE & PURGE ALL DATA ----------------
+  function wireTwoTap(btn: HTMLButtonElement, idleTxt: string, armTxt: string, onConfirm: () => Promise<void>): void {
+    let t = 0;
+    const disarm = () => {
+      clearTimeout(t);
+      btn.classList.remove('armed');
+      btn.textContent = idleTxt;
+    };
+    btn.addEventListener('click', () => {
+      if (!btn.classList.contains('armed')) {
+        btn.classList.add('armed');
+        btn.textContent = armTxt;
+        t = window.setTimeout(disarm, 3500);
+        return;
+      }
+      disarm();
+      void onConfirm();
+    });
+  }
+
+  wireTwoTap(clearTempBtn, 'CLEAR TEMP CACHE', 'CONFIRM CLEAR TEMP?', async () => {
+    try {
+      const r = await fetch('/api/cache/clear', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ mode: 'runtime', token }),
+      });
+      const j = await r.json();
+      if (j.ok) {
+        updatePersistedUi(j.state, j.storage);
+        toast('✓ Temp ghost & forecast cache cleared');
+      } else toast(`✗ ${j.error || 'Failed'}`);
+    } catch {
+      toast('✗ Request failed');
+    }
+  });
+
+  wireTwoTap(purgeAllBtn, 'PURGE ALL DATA', 'CONFIRM PURGE ALL?', async () => {
+    try {
+      const r = await fetch('/api/cache/clear', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ mode: 'all', token }),
+      });
+      const j = await r.json();
+      if (j.ok) {
+        updatePersistedUi(j.state, j.storage);
+        toast('✓ All rolls & cache purged (ROLL 01 reset)');
+      } else toast(`✗ ${j.error || 'Failed'}`);
+    } catch {
+      toast('✗ Request failed');
+    }
   });
 
   // ---------------- Instax Share / Download (pre-cached File for synchronous gesture) ----------------
@@ -540,11 +634,44 @@ export default function admin(app: HTMLElement): void {
     }
   });
 
+  function updatePersistedUi(st?: PersistedState | null, storage?: StorageStats | null): void {
+    if (st) {
+      captureBaseBtn.classList.toggle('needs-base', !st.hasBase);
+      if (st.hasBase && st.baseFrameUrl) {
+        baseImg.src = st.baseFrameUrl;
+        baseImg.classList.remove('hidden');
+        baseNone.classList.add('hidden');
+        baseTitle.textContent = `00A BASELINE LOCKED · ROLL ${pad2(st.rollNumber)}`;
+        const tStr = st.baseCapturedAt ? new Date(st.baseCapturedAt).toLocaleTimeString([], { hour12: false }) : '';
+        baseTime.textContent = tStr ? `Captured at ${tStr} (tap CAPTURE BASE to reshoot)` : 'Ready';
+      } else {
+        baseImg.classList.add('hidden');
+        baseImg.removeAttribute('src');
+        baseNone.classList.remove('hidden');
+        baseTitle.textContent = `NO 00A BASELINE YET · ROLL ${pad2(st.rollNumber)}`;
+        baseTime.textContent = 'Clear beam & tap CAPTURE BASE (00A)';
+      }
+      ghostStatus.textContent = `GHOST CACHE: ${st.hasGhostSequence ? 'READY' : 'EMPTY'}`;
+    }
+    if (storage) {
+      const mb = (storage.totalBytes / (1024 * 1024)).toFixed(2);
+      storageStat.textContent = `VPS STORAGE: ${mb} MB · ${storage.rollsCount} ROLLS · ${storage.framesCount} FRAMES`;
+      ghostStatus.textContent = `GHOST CACHE: ${storage.hasGhostSequence ? 'READY' : 'EMPTY'}`;
+    }
+  }
+
+  net.on('STATE_SYNC', (m) => updatePersistedUi(m.persisted, m.storage));
+
   async function loadDiskTotal(): Promise<void> {
     try {
-      const r = await fetch(`/api/archive?all=1${tq ? '&' + tq : ''}`, { cache: 'no-store' });
-      const j = await r.json();
+      const [archR, stateR] = await Promise.all([
+        fetch(`/api/archive?all=1${tq ? '&' + tq : ''}`, { cache: 'no-store' }),
+        fetch('/api/state', { cache: 'no-store' }),
+      ]);
+      const j = await archR.json();
       if (j.ok) totalDisk.textContent = `${j.count} TOTAL ON DISK`;
+      const sj = await stateR.json();
+      if (sj.ok) updatePersistedUi(sj.state, sj.storage);
     } catch {
       /* ignore */
     }
@@ -572,6 +699,7 @@ export default function admin(app: HTMLElement): void {
 
       const canStart = p === 'IDLE' && net.connected;
       shutterBtn.disabled = !canStart || Date.now() - lastShutter < 1500;
+      captureBaseBtn.disabled = !canStart;
       shutterHint.textContent = canStart ? 'Standby · tap or press SPACE' : net.connected ? `Running · ${p}` : 'Offline';
       skipBtn.disabled = p === 'IDLE' || !net.connected;
       testDevBtn.disabled = p !== 'DEVELOPING' || !net.connected;

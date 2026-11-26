@@ -139,6 +139,43 @@ async function main() {
   cfg = await admin.wait((m) => m.type === 'config');
   ok(cfg.config.safelightSec === 5 && cfg.config.printMode === 'photogram_negative', '恢复默认配置成功');
 
+  // ---- 2b. CAPTURE_BASE (00A) + POST /api/archive/base + GET /api/state ----
+  const jpeg = Buffer.concat([Buffer.from([0xff, 0xd8, 0xff, 0xe0]), Buffer.alloc(2000, 1), Buffer.from([0xff, 0xd9])]);
+  const forecastJpeg = Buffer.concat([Buffer.from([0xff, 0xd8, 0xff, 0xe0]), Buffer.alloc(1200, 2), Buffer.from([0xff, 0xd9])]);
+  admin.clear();
+  mainC.clear();
+  admin.send({ type: 'CAPTURE_BASE', token: TOKEN });
+  await mainC.wait(isState('CAPTURING_BASE'), 3000, 'CAPTURING_BASE');
+  mainC.clear();
+  const baseRes = await (
+    await fetch(BASE + '/api/archive/base', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        imageData: 'data:image/jpeg;base64,' + jpeg.toString('base64'),
+        forecastData: 'data:image/jpeg;base64,' + forecastJpeg.toString('base64'),
+        collapseZone: { cx: 0.438, cy: 0.5, rx: 0.095, ry: 0.135 },
+      }),
+    })
+  ).json();
+  await mainC.wait(isState('IDLE'), 4000, 'IDLE after CAPTURING_BASE');
+  const stAfterBase = await (await fetch(BASE + '/api/state')).json();
+  ok(
+    baseRes.ok && stAfterBase.state.hasBase === true && stAfterBase.state.frames.some((f) => f.frameNo === '00A'),
+    `CAPTURE_BASE + POST /api/archive/base 成功 (00A 已入档, forecast=${!!stAfterBase.state.forecastUrl})`,
+  );
+
+  // ---- 2c. POST /api/cache/ghost & GET /api/cache/ghost ----
+  const ghostRes = await (
+    await fetch(BASE + '/api/cache/ghost', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ rollNumber: 1, frameNumber: 1, frames: ['data:image/jpeg;base64,' + jpeg.toString('base64')] }),
+    })
+  ).json();
+  const ghostGet = await (await fetch(BASE + '/api/cache/ghost')).json();
+  ok(ghostRes.ok && ghostGet.payload?.frames?.length === 1, 'POST/GET /api/cache/ghost 鬼影序列持久化正常');
+
   // ---- 3. 完整轮次：ENTER_BUFFER -> SAFELIGHT_COMPOSE -> EXPOSURE -> DEVELOPING -> FIXED_REVEAL -> IDLE ----
   for (const c of [admin, door, s1, s2, mainC]) c.clear();
   const seen = [];
@@ -184,8 +221,6 @@ async function main() {
   );
 
   // main 上传纯净 JPEG + 下一轮预测 JPEG + collapseZone + deviationPct → 写入磁盘并更新 contact-sheet 与 forecast
-  const jpeg = Buffer.concat([Buffer.from([0xff, 0xd8, 0xff, 0xe0]), Buffer.alloc(2000, 1), Buffer.from([0xff, 0xd9])]);
-  const forecastJpeg = Buffer.concat([Buffer.from([0xff, 0xd8, 0xff, 0xe0]), Buffer.alloc(1200, 2), Buffer.from([0xff, 0xd9])]);
   door.clear();
   mainC.send({
     type: 'freeze',
@@ -238,6 +273,25 @@ async function main() {
   const archAfter = await (await fetch(BASE + '/api/archive?all=1' + (TOKEN ? `&token=${TOKEN}` : ''))).json();
   ok(csNew.sheet.rollNumber === cs.sheet.rollNumber + 1 && csNew.sheet.totalInRoll === 0, `NEW ROLL 切换至 ROLL ${csNew.sheet.rollNumber}`);
   ok(archAfter.count === archBefore.count && archAfter.count >= 1, `磁盘历史归档完整保留（共 ${archAfter.count} 张未删除）`);
+
+  // ---- 6. CLEAR CACHE (runtime & all) ----
+  const clrRuntime = await (
+    await fetch(BASE + '/api/cache/clear', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ mode: 'runtime', token: TOKEN }),
+    })
+  ).json();
+  ok(clrRuntime.ok && clrRuntime.state.hasGhostSequence === false, 'CLEAR TEMP CACHE (runtime) 清理临时缓存成功');
+
+  const clrAll = await (
+    await fetch(BASE + '/api/cache/clear', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ mode: 'all', token: TOKEN }),
+    })
+  ).json();
+  ok(clrAll.ok && clrAll.state.rollNumber === 1 && clrAll.storage.framesCount === 0, 'PURGE ALL DATA (all) 彻底清零至 ROLL 01');
 
   for (const c of [admin, door, s1, s2, mainC]) c.ws.close();
   console.log(failures ? `\n❌ ${failures} 项失败` : '\n🎉 v3 全部联调测试通过');

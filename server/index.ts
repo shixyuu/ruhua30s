@@ -1,5 +1,5 @@
 /**
- * 《入画三十秒 (RH-30)》v3 统一单端口服务：纯现场活体暗房引擎 + /data + /api + /ws
+ * 《入画三十秒 (RH-30)》v3 统一单端口服务：活体暗房时间预言引擎 + VPS 磁盘持久化 + /data + /api + /ws
  */
 import http from 'node:http';
 import path from 'node:path';
@@ -13,7 +13,7 @@ import {
   ClientMsg,
   ClientStatus,
   CollapseZone,
-  ContactSheetInfo,
+  PersistedState,
   Phase,
   Role,
   ROLES,
@@ -22,23 +22,30 @@ import {
 } from '../shared/protocol.js';
 import {
   ASSETS_DIR,
+  CACHE_DIR,
   DATA_DIR,
-  countRollFramesSync,
-  currentForecastSnapshot,
+  clearCache,
+  computeStorageStats,
+  contactSheetFromState,
   decodeJpeg,
   doorPhotoInfo,
+  emptyPersistedState,
   ensureDirs,
-  forecastInfo,
-  getContactSheet,
+  forecastInfoFromState,
   listArchive,
   loadConfig,
+  loadGhostSequence,
+  loadPersistedState,
+  nextAudienceFrameNumber,
   pad,
   resetDoorPhoto,
-  resetForecast,
+  rollDirName,
   sanitizeConfig,
+  saveAudienceFrame,
+  saveBaseFrame,
   saveConfig,
-  saveForecast,
-  saveFreeze,
+  saveGhostSequence,
+  savePersistedState,
 } from './storage.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -54,10 +61,11 @@ const DEV_TICK_MS = 50;
 
 ensureDirs();
 let config: AppConfig = loadConfig();
-let currentSheet: ContactSheetInfo = { rollNumber: config.rollNumber, totalInRoll: 0, frames: [] };
-getContactSheet(config.rollNumber)
-  .then((s) => (currentSheet = s))
-  .catch(() => {});
+let persisted: PersistedState = loadPersistedState(config.rollNumber);
+if (persisted.rollNumber !== config.rollNumber) {
+  config = sanitizeConfig({ ...config, rollNumber: persisted.rollNumber }, config);
+  void saveConfig(config);
+}
 
 // ======================================================================
 // HTTP
@@ -65,10 +73,11 @@ getContactSheet(config.rollNumber)
 const app = express();
 app.disable('x-powered-by');
 app.set('trust proxy', true);
+app.use(express.json({ limit: '15mb' }));
 
 function tokenOk(req: Request): boolean {
   if (!ADMIN_TOKEN) return true;
-  const t = (req.query.token as string) || req.get('x-admin-token') || '';
+  const t = (req.query.token as string) || req.get('x-admin-token') || (req.body?.token as string) || '';
   return t === ADMIN_TOKEN;
 }
 
@@ -81,31 +90,40 @@ app.get('/api/health', (_req, res) => {
     clients: clientCounts(),
     round: round.id,
     rollNumber: config.rollNumber,
+    hasBase: persisted.hasBase,
     timeScale: TIME_SCALE,
     uptime: Math.round(process.uptime()),
     serverTime: Date.now(),
   });
 });
 
-app.get('/api/contact-sheet', async (_req, res) => {
-  const sheet = await getContactSheet(config.rollNumber);
-  currentSheet = sheet;
+app.get('/api/state', async (_req, res) => {
+  const storage = await computeStorageStats(persisted);
   res.set('Cache-Control', 'no-store');
-  res.json({ ok: true, sheet });
+  res.json({
+    ok: true,
+    config,
+    state: persisted,
+    storage,
+    phase: state,
+    serverTime: Date.now(),
+  });
+});
+
+app.get('/api/contact-sheet', (_req, res) => {
+  res.set('Cache-Control', 'no-store');
+  res.json({ ok: true, sheet: contactSheetFromState(persisted) });
 });
 
 app.get('/api/archive', async (req, res) => {
   if (!tokenOk(req)) return void res.status(401).json({ ok: false, error: 'unauthorized' });
-  const date = typeof req.query.date === 'string' && /^\d{8}$/.test(req.query.date) ? req.query.date : null;
-  const all = req.query.all === '1';
   const rollParam = req.query.roll === 'current' ? config.rollNumber : req.query.roll ? Number(req.query.roll) : null;
   const rollFilter = rollParam != null && Number.isFinite(rollParam) ? rollParam : null;
-  const items = await listArchive(date, all, rollFilter);
+  const items = await listArchive(rollFilter);
   res.set('Cache-Control', 'no-store');
   res.json({
     ok: true,
     rollNumber: config.rollNumber,
-    date: date || (all ? 'all' : 'today'),
     count: items.length,
     items,
   });
@@ -116,6 +134,90 @@ app.get('/api/config', (_req, res) => {
   res.json({ ok: true, config });
 });
 
+app.post('/api/archive/base', async (req, res) => {
+  const { imageData, forecastData, collapseZone } = req.body || {};
+  const buf = decodeJpeg(imageData);
+  if (!buf) return void res.status(400).json({ ok: false, error: 'invalid base JPEG' });
+  const fBuf = typeof forecastData === 'string' ? decodeJpeg(forecastData) : null;
+  persisted = await saveBaseFrame(persisted, buf, fBuf, (collapseZone as CollapseZone | null) ?? null);
+  round.hasFreeze = true;
+  await broadcastSync();
+  const storage = await computeStorageStats(persisted);
+  console.log(`[archive] 基准底片 00A 已保存 (roll=${persisted.rollNumber}, ${(buf.length / 1024).toFixed(0)}KB)`);
+  res.json({ ok: true, state: persisted, storage });
+});
+
+app.post('/api/archive/frame', async (req, res) => {
+  const { imageData, forecastData, collapseZone, frameNumber, devPercent, outcome, deviationPct } = req.body || {};
+  const buf = decodeJpeg(imageData);
+  if (!buf) return void res.status(400).json({ ok: false, error: 'invalid frame JPEG' });
+  const fNo = Number.isFinite(Number(frameNumber)) ? Number(frameNumber) : round.frameNumber || nextAudienceFrameNumber(persisted);
+  const devPct = Number.isFinite(Number(devPercent)) ? Number(devPercent) : (round.finalDevProgress ?? round.devProgress) * 100;
+  const out: ChemicalOutcome = (outcome as ChemicalOutcome) || round.outcome || 'FIXED_OPTIMAL';
+  if (typeof deviationPct === 'number' && Number.isFinite(deviationPct)) {
+    round.deviationPct = Math.max(0, Math.min(99, Math.round(deviationPct)));
+  }
+  const fBuf = typeof forecastData === 'string' ? decodeJpeg(forecastData) : null;
+  const saved = await saveAudienceFrame(
+    persisted,
+    fNo,
+    buf,
+    devPct,
+    out,
+    fBuf,
+    (collapseZone as CollapseZone | null) ?? null,
+  );
+  persisted = saved.next;
+  round.hasFreeze = true;
+  await broadcastSync();
+  const storage = await computeStorageStats(persisted);
+  console.log(`[archive] 底片 ${saved.archiveName} 已保存 (${(buf.length / 1024).toFixed(0)}KB, dev=${Math.round(devPct)}%, outcome=${out})`);
+  res.json({ ok: true, archiveName: saved.archiveName, state: persisted, storage });
+});
+
+app.post('/api/cache/ghost', async (req, res) => {
+  const { frames, rollNumber, frameNumber } = req.body || {};
+  if (!Array.isArray(frames)) return void res.status(400).json({ ok: false, error: 'frames array required' });
+  persisted = await saveGhostSequence(
+    persisted,
+    Number(rollNumber) || config.rollNumber,
+    Number(frameNumber) || round.frameNumber,
+    frames,
+  );
+  await broadcastSync();
+  console.log(`[cache] 鬼影序列已缓存 (${frames.length} 帧)`);
+  res.json({ ok: true, hasGhostSequence: persisted.hasGhostSequence, updatedAt: persisted.ghostUpdatedAt });
+});
+
+app.get('/api/cache/ghost', async (_req, res) => {
+  const payload = await loadGhostSequence();
+  res.set('Cache-Control', 'no-store');
+  res.json({ ok: true, payload });
+});
+
+app.post('/api/roll/new', async (req, res) => {
+  if (!tokenOk(req)) return void res.status(401).json({ ok: false, error: 'unauthorized' });
+  await performNewRoll();
+  const storage = await computeStorageStats(persisted);
+  res.json({ ok: true, config, state: persisted, storage });
+});
+
+app.post('/api/cache/clear', async (req, res) => {
+  if (!tokenOk(req)) return void res.status(401).json({ ok: false, error: 'unauthorized' });
+  const mode = req.body?.mode === 'all' ? 'all' : 'runtime';
+  stopDevLoop();
+  enter('IDLE');
+  const cleared = await clearCache(mode, config, persisted);
+  config = cleared.config;
+  persisted = cleared.state;
+  round = freshRound(round.id, config.rollNumber, nextAudienceFrameNumber(persisted));
+  await broadcastSync();
+  broadcast({ type: 'config', config });
+  const storage = await computeStorageStats(persisted);
+  console.log(`[cache] 清理完成 mode=${mode} (roll=${config.rollNumber})`);
+  res.json({ ok: true, mode, config, state: persisted, storage });
+});
+
 // /assets：保留静态挂载以兼容现有 Docker volume 配置
 const noCache = (res: Response) => res.setHeader('Cache-Control', 'no-cache');
 app.use(
@@ -124,17 +226,11 @@ app.use(
 );
 app.use('/assets', (_req, res) => res.status(404).type('text/plain').send('asset not found'));
 
-// /data：持久化目录（当前卷对 /door 免 token 开放；历史卷可受 ADMIN_TOKEN 保护）
+// /data：持久化目录
 app.use('/data', (req: Request, res: Response, next: NextFunction) => {
   if (/\.tmp$/i.test(req.path)) return void res.status(404).end();
-  if (req.path.startsWith('/archive')) {
-    const curPrefix = `/archive/roll-${pad(config.rollNumber, 2)}/`;
-    if (!req.path.startsWith(curPrefix) && !tokenOk(req)) {
-      return void res.status(401).end();
-    }
-  }
-  if (req.path.startsWith('/forecasts')) {
-    const curPrefix = `/forecasts/roll-${pad(config.rollNumber, 2)}/`;
+  if (req.path.startsWith('/rolls')) {
+    const curPrefix = `/rolls/${rollDirName(config.rollNumber)}/`;
     if (!req.path.startsWith(curPrefix) && !tokenOk(req)) {
       return void res.status(401).end();
     }
@@ -236,6 +332,14 @@ function pushClients(): void {
   broadcast({ type: 'clients', clients: clientStatuses(), serverTime: Date.now() }, (p) => p.role === 'admin');
 }
 
+async function broadcastSync(): Promise<void> {
+  const storage = await computeStorageStats(persisted);
+  broadcast({ type: 'door-photo', photo: doorPhotoInfo(), serverTime: Date.now() });
+  broadcast({ type: 'contact-sheet', sheet: contactSheetFromState(persisted), serverTime: Date.now() });
+  broadcast({ type: 'STATE_SYNC', persisted, storage, serverTime: Date.now() });
+  broadcast(stateMsg());
+}
+
 function touch(p: Peer): void {
   p.alive = true;
   p.lastSeen = Date.now();
@@ -297,8 +401,9 @@ async function sendFullSync(ws: WebSocket, peer: Peer): Promise<void> {
   send(ws, stateMsg());
   send(ws, { type: 'config', config });
   send(ws, { type: 'door-photo', photo: doorPhotoInfo(), serverTime: Date.now() });
-  currentSheet = await getContactSheet(config.rollNumber);
-  send(ws, { type: 'contact-sheet', sheet: currentSheet, serverTime: Date.now() });
+  send(ws, { type: 'contact-sheet', sheet: contactSheetFromState(persisted), serverTime: Date.now() });
+  const storage = await computeStorageStats(persisted);
+  send(ws, { type: 'STATE_SYNC', persisted, storage, serverTime: Date.now() });
   if (peer.role === 'admin') send(ws, { type: 'clients', clients: clientStatuses(), serverTime: Date.now() });
   if (peer.role === 'main' || peer.role === 'admin' || peer.role === 'station2') {
     send(ws, {
@@ -330,7 +435,6 @@ function handleMessage(ws: WebSocket, peer: Peer, msg: ClientMsg): void {
       return;
     case 'START_SESSION': {
       if (peer.role !== 'admin' || !(peer.isAdmin || (ADMIN_TOKEN && msg.token === ADMIN_TOKEN))) {
-        console.log(`[ws] 拒绝来自 ${peer.role ?? '未注册'} 的 START_SESSION`);
         return send(ws, { type: 'ack', what: 'START_SESSION', ok: false, message: 'Only /admin can start a session' });
       }
       const ok = tryStart('admin');
@@ -341,6 +445,23 @@ function handleMessage(ws: WebSocket, peer: Peer, msg: ClientMsg): void {
         message: ok
           ? `Shutter released · Roll ${pad(round.rollNumber, 2)} Frame ${pad(round.frameNumber, 2)}A`
           : `Current state is ${state}; can only start from IDLE`,
+      });
+    }
+    case 'CAPTURE_BASE': {
+      if (peer.role !== 'admin' || !(peer.isAdmin || (ADMIN_TOKEN && msg.token === ADMIN_TOKEN))) {
+        return send(ws, { type: 'ack', what: 'CAPTURE_BASE', ok: false, message: 'Only /admin can capture base' });
+      }
+      if (state !== 'IDLE') {
+        return send(ws, { type: 'ack', what: 'CAPTURE_BASE', ok: false, message: `Busy (${state})` });
+      }
+      round = freshRound(round.id + 1, config.rollNumber, 0, null, null);
+      round.trigger = 'base';
+      enter('CAPTURING_BASE');
+      return send(ws, {
+        type: 'ack',
+        what: 'CAPTURE_BASE',
+        ok: true,
+        message: `Capturing 00A BASE · Clear the beam (4s)`,
       });
     }
     case 'TEST_FLASH': {
@@ -407,10 +528,12 @@ function freshRound(
   };
 }
 
-let round: RoundInfo = freshRound(0, config.rollNumber, countRollFramesSync(config.rollNumber));
+let round: RoundInfo = freshRound(0, config.rollNumber, nextAudienceFrameNumber(persisted));
 
 function nextPhaseAfter(cur: Phase): Phase {
   switch (cur) {
+    case 'CAPTURING_BASE':
+      return 'IDLE';
     case 'ENTER_BUFFER':
       return config.safelightSec <= 0 ? 'EXPOSURE' : 'SAFELIGHT_COMPOSE';
     case 'SAFELIGHT_COMPOSE':
@@ -434,6 +557,9 @@ function durationFor(p: Phase): number {
   switch (p) {
     case 'IDLE':
       return 0;
+    case 'CAPTURING_BASE':
+      sec = 5.5;
+      break;
     case 'ENTER_BUFFER':
       sec = config.enterBufferSec;
       break;
@@ -466,7 +592,7 @@ function stateMsg(): ServerMsg {
     timeScale: TIME_SCALE,
     round,
     doorPhoto: doorPhotoInfo(),
-    forecast: forecastInfo(config.rollNumber),
+    forecast: forecastInfoFromState(persisted),
   };
 }
 
@@ -578,9 +704,14 @@ function schedule(atMs: number): void {
 
 function tryStart(trigger: string): boolean {
   if (state !== 'IDLE') return false;
-  const nextFrame = countRollFramesSync(config.rollNumber);
-  const snap = nextFrame > 0 ? currentForecastSnapshot(config.rollNumber) : { archiveUrl: null, collapseZone: null };
-  round = freshRound(round.id + 1, config.rollNumber, nextFrame, snap.archiveUrl, snap.collapseZone);
+  const nextFrame = nextAudienceFrameNumber(persisted);
+  const frameSnapUrl = persisted.forecastUrl
+    ? `/data/rolls/${rollDirName(config.rollNumber)}/forecast_${pad(nextFrame, 2)}A.jpg`
+    : null;
+  const predictedUrl = frameSnapUrl && fs.existsSync(path.join(DATA_DIR, frameSnapUrl.replace(/^\/data\//, '')))
+    ? frameSnapUrl
+    : persisted.forecastUrl;
+  round = freshRound(round.id + 1, config.rollNumber, nextFrame, predictedUrl, persisted.collapseZone);
   round.trigger = trigger;
   enter('ENTER_BUFFER');
   return true;
@@ -627,30 +758,53 @@ async function onFreeze(
       round.deviationPct = Math.max(0, Math.min(99, Math.round(deviationPct)));
     }
     const fBuf = typeof forecastData === 'string' ? decodeJpeg(forecastData) : null;
-    if (fBuf) {
-      await saveForecast(fBuf, round.rollNumber, round.frameNumber + 1, collapseZone);
-    }
-    const { photo, archiveName, sheet } = await saveFreeze(
-      buf,
-      round.rollNumber,
+    const saved = await saveAudienceFrame(
+      persisted,
       round.frameNumber,
-      round.id,
+      buf,
       devPct,
       round.outcome ?? 'FIXED_OPTIMAL',
+      fBuf,
+      collapseZone,
     );
+    persisted = saved.next;
     round.hasFreeze = true;
-    currentSheet = sheet;
-    console.log(`[round ${round.id}] 底片已入档 ${archiveName} (${(buf.length / 1024).toFixed(0)}KB, dev=${Math.round(devPct)}%, outcome=${round.outcome ?? 'FIXED_OPTIMAL'}${fBuf ? ', forecast updated' : ''})`);
-    send(ws, { type: 'ack', what: 'freeze', ok: true, message: archiveName });
-    broadcast({ type: 'door-photo', photo, serverTime: Date.now() });
-    broadcast({ type: 'contact-sheet', sheet, serverTime: Date.now() });
-    broadcast(stateMsg());
+    console.log(`[round ${round.id}] 底片已入档 ${saved.archiveName} (${(buf.length / 1024).toFixed(0)}KB, dev=${Math.round(devPct)}%, outcome=${round.outcome ?? 'FIXED_OPTIMAL'})`);
+    send(ws, { type: 'ack', what: 'freeze', ok: true, message: saved.archiveName });
+    await broadcastSync();
   } catch (err) {
     console.error('[freeze] 保存失败', err);
     send(ws, { type: 'ack', what: 'freeze', ok: false, message: 'Save failed' });
   } finally {
     freezeSaving = false;
   }
+}
+
+async function performNewRoll(): Promise<void> {
+  const nextRoll = config.rollNumber + 1;
+  config = sanitizeConfig({ ...config, rollNumber: nextRoll }, config);
+  try {
+    await saveConfig(config);
+  } catch (err) {
+    console.error('[config] 保存新胶卷号失败', err);
+  }
+  await resetDoorPhoto();
+  // Clear temporary ghost cache only; preserve ./data/rolls/ history
+  try {
+    for (const f of await fs.promises.readdir(CACHE_DIR)) {
+      await fs.promises.rm(path.join(CACHE_DIR, f), { recursive: true, force: true });
+    }
+  } catch {
+    /* ignore */
+  }
+  persisted = emptyPersistedState(config.rollNumber);
+  await savePersistedState(persisted);
+  if (state === 'IDLE') {
+    round = freshRound(round.id, config.rollNumber, 1);
+  }
+  console.log(`[admin] 开启新胶卷 ROLL ${pad(config.rollNumber, 2)}（历史卷完整保留，请先拍摄 00A 基准底片）`);
+  broadcast({ type: 'config', config });
+  await broadcastSync();
 }
 
 async function onAdmin(ws: WebSocket, action: string, cfg?: Partial<AppConfig>): Promise<void> {
@@ -671,38 +825,19 @@ async function onAdmin(ws: WebSocket, action: string, cfg?: Partial<AppConfig>):
     }
 
     case 'newRoll': {
-      const nextRoll = config.rollNumber + 1;
-      config = sanitizeConfig({ ...config, rollNumber: nextRoll }, config);
-      try {
-        await saveConfig(config);
-      } catch (err) {
-        console.error('[config] 保存新胶卷号失败', err);
-      }
-      const photo = await resetDoorPhoto();
-      await resetForecast();
-      currentSheet = await getContactSheet(config.rollNumber);
-      if (state === 'IDLE') {
-        round.rollNumber = config.rollNumber;
-        round.frameNumber = 0;
-        round.predictedUrl = null;
-      }
-      console.log(`[admin] 开启新胶卷 ROLL ${pad(config.rollNumber, 2)}（历史归档完整保留）`);
-      broadcast({ type: 'config', config });
-      broadcast({ type: 'door-photo', photo, serverTime: Date.now() });
-      broadcast({ type: 'contact-sheet', sheet: currentSheet, serverTime: Date.now() });
-      broadcast(stateMsg());
+      await performNewRoll();
       return send(ws, {
         type: 'ack',
         what: 'newRoll',
         ok: true,
-        message: `Started Roll ${pad(config.rollNumber, 2)} · contact sheet & forecast cleared (archive preserved)`,
+        message: `Started Roll ${pad(config.rollNumber, 2)} · capture 00A BASE next`,
       });
     }
 
     case 'resetDoor': {
       const photo = await resetDoorPhoto();
       broadcast({ type: 'door-photo', photo, serverTime: Date.now() });
-      return send(ws, { type: 'ack', what: 'resetDoor', ok: true, message: 'Latest proof cache cleared (archive preserved)' });
+      return send(ws, { type: 'ack', what: 'resetDoor', ok: true, message: 'Latest proof cache cleared' });
     }
 
     case 'testFlash':

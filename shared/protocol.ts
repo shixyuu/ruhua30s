@@ -5,6 +5,7 @@
 
 export type Phase =
   | 'IDLE'
+  | 'CAPTURING_BASE'
   | 'ENTER_BUFFER'
   | 'SAFELIGHT_COMPOSE'
   | 'EXPOSURE'
@@ -116,7 +117,28 @@ export interface ContactFrame {
   name: string;
   devPercent?: number;
   outcome?: ChemicalOutcome | null;
-  outcomeCode?: string; // "FIXED" | "BURNED" | "UNDER" | "LEAK"
+  outcomeCode?: string; // "BASE" | "FIXED" | "BURNED" | "UNDER" | "LEAK"
+}
+
+export interface PersistedState {
+  rollNumber: number;
+  frames: ContactFrame[];
+  hasBase: boolean;
+  baseFrameUrl: string | null;
+  baseCapturedAt: number | null;
+  latestFrameUrl: string | null;
+  prevFrameUrl: string | null;
+  forecastUrl: string | null;
+  collapseZone: CollapseZone | null;
+  hasGhostSequence: boolean;
+  ghostUpdatedAt: number | null;
+}
+
+export interface StorageStats {
+  totalBytes: number;
+  rollsCount: number;
+  framesCount: number;
+  hasGhostSequence: boolean;
 }
 
 export interface ContactSheetInfo {
@@ -157,6 +179,7 @@ export type ServerMsg =
   | { type: 'config'; config: AppConfig }
   | { type: 'door-photo'; photo: DoorPhotoInfo; serverTime: number }
   | { type: 'contact-sheet'; sheet: ContactSheetInfo; serverTime: number }
+  | { type: 'STATE_SYNC'; persisted: PersistedState; storage: StorageStats; serverTime: number }
   | { type: 'FLASH_PULSE'; durationMs: number; ts: number } // 全端同步测试白闪（独立于状态机）
   | { type: 'clients'; clients: ClientStatus[]; serverTime: number }
   | { type: 'ack'; what: string; ok: boolean; message?: string }
@@ -171,6 +194,7 @@ export type ClientMsg =
   | { type: 'time'; clientTime: number }
   | { type: 'hb' }
   | { type: 'START_SESSION'; token?: string }
+  | { type: 'CAPTURE_BASE'; token?: string }
   | { type: 'TEST_FLASH'; token?: string }
   | { type: 'AUDIO_ENERGY'; level: number }
   | { type: 'TRIGGER_FIX' }

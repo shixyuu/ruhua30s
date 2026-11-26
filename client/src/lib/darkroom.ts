@@ -166,21 +166,35 @@ export function drawSafelightField(
   }
 }
 
-/** EXPOSURE: bright warm enlarger beam #F6F2E8 with optional Recursive Past video shadow overlay */
+/** EXPOSURE: bright warm enlarger beam #F6F2E8 with optional Recursive Past video or cached ghost frame overlay */
 export function drawExposureBeam(
   g: CanvasRenderingContext2D,
-  pastVideo?: HTMLVideoElement | null,
+  pastMedia?: HTMLVideoElement | HTMLImageElement | null,
   pastOpacity = 0.48,
 ): void {
   g.fillStyle = '#F6F2E8';
   g.fillRect(0, 0, DISPLAY_W, DISPLAY_H);
 
-  if (pastVideo && pastVideo.readyState >= 2 && pastVideo.videoWidth > 0 && pastVideo.videoHeight > 0 && !pastVideo.ended) {
-    g.save();
-    g.globalCompositeOperation = 'multiply';
-    g.globalAlpha = Math.max(0.15, Math.min(0.85, pastOpacity));
-    drawCover(g, pastVideo, pastVideo.videoWidth, pastVideo.videoHeight, DISPLAY_W, DISPLAY_H);
-    g.restore();
+  if (pastMedia) {
+    let ready = false;
+    let sw = 0;
+    let sh = 0;
+    if (pastMedia instanceof HTMLVideoElement) {
+      ready = pastMedia.readyState >= 2 && pastMedia.videoWidth > 0 && pastMedia.videoHeight > 0 && !pastMedia.ended;
+      sw = pastMedia.videoWidth;
+      sh = pastMedia.videoHeight;
+    } else {
+      ready = pastMedia.complete && pastMedia.naturalWidth > 0;
+      sw = pastMedia.naturalWidth;
+      sh = pastMedia.naturalHeight;
+    }
+    if (ready) {
+      g.save();
+      g.globalCompositeOperation = 'multiply';
+      g.globalAlpha = Math.max(0.15, Math.min(0.85, pastOpacity));
+      drawCover(g, pastMedia, sw, sh, DISPLAY_W, DISPLAY_H);
+      g.restore();
+    }
   }
 
   const v = g.createRadialGradient(
@@ -210,6 +224,8 @@ export class DarkroomEngine {
   private forecastOutCanvas: HTMLCanvasElement;
   private forecastOutCtx: CanvasRenderingContext2D;
   private forecastImg: ImageData;
+  private ghostCanvas: HTMLCanvasElement;
+  private ghostCtx: CanvasRenderingContext2D;
 
   private avgAccum = new Float32Array(N);
   private minAccum = new Float32Array(N);
@@ -251,6 +267,11 @@ export class DarkroomEngine {
     this.forecastOutCtx = this.forecastOutCanvas.getContext('2d')!;
     this.forecastImg = this.forecastOutCtx.createImageData(FW, FH);
 
+    this.ghostCanvas = document.createElement('canvas');
+    this.ghostCanvas.width = 480;
+    this.ghostCanvas.height = 270;
+    this.ghostCtx = this.ghostCanvas.getContext('2d', { willReadFrequently: true })!;
+
     this.regenerateGrain();
   }
 
@@ -274,6 +295,98 @@ export class DarkroomEngine {
   /** Reset in-memory temporal prediction baseline (called on NEW ROLL) */
   resetMemory(): void {
     this.prevGray = null;
+  }
+
+  /** Restore prevGray from persisted VPS frame URL on browser refresh */
+  async restoreBaselineFromUrl(url: string | null | undefined): Promise<void> {
+    if (!url) return;
+    await new Promise<void>((resolve) => {
+      const img = new Image();
+      img.onload = () => {
+        try {
+          this.forecastSrcCtx.fillStyle = '#080706';
+          this.forecastSrcCtx.fillRect(0, 0, FW, FH);
+          drawContain(this.forecastSrcCtx, img, img.naturalWidth, img.naturalHeight, 0, 0, FW, FH);
+          const px = this.forecastSrcCtx.getImageData(0, 0, FW, FH).data;
+          const gray = new Float32Array(FN);
+          for (let i = 0, p = 0; i < FN; i++, p += 4) {
+            gray[i] = (0.299 * px[p] + 0.587 * px[p + 1] + 0.114 * px[p + 2]) / 255;
+          }
+          this.prevGray = gray;
+        } catch {
+          /* ignore */
+        }
+        resolve();
+      };
+      img.onerror = () => resolve();
+      img.src = url;
+    });
+  }
+
+  /** Capture one 480×270 grayscale JPEG ghost frame (~10-15KB) for VPS cache persistence */
+  captureGhostFrame(videoEl: HTMLVideoElement | null, elapsedSec: number, totalSec: number): string {
+    if (videoEl && videoEl.readyState >= 2 && videoEl.videoWidth > 0 && videoEl.videoHeight > 0) {
+      drawCover(this.ghostCtx, videoEl, videoEl.videoWidth, videoEl.videoHeight, 480, 270);
+    } else {
+      this.drawSimulatedExposureInput(this.sampleCtx, elapsedSec, Math.max(1, totalSec));
+      this.ghostCtx.drawImage(this.sampleCanvas, 0, 0, 480, 270);
+    }
+    const img = this.ghostCtx.getImageData(0, 0, 480, 270);
+    const d = img.data;
+    for (let i = 0; i < d.length; i += 4) {
+      const lum = Math.round(0.299 * d[i] + 0.587 * d[i + 1] + 0.114 * d[i + 2]);
+      d[i] = lum;
+      d[i + 1] = lum;
+      d[i + 2] = lum;
+    }
+    this.ghostCtx.putImageData(img, 0, 0);
+    return this.ghostCanvas.toDataURL('image/jpeg', 0.62);
+  }
+
+  /** Sample 1 frame for 00A empty-beam base capture (averages clean frames to denoise) */
+  sampleBaseFrame(videoEl: HTMLVideoElement | null): void {
+    const ctx = this.sampleCtx;
+    if (videoEl && videoEl.readyState >= 2 && videoEl.videoWidth > 0 && videoEl.videoHeight > 0) {
+      drawCover(ctx, videoEl, videoEl.videoWidth, videoEl.videoHeight, LW, LH);
+    } else {
+      // Clean empty warm-white enlarger beam wall (no moving people)
+      const bg = ctx.createRadialGradient(LW * 0.5, LH * 0.5, 40, LW * 0.5, LH * 0.5, LW * 0.68);
+      bg.addColorStop(0, '#F3EFE4');
+      bg.addColorStop(1, '#DCD5C5');
+      ctx.fillStyle = bg;
+      ctx.fillRect(0, 0, LW, LH);
+      // Subtle static wall texture / calibration corner mark
+      ctx.fillStyle = 'rgba(28, 25, 22, 0.18)';
+      ctx.fillRect(LW * 0.44, LH * 0.46, LW * 0.12, LH * 0.08);
+    }
+    const px = ctx.getImageData(0, 0, LW, LH).data;
+    this.sampleCount++;
+    for (let i = 0, p = 0; i < N; i++, p += 4) {
+      const lum = (0.299 * px[p] + 0.587 * px[p + 1] + 0.114 * px[p + 2]) / 255;
+      this.avgAccum[i] += lum;
+    }
+  }
+
+  /** Finalize multi-frame averaged 00A BASE image + initial FORECAST 01A + collapseZone */
+  finalizeBaseAndForecast(): { baseDataUrl: string; forecastDataUrl: string; collapseZone: CollapseZone } {
+    if (this.sampleCount === 0) this.sampleBaseFrame(null);
+    const invN = 1 / Math.max(1, this.sampleCount);
+    const out = this.devImg.data;
+    for (let i = 0, q = 0; i < N; i++, q += 4) {
+      const v = Math.max(0, Math.min(1, this.avgAccum[i] * invN));
+      const g = Math.max(0, Math.min(1, v + this.grainMap[i] * 0.015));
+      out[q] = Math.round(9 + 231 * g);
+      out[q + 1] = Math.round(8 + 226 * g);
+      out[q + 2] = Math.round(8 + 212 * g);
+      out[q + 3] = 255;
+    }
+    this.devCtx.putImageData(this.devImg, 0, 0);
+    this.exportCtx.imageSmoothingEnabled = true;
+    this.exportCtx.imageSmoothingQuality = 'high';
+    this.exportCtx.drawImage(this.devCanvas, 0, 0, DISPLAY_W, DISPLAY_H);
+    const baseDataUrl = this.exportCanvas.toDataURL('image/jpeg', 0.88);
+    const { forecastDataUrl, collapseZone } = this.computeAndExportForecast(true, 0.85);
+    return { baseDataUrl, forecastDataUrl, collapseZone };
   }
 
   /** Capture stream of sampleCanvas for local MediaRecorder fallback when no USB camera is attached */

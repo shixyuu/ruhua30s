@@ -85,7 +85,7 @@ export default async function door(app: HTMLElement): Promise<void> {
 
     const cells: string[] = [];
     visible.forEach((f) => {
-      const code = f.outcomeCode || 'FIXED';
+      const code = f.index === 0 ? 'BASELINE' : f.outcomeCode || 'FIXED';
       cells.push(`
         <div class="cs-cell filled">
           <div class="cs-imgbox">
@@ -106,7 +106,7 @@ export default async function door(app: HTMLElement): Promise<void> {
     }
     pastGrid.innerHTML = cells.join('');
 
-    const targetNo = forecast?.targetFrameNo || (allFrames.length === 0 ? '00A' : `${pad2(allFrames.length)}A`);
+    const targetNo = forecast?.targetFrameNo || (allFrames.length === 0 ? '00A' : `${pad2(allFrames.filter((f) => f.index >= 1).length + 1)}A`);
     if (forecast?.has && forecast.url) {
       futureHead.textContent = `PREDICTED FUTURE · ${targetNo}`;
       futureBox.className = 'future-box active';
@@ -122,13 +122,28 @@ export default async function door(app: HTMLElement): Promise<void> {
     }
   }
 
-  async function refreshSheetHttp(): Promise<void> {
+  async function refreshStateHttp(): Promise<void> {
     try {
-      const r = await fetch('/api/contact-sheet', { cache: 'no-store' });
+      const r = await fetch('/api/state', { cache: 'no-store' });
       const j = await r.json();
-      if (j?.ok && j.sheet) {
-        net.contactSheet = j.sheet;
-        renderSheet(j.sheet);
+      if (j?.ok && j.state) {
+        const st = j.state;
+        const sheet: ContactSheetInfo = {
+          rollNumber: st.rollNumber,
+          totalInRoll: st.frames?.length ?? 0,
+          frames: st.frames ?? [],
+          forecast: st.forecastUrl
+            ? {
+                has: true,
+                version: st.baseCapturedAt || Date.now(),
+                targetFrameNo: `${pad2((st.frames?.filter((f: any) => f.index >= 1).length ?? 0) + 1)}A`,
+                url: st.forecastUrl,
+                collapseZone: st.collapseZone ?? null,
+              }
+            : undefined,
+        };
+        net.contactSheet = sheet;
+        renderSheet(sheet);
       }
     } catch {
       /* ignore */
@@ -137,7 +152,12 @@ export default async function door(app: HTMLElement): Promise<void> {
 
   function renderPhase(phase: Phase): void {
     const isEnter = phase === 'ENTER_BUFFER';
-    const isDim = phase === 'SAFELIGHT_COMPOSE' || phase === 'EXPOSURE' || phase === 'DEVELOPING' || phase === 'LIGHT_LEAK';
+    const isDim =
+      phase === 'CAPTURING_BASE' ||
+      phase === 'SAFELIGHT_COMPOSE' ||
+      phase === 'EXPOSURE' ||
+      phase === 'DEVELOPING' ||
+      phase === 'LIGHT_LEAK';
     enterModal.classList.toggle('show', isEnter);
     sheetWrap.classList.toggle('dim-deep', isEnter);
     sheetWrap.classList.toggle('dim', isDim);
@@ -146,10 +166,11 @@ export default async function door(app: HTMLElement): Promise<void> {
 
   net.on('state', (m) => renderPhase(m.state));
   net.on('contact-sheet', (m) => renderSheet(m.sheet));
+  net.on('STATE_SYNC', () => void refreshStateHttp());
   net.on('config', () => renderSheet(net.contactSheet));
   net.on('open', () => {
     renderSheet(net.contactSheet, net.state?.forecast ?? null);
-    void refreshSheetHttp();
+    void refreshStateHttp();
   });
 
   mountNetDot(net);

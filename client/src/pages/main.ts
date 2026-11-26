@@ -1,7 +1,8 @@
 /**
  * /main — Mac + projector + wide-angle USB camera (v3 Live Darkroom & Temporal Extrapolation Engine)
- * - 92%+ pure darkroom optical imagery; zero center arrow overlays or corner badges.
- * - Minimalist single-row bottom darkroom timeline bar (56px, hidden in IDLE) with 4 steps + live action prompt.
+ * - 92%+ pure darkroom optical imagery; single-row bottom timeline bar (56px, hidden in IDLE/CAPTURING_BASE).
+ * - CAPTURING_BASE: 4s exit countdown -> 1.5s pure #F6F2E8 multi-frame 00A BASE capture + FORECAST 01A init -> POST /api/archive/base.
+ * - EXPOSURE: captures 480×270 grayscale ghost sequence every 0.5s -> POST /api/cache/ghost; restores from GET /api/cache/ghost after refresh.
  * - Exported Instax / archive JPEGs render from offscreen exportCanvas and NEVER include the bottom timeline UI.
  */
 import { Net, mountNetDot, triggerFlashPulse } from '../lib/net';
@@ -51,6 +52,7 @@ export default async function mainPage(app: HTMLElement): Promise<void> {
   app.innerHTML = `
     <canvas class="layer" id="fx"></canvas>
     <div class="main-countdown hidden" id="countdownBox"><span id="countdown">5</span></div>
+    <div class="main-base-prompt hidden" id="basePrompt">CLEAR THE BEAM · BASE CAPTURE IN <span id="baseSec">4</span></div>
     <footer class="main-timeline hidden" id="timelineBar" aria-hidden="true">
       <div class="tl-steps">
         <div class="tl-seg" id="segCompose"><span>01 COMPOSE</span><div class="tl-fill"></div></div>
@@ -68,6 +70,8 @@ export default async function mainPage(app: HTMLElement): Promise<void> {
   const g = setupCanvas(fx);
   const countdownBox = $<HTMLDivElement>('#countdownBox');
   const countdown = $<HTMLSpanElement>('#countdown');
+  const basePrompt = $<HTMLDivElement>('#basePrompt');
+  const baseSecEl = $<HTMLSpanElement>('#baseSec');
   const timelineBar = $<HTMLElement>('#timelineBar');
   const segCompose = $<HTMLDivElement>('#segCompose');
   const segExpose = $<HTMLDivElement>('#segExpose');
@@ -122,12 +126,16 @@ export default async function mainPage(app: HTMLElement): Promise<void> {
   }
 
   // ====================================================================
-  // Recursive Past local MediaRecorder & Forecast image preloading
+  // Recursive Past (local MediaRecorder + VPS 480×270 Ghost Sequence)
   // ====================================================================
   let lastRoundVideoUrl: string | null = null;
   let recorder: MediaRecorder | null = null;
   let recChunks: Blob[] = [];
   let trackedRollNumber: number | null = null;
+
+  let cachedGhostImgs: HTMLImageElement[] = [];
+  let capturedGhostFrames: string[] = [];
+  let lastGhostSlot = -1;
 
   let safelightForecastImg: HTMLImageElement | null = null;
   let predictedRevealImg: HTMLImageElement | null = null;
@@ -145,12 +153,48 @@ export default async function mainPage(app: HTMLElement): Promise<void> {
       URL.revokeObjectURL(lastRoundVideoUrl);
       lastRoundVideoUrl = null;
     }
+    cachedGhostImgs = [];
+    capturedGhostFrames = [];
     pastVid.pause();
     pastVid.removeAttribute('src');
     pastVid.load();
     safelightForecastImg = null;
     predictedRevealImg = null;
     engine.resetMemory();
+  }
+
+  async function loadGhostFromVps(): Promise<void> {
+    try {
+      const r = await fetch('/api/cache/ghost', { cache: 'no-store' });
+      const j = await r.json();
+      const frames: string[] = j?.payload?.frames ?? [];
+      if (frames.length > 0) {
+        cachedGhostImgs = frames.map((u) => {
+          const im = new Image();
+          im.src = u;
+          return im;
+        });
+      }
+    } catch {
+      /* ignore */
+    }
+  }
+
+  async function restoreFromVpsState(): Promise<void> {
+    try {
+      const r = await fetch('/api/state', { cache: 'no-store' });
+      const j = await r.json();
+      if (!j?.ok || !j.state) return;
+      const st = j.state;
+      trackedRollNumber = st.rollNumber;
+      const baselineUrl = st.latestFrameUrl || st.baseFrameUrl;
+      if (baselineUrl) await engine.restoreBaselineFromUrl(baselineUrl);
+      if (st.hasGhostSequence && cachedGhostImgs.length === 0) {
+        await loadGhostFromVps();
+      }
+    } catch {
+      /* ignore */
+    }
   }
 
   function startPastRecorder(): void {
@@ -209,17 +253,37 @@ export default async function mainPage(app: HTMLElement): Promise<void> {
     }
   }
 
-  // Test flash audio sync (shared flash overlay itself is mounted by mountNetDot)
+  async function uploadCapturedGhost(rollNumber: number, frameNumber: number): Promise<void> {
+    if (capturedGhostFrames.length === 0) return;
+    const frames = [...capturedGhostFrames];
+    capturedGhostFrames = [];
+    cachedGhostImgs = frames.map((u) => {
+      const im = new Image();
+      im.src = u;
+      return im;
+    });
+    try {
+      await fetch('/api/cache/ghost', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ rollNumber, frameNumber, frames }),
+      });
+    } catch {
+      /* ignore */
+    }
+  }
+
+  // Test flash audio sync
   net.on('FLASH_PULSE', () => {
     try {
       shutter();
     } catch {
-      /* ignore if audio locked */
+      /* ignore */
     }
   });
 
   // ====================================================================
-  // exposure sampler & developing state
+  // exposure & base capture samplers
   // ====================================================================
   let sampleTimer: number | null = null;
   let liveDevProgress = 0;
@@ -227,6 +291,8 @@ export default async function mainPage(app: HTMLElement): Promise<void> {
   let frozenDeviationPct: number | null = null;
   let activePrintMode: PrintMode = 'photogram_negative';
   let freezeUploadedRound = -1;
+  let baseUploadedRound = -1;
+  let baseShutterFired = false;
   let devWarnTickStarted = false;
 
   function stopSampler(): void {
@@ -239,14 +305,46 @@ export default async function mainPage(app: HTMLElement): Promise<void> {
   function startSampler(roundId: number): void {
     stopSampler();
     engine.beginExposure(roundId);
+    capturedGhostFrames = [];
+    lastGhostSlot = -1;
     const sampleOnce = () => {
       if (net.phase !== 'EXPOSURE') return stopSampler();
       const totalSec = net.config?.exposureSec ?? 15;
       const elapsedSec = net.storySec();
       engine.sampleExposureFrame(camLive() ? camV : null, elapsedSec, totalSec);
+
+      const slot = Math.floor(elapsedSec / 0.5);
+      if (slot > lastGhostSlot && capturedGhostFrames.length < 30) {
+        lastGhostSlot = slot;
+        capturedGhostFrames.push(engine.captureGhostFrame(camLive() ? camV : null, elapsedSec, totalSec));
+      }
     };
     sampleOnce();
     sampleTimer = window.setInterval(sampleOnce, SAMPLE_INTERVAL_MS);
+  }
+
+  function startBaseSampler(roundId: number): void {
+    stopSampler();
+    engine.beginExposure(roundId);
+    baseShutterFired = false;
+    baseUploadedRound = -1;
+    const sampleBase = () => {
+      if (net.phase !== 'CAPTURING_BASE') return stopSampler();
+      const s = net.storySec();
+      if (s >= 4.0 && s < 4.95) {
+        engine.sampleBaseFrame(camLive() ? camV : null);
+      } else if (s >= 4.95 && baseUploadedRound !== roundId) {
+        baseUploadedRound = roundId;
+        stopSampler();
+        const { baseDataUrl, forecastDataUrl, collapseZone } = engine.finalizeBaseAndForecast();
+        void fetch('/api/archive/base', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ imageData: baseDataUrl, forecastData: forecastDataUrl, collapseZone }),
+        }).catch(() => {});
+      }
+    };
+    sampleTimer = window.setInterval(sampleBase, SAMPLE_INTERVAL_MS);
   }
 
   net.on('dev', (m) => {
@@ -283,17 +381,28 @@ export default async function mainPage(app: HTMLElement): Promise<void> {
     const isSeed = st.round.frameNumber === 0;
     activePrintMode = st.round.printMode ?? net.config?.printMode ?? 'photogram_negative';
     countdownBox.classList.add('hidden');
+    basePrompt.classList.add('hidden');
     stopSampler();
     devWarnTickStarted = false;
-    if (phase !== 'EXPOSURE') {
+
+    if (prevPhase === 'EXPOSURE' && phase !== 'EXPOSURE') {
       stopPastRecorder(phase === 'DEVELOPING' || phase === 'LIGHT_LEAK' || phase === 'FIXED_REVEAL');
       pastVid.pause();
+      void uploadCapturedGhost(st.round.rollNumber, st.round.frameNumber);
     }
 
     switch (phase) {
       case 'IDLE':
         stopAllLoops();
         timelineBar.classList.add('hidden');
+        break;
+
+      case 'CAPTURING_BASE':
+        stopAllLoops();
+        timelineBar.classList.add('hidden');
+        basePrompt.classList.remove('hidden');
+        await ensureCamera();
+        if (net.phase === 'CAPTURING_BASE') startBaseSampler(roundId);
         break;
 
       case 'ENTER_BUFFER':
@@ -309,6 +418,7 @@ export default async function mainPage(app: HTMLElement): Promise<void> {
         }
         timelineBar.classList.add('hidden');
         countdownBox.classList.remove('hidden');
+        if (cachedGhostImgs.length === 0 && !lastRoundVideoUrl) void loadGhostFromVps();
         await ensureCamera();
         break;
 
@@ -326,6 +436,7 @@ export default async function mainPage(app: HTMLElement): Promise<void> {
         setActiveSegment(segCompose);
         tlPrompt.className = 'tl-prompt';
         tlPrompt.textContent = isSeed ? 'SEED 00A · STEP INTO POSITION' : 'STEP INTO POSITION';
+        if (cachedGhostImgs.length === 0 && !lastRoundVideoUrl) void loadGhostFromVps();
         await ensureCamera();
         break;
 
@@ -337,10 +448,12 @@ export default async function mainPage(app: HTMLElement): Promise<void> {
         setActiveSegment(segExpose);
         tlPrompt.className = 'tl-prompt';
         tlPrompt.textContent = 'ALTER FRAME WITH BOARDS & FILMS';
-        if (!isSeed && lastRoundVideoUrl) {
+        if (lastRoundVideoUrl) {
           pastVid.src = lastRoundVideoUrl;
           pastVid.currentTime = 0;
           void pastVid.play().catch(() => {});
+        } else if (cachedGhostImgs.length === 0) {
+          void loadGhostFromVps();
         }
         await ensureCamera();
         if (net.phase === 'EXPOSURE') {
@@ -419,11 +532,16 @@ export default async function mainPage(app: HTMLElement): Promise<void> {
     trackedRollNumber = m.config.rollNumber;
   });
 
-  net.on('contact-sheet', (m) => {
-    if (m.sheet.totalInRoll === 0 && net.phase === 'IDLE' && lastRoundVideoUrl !== null) {
+  net.on('STATE_SYNC', (m) => {
+    const p = m.persisted;
+    if (!p.hasBase && p.frames.length === 0 && !p.hasGhostSequence) {
       clearRollMemory();
+    } else if (p.hasGhostSequence && !lastRoundVideoUrl && cachedGhostImgs.length === 0) {
+      void loadGhostFromVps();
     }
   });
+
+  net.on('open', () => void restoreFromVpsState());
 
   net.on('state', (m) => {
     if (trackedRollNumber !== null && m.round.rollNumber !== trackedRollNumber) {
@@ -451,6 +569,27 @@ export default async function mainPage(app: HTMLElement): Promise<void> {
         drawIdleDarkroom(g, net.now());
         break;
 
+      case 'CAPTURING_BASE': {
+        const s = net.storySec();
+        if (s < 4.0) {
+          drawIdleDarkroom(g, net.now());
+          basePrompt.classList.remove('hidden');
+          baseSecEl.textContent = String(Math.max(1, Math.ceil(4.0 - s)));
+        } else {
+          if (!baseShutterFired) {
+            baseShutterFired = true;
+            try {
+              shutter();
+            } catch {
+              /* ignore */
+            }
+          }
+          basePrompt.classList.add('hidden');
+          drawExposureBeam(g, null, 0);
+        }
+        break;
+      }
+
       case 'ENTER_BUFFER': {
         drawIdleDarkroom(g, net.now());
         const remain = Math.max(1, Math.ceil(net.remainingMs() / 1000 / net.timeScale));
@@ -466,7 +605,15 @@ export default async function mainPage(app: HTMLElement): Promise<void> {
 
       case 'EXPOSURE': {
         const pastOpacity = net.config?.pastOpacity ?? 0.48;
-        drawExposureBeam(g, !isSeed && lastRoundVideoUrl ? pastVid : null, pastOpacity);
+        let pastMedia: HTMLVideoElement | HTMLImageElement | null = null;
+        if (lastRoundVideoUrl) {
+          pastMedia = pastVid;
+        } else if (cachedGhostImgs.length > 0) {
+          const total = Math.max(1, net.config?.exposureSec ?? 15);
+          const idx = Math.min(cachedGhostImgs.length - 1, Math.floor((net.storySec() / total) * cachedGhostImgs.length));
+          pastMedia = cachedGhostImgs[idx];
+        }
+        drawExposureBeam(g, pastMedia, pastOpacity);
         const total = Math.max(1, net.config?.exposureSec ?? 15);
         const frac = Math.max(0, Math.min(1, net.storySec() / total));
         expFill.style.width = `${(frac * 100).toFixed(1)}%`;
@@ -561,7 +708,7 @@ export default async function mainPage(app: HTMLElement): Promise<void> {
           <div class="fields">
             <label><span class="no">01 / CAMERA</span>External USB wide-angle camera<select id="camSel"></select></label>
             <label><span class="no">02 / AUDIO OUT</span>Audio output device<select id="sinkSel"></select></label>
-            <div class="hint" id="camHint">Camera stream stays strictly local for live photogram accumulation &amp; recursive past overlay.</div>
+            <div class="hint" id="camHint">Camera stream stays strictly local; only lightweight 480×270 ghost frames cache to VPS.</div>
           </div>
           <div class="fields">
             <div class="pv"><video id="pv" muted playsinline autoplay></video><span class="mono">LIVE CAMERA PREVIEW</span></div>
