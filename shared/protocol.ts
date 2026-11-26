@@ -51,7 +51,7 @@ export interface AppConfig {
   devSpeed: number;
   /** 画框四周黑边百分比（0–30，默认 6） */
   easelMargin: number;
-  /** 摄像头遮挡差分阈值（0.05–0.35，默认 0.12） */
+  /** 摄像头遮挡差分阈值（0.02–0.50，默认 0.12；越低越灵敏） */
   diffSensitivity: number;
   /** 在家无摄像头鼠标涂抹减光模拟开关 */
   mouseSimulator: boolean;
@@ -69,7 +69,7 @@ export const CONFIG_BOUNDS = {
   noiseFloor: { min: 0.0, max: 0.5 },
   devSpeed: { min: 0.03, max: 0.8 },
   easelMargin: { min: 0, max: 30 },
-  diffSensitivity: { min: 0.05, max: 0.35 },
+  diffSensitivity: { min: 0.02, max: 0.5 },
 } as const;
 
 export const DEFAULT_CONFIG: AppConfig = {

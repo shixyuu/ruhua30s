@@ -99,7 +99,7 @@ export default function admin(app: HTMLElement): void {
             <input id="marginRange" type="range" min="${CONFIG_BOUNDS.easelMargin.min}" max="${CONFIG_BOUNDS.easelMargin.max}" step="1" value="6" />
           </label>
           <label class="slider-ctl">
-            <div class="sl-head"><span>Diff Sensitivity (AE / Moiré Filter)</span><span class="mono" id="diffVal">0.12</span></div>
+            <div class="sl-head"><span>Detect Threshold (lower = more sensitive)</span><span class="mono" id="diffVal">0.12</span></div>
             <input id="diffRange" type="range" min="${CONFIG_BOUNDS.diffSensitivity.min}" max="${CONFIG_BOUNDS.diffSensitivity.max}" step="0.01" value="0.12" />
           </label>
         </div>
