@@ -57,7 +57,7 @@ export default async function door(app: HTMLElement): Promise<void> {
       queuePill.textContent = 'NEXT PHOTO: READY (UPLOADED)';
       queuePill.className = 'mono q-ready';
     } else if (sampleIdx > 0) {
-      queuePill.textContent = `NEXT PHOTO: BUILT-IN SAMPLE #${sampleIdx}`;
+      queuePill.textContent = sampleIdx === 7 ? 'NEXT PHOTO: LAST PRINT' : `NEXT PHOTO: BUILT-IN SAMPLE #${sampleIdx}`;
       queuePill.className = 'mono q-ready';
     } else {
       queuePill.textContent = 'WAITING FOR UPLOAD';

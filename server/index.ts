@@ -666,7 +666,7 @@ function tryStart(trigger: string): boolean {
 
   if (config.sampleFallback > 0) {
     sampleIndex = config.sampleFallback;
-    if (sampleIndex === 4 && persisted.latestFrameUrl) {
+    if (sampleIndex === 7 && persisted.latestFrameUrl) {
       sourceUrl = persisted.latestFrameUrl;
     }
   } else if (persisted.hasQueuedPhoto && persisted.queuedPhotoUrl) {

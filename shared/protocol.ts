@@ -91,7 +91,7 @@ export interface RoundInfo {
   rollNumber: number;
   frameNumber: number; // 1 -> 01A, 2 -> 02A...
   sourceUrl: string | null; // uploaded photo URL or null (sample fallback)
-  sampleIndex: number; // 0 = uploaded, 1..3 = built-in sample, 4 = prev print
+  sampleIndex: number; // 0 = uploaded, 1..6 = built-in sample photo, 7 = prev print
   devProgress: number;
   finalDevProgress: number | null;
   fixTriggeredBy: 'station2' | 'timeout' | 'admin' | null;

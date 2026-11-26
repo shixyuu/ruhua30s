@@ -11,6 +11,15 @@
  */
 import { GRID_H, GRID_W, warpCameraToGridGray } from './homography';
 
+// Built-in sample photographs (admin "USE BUILT-IN SAMPLE" #1..#6); re-encoded JPEGs, metadata stripped
+import samplePhoto1 from '../samples/sample-1.jpg';
+import samplePhoto2 from '../samples/sample-2.jpg';
+import samplePhoto3 from '../samples/sample-3.jpg';
+import samplePhoto4 from '../samples/sample-4.jpg';
+import samplePhoto5 from '../samples/sample-5.jpg';
+import samplePhoto6 from '../samples/sample-6.jpg';
+const SAMPLE_PHOTOS = [samplePhoto1, samplePhoto2, samplePhoto3, samplePhoto4, samplePhoto5, samplePhoto6];
+
 export const DISPLAY_W = 1280;
 export const DISPLAY_H = 720;
 const CAM_W = 640;
@@ -167,124 +176,50 @@ export class DarkroomEngine {
     this.exportCanvas = document.createElement('canvas');
     this.exportCtx = this.exportCanvas.getContext('2d')!;
 
-    this.generateBuiltInSample(1);
+    this.setBlankSource();
   }
 
   getSourceSize(): { w: number; h: number } {
     return { w: this.origW, h: this.origH };
   }
 
-  /** Load user uploaded photo URL (or built-in sample if url is null) */
+  /** Load user uploaded photo URL (or built-in sample photo if url is null) */
   async loadSource(url: string | null, sampleIndex = 1): Promise<void> {
-    if (!url) {
-      this.generateBuiltInSample(sampleIndex || 1);
-      return;
-    }
-    try {
-      const img = await new Promise<HTMLImageElement>((resolve, reject) => {
-        const im = new Image();
-        im.crossOrigin = 'anonymous';
-        im.onload = () => resolve(im);
-        im.onerror = () => reject(new Error('Image load failed'));
-        im.src = url;
-      });
-      const maxWork = 1280;
-      const scale = Math.min(1, maxWork / Math.max(img.naturalWidth, img.naturalHeight));
-      const w = Math.max(16, Math.round(img.naturalWidth * scale));
-      const h = Math.max(16, Math.round(img.naturalHeight * scale));
-      this.origCanvas.width = w;
-      this.origCanvas.height = h;
-      this.origCtx.drawImage(img, 0, 0, w, h);
-      this.prepareDerivedCanvases();
-    } catch {
-      this.generateBuiltInSample(sampleIndex || 1);
-    }
-  }
-
-  /** Built-in high-contrast color test photographs when no phone upload is queued */
-  private generateBuiltInSample(idx: number): void {
-    const w = 1280;
-    const h = 720;
-    this.origCanvas.width = w;
-    this.origCanvas.height = h;
-    const c = this.origCtx;
-
-    if (idx === 2) {
-      // Sample 2: Botanical Crimson & Cobalt Still Life
-      const bg = c.createLinearGradient(0, 0, w, h);
-      bg.addColorStop(0, '#10243E');
-      bg.addColorStop(0.55, '#1B3A5C');
-      bg.addColorStop(1, '#09111E');
-      c.fillStyle = bg;
-      c.fillRect(0, 0, w, h);
-
-      c.fillStyle = '#D94B38';
-      c.beginPath();
-      c.arc(w * 0.48, h * 0.48, 175, 0, Math.PI * 2);
-      c.fill();
-
-      c.fillStyle = '#F2C14E';
-      c.beginPath();
-      c.arc(w * 0.62, h * 0.36, 78, 0, Math.PI * 2);
-      c.fill();
-
-      c.fillStyle = '#0F1814';
-      c.fillRect(w * 0.14, h * 0.68, w * 0.72, h * 0.22);
-      c.fillStyle = '#E8DFCC';
-      c.fillRect(w * 0.25, h * 0.28, 36, 320);
-    } else if (idx === 3) {
-      // Sample 3: Architectural Warm Beam & Indigo Shadows
-      c.fillStyle = '#141B29';
-      c.fillRect(0, 0, w, h);
-      const beam = c.createLinearGradient(w * 0.18, 0, w * 0.85, h);
-      beam.addColorStop(0, '#FCE6B4');
-      beam.addColorStop(0.5, '#D97B48');
-      beam.addColorStop(1, '#1A2639');
-      c.fillStyle = beam;
-      c.beginPath();
-      c.moveTo(w * 0.22, 0);
-      c.lineTo(w * 0.68, 0);
-      c.lineTo(w * 0.88, h);
-      c.lineTo(w * 0.12, h);
-      c.closePath();
-      c.fill();
-
-      c.fillStyle = '#0B0F17';
-      c.fillRect(w * 0.38, h * 0.32, 110, 360);
-      c.fillStyle = '#477998';
-      c.beginPath();
-      c.arc(w * 0.62, h * 0.52, 92, 0, Math.PI * 2);
-      c.fill();
-    } else {
-      // Sample 1: Coastal Sunset & Pier Silhouette
-      const sky = c.createLinearGradient(0, 0, 0, h * 0.65);
-      sky.addColorStop(0, '#1A2D4F');
-      sky.addColorStop(0.55, '#B84A39');
-      sky.addColorStop(1, '#F2AE52');
-      c.fillStyle = sky;
-      c.fillRect(0, 0, w, h * 0.65);
-
-      c.fillStyle = '#FFF0C2';
-      c.beginPath();
-      c.arc(w * 0.52, h * 0.44, 96, 0, Math.PI * 2);
-      c.fill();
-
-      const sea = c.createLinearGradient(0, h * 0.65, 0, h);
-      sea.addColorStop(0, '#2C4257');
-      sea.addColorStop(1, '#0C131C');
-      c.fillStyle = sea;
-      c.fillRect(0, h * 0.65, w, h * 0.35);
-
-      // Reflection + Pier silhouette
-      c.fillStyle = 'rgba(255, 200, 110, 0.45)';
-      c.fillRect(w * 0.47, h * 0.65, 130, h * 0.35);
-      c.fillStyle = '#0D0C0B';
-      c.fillRect(0, h * 0.63, w * 0.42, 24);
-      for (let px = 60; px < w * 0.42; px += 95) {
-        c.fillRect(px, h * 0.63, 18, h * 0.37);
+    const n = SAMPLE_PHOTOS.length;
+    const sampleUrl = SAMPLE_PHOTOS[((Math.max(1, Math.floor(sampleIndex || 1)) - 1) % n + n) % n];
+    const candidates = url ? [url, sampleUrl] : [sampleUrl];
+    for (const src of candidates) {
+      try {
+        const img = await new Promise<HTMLImageElement>((resolve, reject) => {
+          const im = new Image();
+          im.crossOrigin = 'anonymous';
+          im.onload = () => resolve(im);
+          im.onerror = () => reject(new Error('Image load failed'));
+          im.src = src;
+        });
+        const maxWork = 1280;
+        const scale = Math.min(1, maxWork / Math.max(img.naturalWidth, img.naturalHeight));
+        const w = Math.max(16, Math.round(img.naturalWidth * scale));
+        const h = Math.max(16, Math.round(img.naturalHeight * scale));
+        this.origCanvas.width = w;
+        this.origCanvas.height = h;
+        this.origCtx.drawImage(img, 0, 0, w, h);
+        this.prepareDerivedCanvases();
+        return;
+      } catch {
+        console.warn(`[darkroom] source image failed to load: ${src}`);
       }
     }
+    // Nothing loadable: blank (black) source, no drawn placeholder
+    this.setBlankSource();
+  }
 
+  /** Blank black working source (initial state / every image failed to load) */
+  private setBlankSource(): void {
+    this.origCanvas.width = DISPLAY_W;
+    this.origCanvas.height = DISPLAY_H;
+    this.origCtx.fillStyle = '#000';
+    this.origCtx.fillRect(0, 0, DISPLAY_W, DISPLAY_H);
     this.prepareDerivedCanvases();
   }
 

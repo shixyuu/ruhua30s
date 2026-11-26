@@ -114,7 +114,7 @@ export function sanitizeConfig(input: Partial<AppConfig> | undefined, base: AppC
     mouseSimulator: typeof src.mouseSimulator === 'boolean' ? src.mouseSimulator : base.mouseSimulator,
     sampleFallback: (() => {
       const s = typeof src.sampleFallback === 'number' ? src.sampleFallback : Number(src.sampleFallback);
-      return Number.isFinite(s) ? Math.max(0, Math.min(4, Math.floor(s))) : base.sampleFallback;
+      return Number.isFinite(s) ? Math.max(0, Math.min(7, Math.floor(s))) : base.sampleFallback;
     })(),
     rollNumber: (() => {
       const r = typeof src.rollNumber === 'number' ? src.rollNumber : Number(src.rollNumber);

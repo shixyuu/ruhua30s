@@ -294,7 +294,7 @@ export default function admin(app: HTMLElement): void {
 
   sampleBtn.addEventListener('click', () => {
     const cur = net.config?.sampleFallback ?? 0;
-    const next = (cur + 1) % 5; // 0=OFF, 1..3=samples, 4=last print
+    const next = (cur + 1) % 8; // 0=OFF, 1..6=sample photos, 7=last print
     sendConfigPatch({ sampleFallback: next }, true);
   });
 
@@ -580,7 +580,7 @@ export default function admin(app: HTMLElement): void {
   });
 
   function updateSampleLabel(sampleIdx: number): void {
-    const map = ['OFF', 'SAMPLE #1', 'SAMPLE #2', 'SAMPLE #3', 'LAST PRINT'];
+    const map = ['OFF', 'SAMPLE #1', 'SAMPLE #2', 'SAMPLE #3', 'SAMPLE #4', 'SAMPLE #5', 'SAMPLE #6', 'LAST PRINT'];
     sampleBtn.textContent = `USE BUILT-IN SAMPLE: ${map[sampleIdx] ?? 'OFF'}`;
     sampleBtn.classList.toggle('armed', sampleIdx > 0);
   }
