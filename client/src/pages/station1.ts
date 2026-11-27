@@ -1,10 +1,3 @@
-/**
- * /station1 — tablet 2: south-west acoustic developer gauge
- * - Pure black (#000000) outside DEVELOPING.
- * - During DEVELOPING: full-screen vintage analog needle meter driven smoothly by live microphone energy,
- *   with a single caption below: MAKE NOISE TO DEVELOP (never displays devProgress percentage).
- * - Streams normalized energy (0.0–1.0) at 12 Hz via WebSocket `{ type: 'AUDIO_ENERGY', level }`.
- */
 import { Net, mountNetDot } from '../lib/net';
 import { audioCtx, stationWakeChime } from '../lib/sfx';
 import { showStartOverlay } from '../lib/unlock';

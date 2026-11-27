@@ -1,12 +1,3 @@
-/**
- * /main — Mac + projector + wide-angle USB camera (v3.2 Color Darkroom & Physical Dodging Engine)
- * - CALIBRATING: pure high-contrast TL/TR/BR/BL target inside easelMargin (no camera echo)
- * - CAPTURE_CLEAN (0.8s): shadow-lifted color photo + 4-frame warped camClean baseline
- * - OBSERVE (8s): safelight red monochrome projection + `01 OBSERVE` timeline
- * - EXPOSE (30s): shadow-lifted color photo + 7 FPS homography dodge integration (or Mouse Dodge Simulator)
- * - DEVELOP (25s): RA-4 subtractive color darkroom developing model driven by /station1 acoustic energy
- * - REVEAL (12s): side-by-side ORIGINAL vs ALTERED PRINT + clean Instax color JPEG upload
- */
 import { Net, mountNetDot, triggerFlashPulse } from '../lib/net';
 import {
   audioCtx,
@@ -74,9 +65,7 @@ export default async function mainPage(app: HTMLElement): Promise<void> {
   (window as any).__net = net;
   mountNetDot(net);
 
-  // ====================================================================
   // camera & audio sink
-  // ====================================================================
   let camStream: MediaStream | null = null;
   let camId = localStorage.getItem(LS_CAM) || '';
   let sinkId = localStorage.getItem(LS_SINK) || '';
@@ -127,9 +116,7 @@ export default async function mainPage(app: HTMLElement): Promise<void> {
     }
   });
 
-  // ====================================================================
   // Home Mouse Dodge Simulator (paint directly on /main during EXPOSE)
-  // ====================================================================
   let mouseDown = false;
   let lastPaintAt = 0;
 
@@ -168,9 +155,7 @@ export default async function mainPage(app: HTMLElement): Promise<void> {
     mouseDown = false;
   });
 
-  // ====================================================================
   // exposure / clean sampling & developing state
-  // ====================================================================
   let sampleTimer: number | null = null;
   let lastSampleAt = 0;
   let liveDevProgress = 0;
@@ -241,9 +226,7 @@ export default async function mainPage(app: HTMLElement): Promise<void> {
     if (net.phase === 'DEVELOP') devBathAudio.update(liveDevProgress);
   });
 
-  // ====================================================================
   // phase changes
-  // ====================================================================
   let curPhase: Phase | null = null;
   let curRound = -1;
 
@@ -377,9 +360,7 @@ export default async function mainPage(app: HTMLElement): Promise<void> {
     void onPhase(m.state, true, prev);
   });
 
-  // ====================================================================
   // admin DETECT VIEW: stream a low-fps debug frame + stats to /admin
-  // ====================================================================
   const detectCanvas = document.createElement('canvas');
   let detectTimer: number | null = null;
   let detectPhase: Phase | null = null;
@@ -436,9 +417,7 @@ export default async function mainPage(app: HTMLElement): Promise<void> {
     net.send({ type: 'REREF_EVENT', kind: r.kind, reason: r.reason, frames: r.frames });
   }, 300);
 
-  // ====================================================================
   // render loop
-  // ====================================================================
   function frame(): void {
     const phase = net.phase;
     const st = net.state;
@@ -523,9 +502,7 @@ export default async function mainPage(app: HTMLElement): Promise<void> {
     requestAnimationFrame(frame);
   }
 
-  // ====================================================================
   // setup panel (S reopens, F fullscreen)
-  // ====================================================================
   await setupPanel();
   net.connect();
   requestAnimationFrame(frame);

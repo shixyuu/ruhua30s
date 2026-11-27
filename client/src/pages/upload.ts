@@ -1,8 +1,3 @@
-/**
- * /upload — Mobile Audience Photo Upload (Color Darkroom Queue)
- * - Compresses selected image long edge to 1600px (preserving original color & aspect ratio, JPEG q=0.90)
- * - Uploads via POST /api/upload -> FIFO queue in ./data/queue/ (max QUEUE_MAX, 429 when full)
- */
 import { TITLE_EN } from '../lib/brand';
 
 const MAX_EDGE = 1600;

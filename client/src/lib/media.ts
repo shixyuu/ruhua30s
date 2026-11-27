@@ -1,4 +1,3 @@
-/** Minimalist blob/image helper */
 export function triggerDownload(url: string, filename: string): void {
   const a = document.createElement('a');
   a.href = url;

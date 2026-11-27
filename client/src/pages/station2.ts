@@ -1,10 +1,3 @@
-/**
- * /station2 — tablet 3: north-west vertical fixation fader
- * - Pure black (#000000) outside DEVELOPING.
- * - Zero-resistance 1:1 pointer tracking across the entire fader well with setPointerCapture.
- * - Triggers TRIGGER_FIX cleanly at >= 80% (or fast downward flick >= 55%).
- * - 3-state "when to pull" visual cue synced to server devProgress & remaining seconds.
- */
 import { Net, mountNetDot } from '../lib/net';
 import { stationWakeChime } from '../lib/sfx';
 import { showStartOverlay } from '../lib/unlock';

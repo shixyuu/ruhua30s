@@ -176,9 +176,7 @@ export async function saveConfig(cfg: AppConfig): Promise<void> {
   await atomicWriteJson(CONFIG_FILE, cfg);
 }
 
-// ======================================================================
 // Calibration persistence (./data/calibration.json)
-// ======================================================================
 export function loadCalibration(): CalibrationData {
   try {
     const raw = JSON.parse(fs.readFileSync(CALIBRATION_FILE, 'utf8')) as Partial<CalibrationData>;
@@ -203,9 +201,7 @@ export async function saveCalibration(data: CalibrationData): Promise<Calibratio
   return clean;
 }
 
-// ======================================================================
 // state.json persistence
-// ======================================================================
 export function emptyPersistedState(rollNumber: number): PersistedState {
   return {
     rollNumber,
@@ -296,9 +292,7 @@ export async function savePersistedState(st: PersistedState): Promise<void> {
   await atomicWriteJson(STATE_FILE, withQueue(st, liveQueue));
 }
 
-// ======================================================================
 // JPEG decode, Queue management & Roll archiving
-// ======================================================================
 export function decodeJpeg(data: string): Buffer | null {
   if (typeof data !== 'string') return null;
   const b64 = data.includes(',') ? data.slice(data.indexOf(',') + 1) : data;

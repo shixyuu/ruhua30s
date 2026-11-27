@@ -1,9 +1,3 @@
-/**
- * /door — tablet 1: entrance darkroom display
- * - Prominent pure-JS QR code pointing to `${location.origin}/upload` + `SCAN TO LOAD A MEMORY FOR THE NEXT EXPOSURE`
- * - Queue status indicator: `NEXT PHOTO: READY (UPLOADED)` or `WAITING FOR UPLOAD` (or `BUILT-IN SAMPLE READY`)
- * - Contact sheet grid of recent finished prints
- */
 import { Net, mountNetDot } from '../lib/net';
 import { generateQrSvg } from '../lib/qr';
 import { escapeHtml, showStartOverlay } from '../lib/unlock';

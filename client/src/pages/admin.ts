@@ -1,6 +1,3 @@
-/**
- * /admin — mobile-first single-hand operator desk & remote homography calibration (v3.2)
- */
 import { Net, mountFlashOverlay } from '../lib/net';
 import { computeHomographyInv } from '../lib/homography';
 import type { ContactSheetInfo, PersistedState, Point2D, Role, StorageStats } from '../../../shared/protocol';
@@ -316,7 +313,8 @@ export default function admin(app: HTMLElement): void {
     toastTimer = window.setTimeout(() => toastEl.classList.remove('show'), 2400);
   };
 
-  // ---------------- Shutter & Queue ----------------
+  // Shutter & Queue
+
   let lastShutter = 0;
   function fireShutter(): void {
     if (net.phase !== 'IDLE' || !net.connected) return;
@@ -348,7 +346,8 @@ export default function admin(app: HTMLElement): void {
     sendConfigPatch({ sampleFallback: next }, true);
   });
 
-  // ---------------- Two-tap buttons ----------------
+  // Two-tap buttons
+
   function wireTwoTap(btn: HTMLButtonElement, idleTxt: string, armTxt: string, onConfirm: () => void): void {
     let t = 0;
     const disarm = () => {
@@ -395,7 +394,8 @@ export default function admin(app: HTMLElement): void {
     }
   });
 
-  // ---------------- Calibration Snapshot & 4-Corner Homography UI ----------------
+  // Calibration Snapshot & 4-Corner Homography UI
+
   let snapImg: HTMLImageElement | null = null;
   let corners: [Point2D, Point2D, Point2D, Point2D] = [
     { x: 0.08, y: 0.08 },
@@ -549,7 +549,8 @@ export default function admin(app: HTMLElement): void {
     }
   });
 
-  // ---------------- Instax Share / Download ----------------
+  // Instax Share / Download
+
   let cachedUrl = '';
   let cachedFileName = 'RH30-print.jpg';
   let cachedFile: File | null = null;
@@ -584,7 +585,8 @@ export default function admin(app: HTMLElement): void {
     toast(`Downloading ${cachedFileName}`);
   });
 
-  // ---------------- Config Sliders & Steppers ----------------
+  // Config Sliders & Steppers
+
   let cfgSendTimer = 0;
   function sendConfigPatch(patch: Record<string, unknown>, immediate = false): void {
     clearTimeout(cfgSendTimer);
@@ -598,7 +600,8 @@ export default function admin(app: HTMLElement): void {
     marginVal.textContent = `${v}%`;
     sendConfigPatch({ easelMargin: v });
   });
-  // ---------------- camera detection tuning + live view ----------------
+  // camera detection tuning + live view
+
   let detOn = false;
   let detLastFrameAt = 0;
   const DET_METER_MAX = 10; // meter full scale, % of photo area
@@ -734,7 +737,8 @@ export default function admin(app: HTMLElement): void {
     renderArchive(net.contactSheet);
   });
 
-  // ---------------- Live meters & clients ----------------
+  // Live meters & clients
+
   net.on('dev', (m) => {
     const mic = Math.round(Math.max(0, Math.min(1, m.audioLevel)) * 100);
     const dev = Math.round(Math.max(0, m.devProgress) * 100);
@@ -777,7 +781,8 @@ export default function admin(app: HTMLElement): void {
     lights.querySelectorAll('.light').forEach((l) => l.classList.remove('on'));
   });
 
-  // ---------------- Archive & Storage ----------------
+  // Archive & Storage
+
   function renderArchive(sheet?: ContactSheetInfo | null): void {
     const rollNo = sheet?.rollNumber ?? net.config?.rollNumber ?? 1;
     const frames = sheet?.frames ?? [];
@@ -850,7 +855,8 @@ export default function admin(app: HTMLElement): void {
     }
   }
 
-  // ---------------- Tick ----------------
+  // Tick
+
   function tick(): void {
     const st = net.state;
     if (st) {

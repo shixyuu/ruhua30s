@@ -1,6 +1,3 @@
-/**
- * 《入画三十秒 (RH-30)》v3 统一单端口服务：扫码传图彩色暗房精修 + 远程透视标定 + /data + /api + /ws
- */
 import http from 'node:http';
 import path from 'node:path';
 import fs from 'node:fs';
@@ -80,9 +77,7 @@ if (persisted.rollNumber !== config.rollNumber) {
   void saveConfig(config);
 }
 
-// ======================================================================
 // HTTP
-// ======================================================================
 const app = express();
 app.disable('x-powered-by');
 app.set('trust proxy', true);
@@ -263,9 +258,7 @@ const server = http.createServer(app);
 server.keepAliveTimeout = 65_000;
 server.headersTimeout = 66_000;
 
-// ======================================================================
 // WebSocket
-// ======================================================================
 interface Peer {
   role: Role | null;
   alive: boolean;
@@ -503,9 +496,7 @@ function handleMessage(ws: WebSocket, peer: Peer, msg: ClientMsg): void {
   }
 }
 
-// ======================================================================
-// 状态机（唯一真相源）
-// ======================================================================
+// state machine
 let state: Phase = 'IDLE';
 let phaseStartedAt = Date.now();
 let phaseDurationMs = 0;

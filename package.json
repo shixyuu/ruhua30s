@@ -1,7 +1,6 @@
 {
   "name": "ruhua30s",
   "version": "1.0.0",
-  "description": "交互式时间循环装置艺术《入画三十秒》— 多设备联动 Web 系统",
   "private": true,
   "type": "module",
   "engines": {
@@ -15,8 +14,7 @@
     "build:client": "tsc -p tsconfig.json --noEmit && vite build",
     "build:server": "tsc -p tsconfig.server.json",
     "typecheck": "tsc -p tsconfig.json --noEmit && tsc -p tsconfig.server.json --noEmit",
-    "start": "node build/server/index.js",
-    "test:flow": "node scripts/ws-flow-test.mjs"
+    "start": "node build/server/index.js"
   },
   "dependencies": {
     "express": "^4.21.2",
@@ -27,7 +25,6 @@
     "@types/node": "^20.17.0",
     "@types/ws": "^8.5.13",
     "concurrently": "^9.1.0",
-    "puppeteer-core": "^23.11.1",
     "tsx": "^4.19.2",
     "typescript": "~5.7.2",
     "vite": "^6.0.7"

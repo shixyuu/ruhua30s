@@ -1,14 +1,3 @@
-/**
- * RA-4 Color Darkroom & Physical Dodging Engine (/main)
- * - Zero AI / OpenCV dependencies: pure TypeScript 3x3 homography + Canvas pixel arithmetic.
- * - Supports:
- *   1. High-contrast Calibration Target (TL / TR / BR / BL) with adjustable Easel Margin (0–30%).
- *   2. Shadow-lifted original color projection (RGB >= 38/255) for physical dodging detection.
- *   3. Anti-AE drift normalization (median ratio of lowest-20% diff pixels) + dodgeMap integration.
- *   4. Home Mouse Dodge Simulator (paint directly onto canvas during EXPOSE).
- *   5. RA-4 subtractive color darkroom developing curve (E <= 1.0 soft dodge, E > 1.0 overdeveloped burn).
- *   6. Side-by-side ORIGINAL vs ALTERED PRINT reveal + clean border-framed Instax export.
- */
 import { GRID_H, GRID_W, warpCameraToGridGray } from './homography';
 
 // Built-in sample photographs (admin "USE BUILT-IN SAMPLE" #1..#6); re-encoded JPEGs, metadata stripped

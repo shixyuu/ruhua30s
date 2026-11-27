@@ -1,8 +1,4 @@
-/**
- * Pure TypeScript 2D Perspective Homography (zero OpenCV / CV deps).
- * Solves an 8x8 linear system via Gaussian elimination with partial pivoting
- * to map canonical working grid (320x180) -> normalized camera coordinates [0..1].
- */
+/** 3x3 homography: 320x180 grid -> camera normalized coords [0..1]. */
 import type { Point2D } from '../../../shared/protocol';
 
 export const GRID_W = 320;

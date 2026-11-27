@@ -1,8 +1,3 @@
-/**
- * 《入画三十秒 (RH-30)》v3 — 扫码传图彩色暗房精修版（前后端共享协议）
- * 服务端是唯一真相源：所有终端根据 state / dev 包里的 serverTime / phaseStartedAt 校准本地时钟。
- */
-
 export type Phase =
   | 'IDLE'
   | 'CALIBRATING'
@@ -51,33 +46,33 @@ export interface CalibrationData {
 }
 
 export interface AppConfig {
-  /** 01 OBSERVE 安全红光秒数（3–20，默认 8） */
+  /** OBSERVE duration, seconds (3–20, default 8) */
   observeSec: number;
-  /** 02 EXPOSE 彩色投影遮挡减光秒数（10–60，默认 30） */
+  /** EXPOSE duration, seconds (10–60, default 30) */
   exposeSec: number;
-  /** 03 DEVELOP 最长声控显影秒数（10–45，默认 25） */
+  /** DEVELOP duration, seconds (10–45, default 25) */
   developSec: number;
-  /** 04 REVEAL 前后对照展示秒数（6–25，默认 12） */
+  /** REVEAL duration, seconds (6–25, default 12) */
   revealSec: number;
-  /** 抗环境底噪阈值（0.00–0.50，默认 0.08） */
+  /** Mic noise floor (0–0.50, default 0.08) */
   noiseFloor: number;
-  /** 满能量时每秒显影增量（0.03–0.80，默认 0.20） */
+  /** Development per second at full energy (0.03–0.80, default 0.20) */
   devSpeed: number;
-  /** 画框四周黑边百分比（0–30，默认 6） */
+  /** Easel margin percent (0–30, default 6) */
   easelMargin: number;
-  /** 摄像头遮挡差分阈值（0.02–0.50，默认 0.12；越低越灵敏） */
+  /** Camera diff threshold; lower = more sensitive (0.02–0.50, default 0.12) */
   diffSensitivity: number;
-  /** Detection noise filter: box-blur radius on the diff map, grid px (0–4, default 0 = off) */
+  /** Diff-map box-blur radius in grid px (0–4, default 0) */
   detectBlur: number;
-  /** Detection min area: ignore frames with less than this % of the grid changed (0–10, default 0) */
+  /** Ignore frames with less than this % of the grid changed (0–10, default 0) */
   detectMinArea: number;
-  /** Seconds of continuous blocking to reach full dodge (5–40, default 18) */
+  /** Seconds of blocking to reach full dodge (5–40, default 18) */
   fullDodgeSec: number;
-  /** 在家无摄像头鼠标涂抹减光模拟开关 */
+  /** Paint dodge on /main with the mouse when no camera is available */
   mouseSimulator: boolean;
-  /** 免扫码兜底：使用内置高反差测试图（0=关闭, 1..3=内置样张, 4=上一轮成品） */
+  /** 0 = off, 1..6 = built-in sample, 7 = last print */
   sampleFallback: number;
-  /** 当前胶卷编号（从 1 开始，NEW ROLL 时递增，历史照片按卷归档保留） */
+  /** Current roll number (increments on NEW ROLL) */
   rollNumber: number;
 }
 
@@ -182,7 +177,7 @@ export interface ClientStatus {
   lastSeen: number | null;
 }
 
-// ---------------- 服务端 → 客户端 ----------------
+// server -> client
 export type ServerMsg =
   | {
       type: 'state';
@@ -217,7 +212,7 @@ export type ServerMsg =
   | { type: 'ack'; what: string; ok: boolean; message?: string }
   | { type: 'error'; message: string };
 
-// ---------------- 客户端 → 服务端 ----------------
+// client -> server
 export type AdminAction = 'reset' | 'skipPhase' | 'newRoll' | 'resetDoor' | 'testFlash' | 'testDevelop' | 'setConfig';
 
 export type ClientMsg =

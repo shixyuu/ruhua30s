@@ -1,11 +1,3 @@
-/**
- * Live Darkroom Web Audio Soundscape (v3):
- *  - SAFELIGHT_COMPOSE: crisp mechanical filter-paddle click
- *  - EXPOSURE: enlarger relay clack + restrained 1 Hz mechanical darkroom timer metronome
- *  - DEVELOPING: enlarger relay off clack + subtle chemical bath fluid murmur that shifts subtly
- *                with devProgress (and adds gentle granular crackle above 1.0, never harsh alarms)
- *  - FIXED_REVEAL: crisp mechanical shutter / stop-bath click, then total room silence
- */
 let ctx: AudioContext | null = null;
 let master: GainNode | null = null;
 let noiseBuf: AudioBuffer | null = null;
@@ -77,7 +69,7 @@ function env(g: GainNode, t: number, a: number, peak: number, d: number): void {
   g.gain.exponentialRampToValueAtTime(0.0001, t + a + d);
 }
 
-// ---------------------------------------------------------------- mechanical darkroom switches
+// mechanical darkroom switches
 /** Crisp swing-arm red safelight filter paddle click */
 export function safelightClick(volume = 0.65): void {
   const c = audioCtx();
@@ -171,7 +163,7 @@ export function shutter(volume = 0.95): void {
   o.stop(t + 0.1);
 }
 
-// ---------------------------------------------------------------- 1 Hz enlarger timer metronome (EXPOSURE)
+// 1 Hz enlarger timer metronome (EXPOSURE)
 let timerInterval: number | null = null;
 let nextTickAt = 0;
 let tickParity = 0;
@@ -247,7 +239,7 @@ export const enlargerTimer = {
   },
 };
 
-// ---------------------------------------------------------------- chemical bath ambient feedback (DEVELOPING)
+// chemical bath ambient feedback (DEVELOPING)
 let bathSrc: AudioBufferSourceNode | null = null;
 let bathFilter: BiquadFilterNode | null = null;
 let bathGain: GainNode | null = null;

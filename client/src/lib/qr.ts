@@ -1,7 +1,4 @@
-/**
- * Minimalist zero-dependency QR Code SVG generator (Byte mode, ECC-L, Versions 1–6).
- * Enough for URLs up to ~134 bytes (e.g. https://domain.com/upload).
- */
+/** QR Code SVG generator (Byte mode, ECC-L, versions 1–6; URLs up to ~134 bytes). */
 
 const GF_EXP = new Uint8Array(512);
 const GF_LOG = new Uint8Array(256);

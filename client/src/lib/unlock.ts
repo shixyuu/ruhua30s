@@ -1,4 +1,4 @@
-/** First-tap start overlay: unlocks AudioContext, media permissions, fullscreen and keep-awake in one gesture */
+/** Start overlay: unlock audio, permissions, fullscreen, and keep-awake in one gesture. */
 import { unlockAudio } from './sfx';
 
 let wakeLock: any = null;

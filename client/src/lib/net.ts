@@ -15,11 +15,7 @@ export type StateMsg = Extract<ServerMsg, { type: 'state' }>;
 export type DevMsg = Extract<ServerMsg, { type: 'dev' }>;
 type Handler<T extends ServerMsg['type']> = (msg: Extract<ServerMsg, { type: T }>) => void;
 
-/**
- * WebSocket client:
- *  - exponential back-off reconnect (0.5s → 1s → 2s … capped at 10s, with jitter)
- *  - NTP-style clock sync: uses the offset of the lowest-RTT sample among recent ones
- */
+/** WebSocket client with backoff reconnect and NTP-style clock sync. */
 export class Net {
   readonly role: Role;
   private ws: WebSocket | null = null;
