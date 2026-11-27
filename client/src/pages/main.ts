@@ -1,94 +1,71 @@
-/**
- * /main — Mac + projector + external wide-angle camera
- * - The 30-second camera recording stays local (MediaRecorder → Blob URL replay) and is never uploaded
- * - Only the mono freeze frame at 30s is uploaded (JPEG ≤1280px, q=0.78)
- */
-import { Net, mountNetDot } from '../lib/net';
-import { audioCtx, heartbeat, out, rewindSfx, setAudioSink, shutter, stopAllLoops, unlockAudio } from '../lib/sfx';
-import { assetAvailable, dataURLToArrayBuffer, drawDefaultDoorPhoto, filmFilter, pickVideoMime } from '../lib/media';
-import { cropMarks, filmStrip, keepAwake, requestFullscreen } from '../lib/unlock';
+import { Net, mountNetDot, triggerFlashPulse } from '../lib/net';
+import {
+  audioCtx,
+  devBathAudio,
+  enlargerTimer,
+  lightLeakBurst,
+  relayClick,
+  safelightClick,
+  setAudioSink,
+  shutter,
+  stopAllLoops,
+  stopBathThud,
+  unlockAudio,
+} from '../lib/sfx';
+import {
+  DarkroomEngine,
+  computeEaselRect,
+  drawCalibrationTarget,
+  drawIdleDarkroom,
+  setupCanvas,
+  type DetectOptions,
+} from '../lib/darkroom';
+import { keepAwake, requestFullscreen, withTimeout } from '../lib/unlock';
 import { TITLE_EN } from '../lib/brand';
-import { clear, drawIdle, drawNoRecording, drawRewind, drawSimFilm, preloadCanvasFonts, setupCanvas } from '../lib/film';
+import { outcomeFullLabel } from '../../../shared/protocol';
 import type { Phase } from '../../../shared/protocol';
-import { TIMELINE } from '../../../shared/protocol';
 
 const LS_CAM = 'ruhua.main.camera';
 const LS_SINK = 'ruhua.main.sink';
-const BYSTANDER = 'You kept to the rules and did not become the killer. But you also watched it end.';
-
-type SinkEl = HTMLMediaElement & { setSinkId?: (id: string) => Promise<void> };
+const EXPOSE_SAMPLE_MS = 140; // ~7 FPS camera dodge integration
+const CLEAN_SAMPLE_MS = 150;
+const CLEAN_SETTLE_MS = 500; // ignore camera frames right after the projection changes (latency + auto-exposure)
+const DETECT_VIEW_MS = 400; // admin detect view stream (~2.5 fps)
 
 export default async function mainPage(app: HTMLElement): Promise<void> {
-  document.title = `Main projector · ${TITLE_EN}`;
+  document.title = `Enlarger Projector · ${TITLE_EN}`;
   app.innerHTML = `
     <canvas class="layer" id="fx"></canvas>
-    <video class="layer hidden" id="base" playsinline preload="auto"></video>
-    <video class="layer hidden" id="rewind" playsinline preload="auto"></video>
-    <video class="layer hidden" id="replay" playsinline muted></video>
-    <div class="countdown hidden" id="countdownBox"><div class="k"><span>ENTER BUFFER</span><span class="chem"><span class="on"><b>DEV</b></span><span><b>STOP</b></span><span><b>FIX</b></span></span></div><div class="n" id="countdown"></div></div>
-    <div class="bystander" id="bystander"><p id="bystanderText"></p></div>
-    <div class="cctv hidden" id="cctv">
-      <div class="rule"><span><b>RH-30</b> · NODE SYNC · CONTACT PROOF</span><span id="cctvClock">--:--:--</span></div>
-      <div class="pane left">
-        <div class="neg">
-          ${filmStrip(29)}
-          <div class="frame"><img id="freezeImg" alt="" /></div>
-          ${filmStrip(30)}
-          <span class="ring"></span><span class="grease">PRINT ✓</span>
-        </div>
-        <div class="cap"><span class="no" id="frameNo">FR 001</span><span class="t">New node negative synced to the entrance</span></div>
+    <footer class="main-timeline hidden" id="timelineBar" aria-hidden="true">
+      <div class="tl-steps">
+        <div class="tl-seg" id="segObserve"><span>01 OBSERVE</span><div class="tl-fill"></div></div>
+        <div class="tl-seg" id="segExpose"><span>02 EXPOSE</span><div class="tl-fill" id="expFill"></div></div>
+        <div class="tl-seg" id="segDevelop"><span>03 DEVELOP</span><div class="tl-fill" id="devFill"></div></div>
+        <div class="tl-seg" id="segFixed"><span>04 FIXED</span><div class="tl-fill"></div></div>
       </div>
-      <div class="pane right">
-        <div class="frame">
-          <img id="cctvImg" class="hidden" alt="" />
-          <div class="nosignal hidden" id="nosig">ENTRANCE FEED · NO SIGNAL</div>
-          <div class="osd"><span>CH-01</span><span class="live">LIVE</span></div>
-        </div>
-        <div class="cap"><span class="no">CH-01</span><span class="t">Entrance live feed · next visitor</span></div>
-      </div>
-      <div class="exit"><span>Please exit to the north</span><span class="arr">↑</span></div>
-    </div>
-    <div class="flash" id="flash"></div>
+      <div class="tl-prompt" id="tlPrompt">FIND WHAT YOU WANT TO SOFTEN OR ERASE</div>
+    </footer>
     <video id="cam" class="hidden" muted playsinline autoplay></video>`;
+
   const $ = <T extends HTMLElement>(s: string) => app.querySelector(s) as T;
   const fx = $<HTMLCanvasElement>('#fx');
   const g = setupCanvas(fx);
-  preloadCanvasFonts();
-  const baseV = $<HTMLVideoElement>('#base');
-  const rewindV = $<HTMLVideoElement>('#rewind');
-  const replayV = $<HTMLVideoElement>('#replay');
-  const countdown = $<HTMLDivElement>('#countdown');
-  const countdownBox = $<HTMLDivElement>('#countdownBox');
-  const bystander = $<HTMLDivElement>('#bystander');
-  $<HTMLParagraphElement>('#bystanderText').textContent = BYSTANDER;
-  const frameNo = $<HTMLSpanElement>('#frameNo');
-  const cctvClock = $<HTMLSpanElement>('#cctvClock');
-  const cctv = $<HTMLDivElement>('#cctv');
-  const freezeImg = $<HTMLImageElement>('#freezeImg');
-  const cctvImg = $<HTMLImageElement>('#cctvImg');
-  const nosig = $<HTMLDivElement>('#nosig');
-  const flashEl = $<HTMLDivElement>('#flash');
+  const timelineBar = $<HTMLElement>('#timelineBar');
+  const segObserve = $<HTMLDivElement>('#segObserve');
+  const segExpose = $<HTMLDivElement>('#segExpose');
+  const segDevelop = $<HTMLDivElement>('#segDevelop');
+  const segFixed = $<HTMLDivElement>('#segFixed');
+  const expFill = $<HTMLDivElement>('#expFill');
+  const devFill = $<HTMLDivElement>('#devFill');
+  const tlPrompt = $<HTMLDivElement>('#tlPrompt');
   const camV = $<HTMLVideoElement>('#cam');
 
+  const engine = new DarkroomEngine();
   const net = new Net('main');
-  (window as any).__net = net; // debugging / automated tests
+  (window as any).__net = net;
   mountNetDot(net);
 
-  // ====================================================================
-  // asset probe (re-HEAD on every return to IDLE so files can be hot-swapped)
-  // ====================================================================
-  const assets = { base: false, rewind: false };
-  async function checkAssets(): Promise<void> {
-    const [b, r] = await Promise.all([assetAvailable('/assets/base.mp4'), assetAvailable('/assets/rewind.mp4')]);
-    assets.base = b;
-    assets.rewind = r;
-    updateAssetInfo?.();
-  }
-  let updateAssetInfo: (() => void) | null = null;
-
-  // ====================================================================
-  // camera
-  // ====================================================================
+  // camera & audio sink
   let camStream: MediaStream | null = null;
   let camId = localStorage.getItem(LS_CAM) || '';
   let sinkId = localStorage.getItem(LS_SINK) || '';
@@ -100,8 +77,8 @@ export default async function mainPage(app: HTMLElement): Promise<void> {
       camStream = await navigator.mediaDevices.getUserMedia({
         video: {
           ...(deviceId ? { deviceId: { exact: deviceId } } : {}),
-          width: { ideal: 1920 },
-          height: { ideal: 1080 },
+          width: { ideal: 1280 },
+          height: { ideal: 720 },
           frameRate: { ideal: 30 },
         },
         audio: false,
@@ -123,384 +100,416 @@ export default async function mainPage(app: HTMLElement): Promise<void> {
     if (!camLive()) await openCamera(camId);
   }
 
-  // ====================================================================
-  // local recording (never uploaded)
-  // ====================================================================
-  let recorder: MediaRecorder | null = null;
-  let recChunks: Blob[] = [];
-  let recRound = -1;
-  let replayUrl: string | null = null;
-  let replayRound = -1;
+  // Remote calibration snapshot request from /admin
+  net.on('REQUEST_SNAPSHOT', async () => {
+    await ensureCamera();
+    const margin = net.config?.easelMargin ?? 6;
+    const imageData = engine.grabCameraSnapshot(camLive() ? camV : null, margin);
+    net.send({ type: 'SNAPSHOT_DATA', imageData });
+  });
 
-  function startRecording(roundId: number): void {
-    if (recorder || !camLive()) return;
-    const mime = pickVideoMime();
+  net.on('FLASH_PULSE', () => {
     try {
-      recorder = new MediaRecorder(camStream!, mime ? { mimeType: mime, videoBitsPerSecond: 5_000_000 } : undefined);
+      shutter();
     } catch {
-      recorder = new MediaRecorder(camStream!);
+      /* ignore */
     }
-    recChunks = [];
-    recRound = roundId;
-    recorder.ondataavailable = (e) => e.data && e.data.size && recChunks.push(e.data);
-    recorder.start(1000);
+  });
+
+  // Home Mouse Dodge Simulator (paint directly on /main during EXPOSE)
+  let mouseDown = false;
+  let lastPaintAt = 0;
+
+  function canvasClientToEaselNorm(clientX: number, clientY: number): { nx: number; ny: number } | null {
+    const cr = fx.getBoundingClientRect();
+    const scale = Math.min(cr.width / fx.width, cr.height / fx.height);
+    const drawW = fx.width * scale;
+    const drawH = fx.height * scale;
+    const offX = cr.left + (cr.width - drawW) / 2;
+    const offY = cr.top + (cr.height - drawH) / 2;
+
+    const cx = (clientX - offX) / scale;
+    const cy = (clientY - offY) / scale;
+    const { w, h } = engine.getSourceSize();
+    const er = computeEaselRect(fx.width, fx.height, net.config?.easelMargin ?? 6, w, h);
+    if (cx < er.x || cx > er.x + er.w || cy < er.y || cy > er.y + er.h) return null;
+    return { nx: (cx - er.x) / er.w, ny: (cy - er.y) / er.h };
   }
 
-  function stopRecording(keep: boolean): Promise<void> {
-    return new Promise((resolve) => {
-      const r = recorder;
-      if (!r) return resolve();
-      recorder = null;
-      r.onstop = () => {
-        if (keep && recChunks.length) {
-          if (replayUrl) URL.revokeObjectURL(replayUrl);
-          replayUrl = URL.createObjectURL(new Blob(recChunks, { type: r.mimeType || 'video/webm' }));
-          replayRound = recRound;
-        }
-        recChunks = [];
-        resolve();
-      };
-      try {
-        r.stop();
-      } catch {
-        resolve();
+  fx.addEventListener('pointerdown', (e) => {
+    if (net.phase !== 'EXPOSE' || !net.config?.mouseSimulator) return;
+    mouseDown = true;
+    lastPaintAt = performance.now();
+    const pt = canvasClientToEaselNorm(e.clientX, e.clientY);
+    if (pt) engine.applyMouseDodge(pt.nx, pt.ny, 0.06);
+  });
+  fx.addEventListener('pointermove', (e) => {
+    if (!mouseDown || net.phase !== 'EXPOSE' || !net.config?.mouseSimulator) return;
+    const now = performance.now();
+    const dt = Math.min(0.15, Math.max(0.016, (now - lastPaintAt) / 1000));
+    lastPaintAt = now;
+    const pt = canvasClientToEaselNorm(e.clientX, e.clientY);
+    if (pt) engine.applyMouseDodge(pt.nx, pt.ny, dt);
+  });
+  window.addEventListener('pointerup', () => {
+    mouseDown = false;
+  });
+
+  // exposure / clean sampling & developing state
+  let sampleTimer: number | null = null;
+  let lastSampleAt = 0;
+  let liveDevProgress = 0;
+  let frozenDevProgress = 0;
+  let freezeUploadedRound = -1;
+  let exposeFastTickStarted = false;
+  let devWarnTickStarted = false;
+
+  function stopSampler(): void {
+    if (sampleTimer !== null) {
+      clearInterval(sampleTimer);
+      sampleTimer = null;
+    }
+  }
+
+  function detectOpts(): DetectOptions {
+    const c = net.config;
+    return {
+      threshold: c?.diffSensitivity ?? 0.12,
+      blur: c?.detectBlur ?? 0,
+      minAreaPct: c?.detectMinArea ?? 0,
+      fullDodgeSec: c?.fullDodgeSec ?? 18,
+      marginPct: c?.easelMargin ?? 6,
+    };
+  }
+
+  function startCleanSampler(): void {
+    stopSampler();
+    if (net.config?.mouseSimulator) return;
+    const t0 = performance.now();
+    const run = () => {
+      if (net.phase !== 'CAPTURE_CLEAN') return stopSampler();
+      // Let the camera settle (latency / auto-exposure after the projection switches to the photo)
+      if (performance.now() - t0 < CLEAN_SETTLE_MS) return;
+      engine.sampleCleanFrame(camLive() ? camV : null, net.calibration?.hInv ?? null);
+    };
+    run();
+    sampleTimer = window.setInterval(run, CLEAN_SAMPLE_MS);
+  }
+
+  function startExposeSampler(): void {
+    stopSampler();
+    if (net.config?.mouseSimulator) return;
+    lastSampleAt = performance.now();
+    const t0 = performance.now();
+    const run = () => {
+      if (net.phase !== 'EXPOSE') return stopSampler();
+      // No clean plate yet (camera was late): wait for the projection to settle before bootstrapping one
+      if (!engine.hasCleanPlate() && performance.now() - t0 < CLEAN_SETTLE_MS) {
+        lastSampleAt = performance.now();
+        return;
+      }
+      const now = performance.now();
+      const dtSec = Math.max(0.05, (now - lastSampleAt) / 1000 / net.timeScale);
+      lastSampleAt = now;
+      engine.sampleExposeFrame(
+        camLive() ? camV : null,
+        dtSec,
+        net.calibration?.hInv ?? null,
+        detectOpts(),
+      );
+    };
+    sampleTimer = window.setInterval(run, EXPOSE_SAMPLE_MS);
+  }
+
+  net.on('dev', (m) => {
+    liveDevProgress = m.devProgress;
+    if (net.phase === 'DEVELOP') devBathAudio.update(liveDevProgress);
+  });
+
+  // phase changes
+  let curPhase: Phase | null = null;
+  let curRound = -1;
+
+  function setActiveSegment(seg: HTMLDivElement | null, stateCls = ''): void {
+    for (const s of [segObserve, segExpose, segDevelop, segFixed]) {
+      s.classList.remove('active', 'done', 'gold', 'burn');
+    }
+    const order = [segObserve, segExpose, segDevelop, segFixed];
+    const idx = seg ? order.indexOf(seg) : -1;
+    order.forEach((s, i) => {
+      if (idx > i) s.classList.add('done');
+      if (idx === i) {
+        s.classList.add('active');
+        if (stateCls) s.classList.add(stateCls);
       }
     });
   }
 
-  // ====================================================================
-  // visitor's voice: telephone-receiver filter
-  // ====================================================================
-  let voice: { roundId: number; offset: number; buffer: AudioBuffer | null; el: HTMLAudioElement | null } | null = null;
-  let voiceSource: AudioScheduledSourceNode | null = null;
-  let voiceTimer: number | null = null;
-  let voicePlayedRound = -1;
-
-  function telephoneChain(): AudioNode {
-    const c = audioCtx();
-    const bp = c.createBiquadFilter(); // 300–3000 Hz band-pass: centre √(300·3000) ≈ 949 Hz, Q = 949/2700 ≈ 0.35
-    bp.type = 'bandpass';
-    bp.frequency.value = 949;
-    bp.Q.value = 0.35;
-    const hp = c.createBiquadFilter();
-    hp.type = 'highpass';
-    hp.frequency.value = 300;
-    hp.Q.value = 0.7;
-    const lp = c.createBiquadFilter();
-    lp.type = 'lowpass';
-    lp.frequency.value = 3000;
-    lp.Q.value = 0.7;
-    const shaper = c.createWaveShaper();
-    const n = 1024;
-    const curve = new Float32Array(n);
-    const k = 6;
-    for (let i = 0; i < n; i++) {
-      const x = (i * 2) / n - 1;
-      curve[i] = ((1 + k) * x) / (1 + k * Math.abs(x));
-    }
-    shaper.curve = curve;
-    shaper.oversample = '2x';
-    const gain = c.createGain();
-    gain.gain.value = 2.2;
-    bp.connect(hp).connect(lp).connect(shaper).connect(gain).connect(out());
-    return bp;
-  }
-
-  net.on('audio', async (m) => {
-    const entry = { roundId: m.roundId, offset: m.audioOffsetMs, buffer: null as AudioBuffer | null, el: null as HTMLAudioElement | null };
-    voice = entry;
-    try {
-      entry.buffer = await audioCtx().decodeAudioData(dataURLToArrayBuffer(m.data));
-    } catch {
-      // some codecs fail decodeAudioData: fall back to <audio> + MediaElementSource
-      const el = new Audio();
-      el.src = m.data;
-      el.preload = 'auto';
-      entry.el = el;
-    }
-    if (net.phase === 'REPLAY_TRUTH') scheduleVoice();
-  });
-
-  function scheduleVoice(): void {
-    const st = net.state;
-    if (!st || !voice || voice.roundId !== st.round.id || voicePlayedRound === st.round.id) return;
-    const v = voice;
-    const startAtLocal = net.toLocal(st.phaseStartedAt + v.offset);
-    const delayMs = startAtLocal - Date.now();
-    const play = (skipSec: number) => {
-      voicePlayedRound = st.round.id;
-      const c = audioCtx();
-      const input = telephoneChain();
-      if (v.buffer) {
-        if (skipSec >= v.buffer.duration) return;
-        const s = c.createBufferSource();
-        s.buffer = v.buffer;
-        s.connect(input);
-        s.start(c.currentTime + 0.01, Math.max(0, skipSec));
-        voiceSource = s;
-      } else if (v.el) {
-        try {
-          c.createMediaElementSource(v.el).connect(input);
-        } catch {
-          /* already connected */
-        }
-        v.el.currentTime = Math.max(0, skipSec);
-        v.el.play().catch(() => {});
-      }
-    };
-    if (voiceTimer) clearTimeout(voiceTimer);
-    if (delayMs > 0) voiceTimer = window.setTimeout(() => play(0), delayMs);
-    else play(-delayMs / 1000);
-  }
-
-  function stopVoice(): void {
-    if (voiceTimer) clearTimeout(voiceTimer);
-    voiceTimer = null;
-    try {
-      voiceSource?.stop();
-    } catch {
-      /* ignore */
-    }
-    voiceSource = null;
-    voice?.el?.pause();
-  }
-
-  // ====================================================================
-  // flash / freeze
-  // ====================================================================
-  function flash(ms = 200): void {
-    flashEl.classList.add('on');
-    shutter();
-    window.setTimeout(() => flashEl.classList.remove('on'), ms);
-  }
-  net.on('flash', () => flash(200));
-
-  let freezeDataUrl: string | null = null;
-  let freezeRound = -1;
-  function captureFreeze(roundId: number): void {
-    if (freezeRound === roundId) return;
-    freezeRound = roundId;
-    let src: CanvasImageSource;
-    if (camLive() && camV.videoWidth > 0) src = camV;
-    else {
-      // no camera: use the last simulated-film frame so the flow works with zero assets
-      drawSimFilm(g, 30);
-      src = fx;
-    }
-    const c = filmFilter(src, 1280);
-    freezeDataUrl = c.toDataURL('image/jpeg', 0.78);
-    net.send({ type: 'freeze', data: freezeDataUrl });
-  }
-
-  // ====================================================================
-  // phase changes
-  // ====================================================================
-  let curPhase: Phase | null = null;
-  let curRound = -1;
-  let lastCctvAt = 0;
-  let cctvPhaseStart = 0;
-  let baseFailed = false;
-  let rewindFailed = false;
-
-  const hideAll = () => {
-    for (const el of [baseV, rewindV, replayV, countdownBox, cctv]) el.classList.add('hidden');
-    bystander.classList.remove('show');
-  };
-
-  function sinkAll(): void {
-    for (const el of [baseV, rewindV] as SinkEl[]) {
-      if (sinkId && typeof el.setSinkId === 'function') el.setSinkId(sinkId === 'default' ? '' : sinkId).catch(() => {});
-    }
-  }
-
-  function videoSrc(v: HTMLVideoElement, name: string): void {
-    v.src = `/assets/${name}?v=${Date.now()}`;
-    v.load();
-  }
-
-  async function onPhase(phase: Phase, fresh: boolean): Promise<void> {
+  async function onPhase(phase: Phase, fresh: boolean, prevPhase: Phase | null): Promise<void> {
     const st = net.state!;
     const roundId = st.round.id;
-    const elapsedSec = net.elapsedMs() / 1000;
-    hideAll();
+    stopSampler();
+    exposeFastTickStarted = false;
+    devWarnTickStarted = false;
+
+    if (prevPhase === 'CAPTURE_CLEAN') engine.finalizeClean();
+    if (prevPhase === 'EXPOSE') engine.finalizeDodgeMap();
+
     switch (phase) {
       case 'IDLE':
+      case 'CALIBRATING':
         stopAllLoops();
-        stopVoice();
-        await stopRecording(false);
-        baseV.pause();
-        rewindV.pause();
-        replayV.pause();
-        checkAssets();
+        timelineBar.classList.add('hidden');
+        if (phase === 'CALIBRATING') await ensureCamera();
+        else if (!net.config?.mouseSimulator) void ensureCamera(); // keep the camera warm so CAPTURE_CLEAN gets real frames
         break;
 
-      case 'ENTER_BUFFER':
-        stopVoice();
-        countdownBox.classList.remove('hidden');
-        heartbeat.setRate(70);
-        heartbeat.start(Math.max(0.5, net.remainingMs() / 1000), 0.9);
-        baseFailed = rewindFailed = false;
-        await Promise.all([ensureCamera(), checkAssets()]);
-        if (net.phase !== 'ENTER_BUFFER') break; // already moved on; don't clobber
-        if (assets.base) {
-          videoSrc(baseV, 'base.mp4');
-          baseV.currentTime = 0;
-        }
-        break;
-
-      case 'ACTIVE_30S':
-        heartbeat.start(0.3, 1);
-        if (!camLive()) await ensureCamera();
-        startRecording(roundId);
-        if (assets.base && !baseFailed) {
-          if (!baseV.src) videoSrc(baseV, 'base.mp4');
-          baseV.classList.remove('hidden');
-          if (elapsedSec > 0.3) baseV.currentTime = elapsedSec;
-          baseV.play().catch(() => (baseFailed = true));
-        }
-        break;
-
-      case 'FLASH_FREEZE':
-        if (fresh && net.elapsedMs() < 600) flash(200);
+      case 'CAPTURE_CLEAN':
         stopAllLoops();
-        baseV.pause();
-        captureFreeze(roundId);
-        await stopRecording(true);
-        if (assets.rewind) videoSrc(rewindV, 'rewind.mp4');
+        liveDevProgress = 0;
+        timelineBar.classList.add('hidden');
+        engine.beginRound();
+        engine.setRoundRefReason(
+          `new image · round ${roundId} · ${st.round.sampleIndex === 0 ? 'upload' : st.round.sampleIndex === 7 ? 'last print' : `sample #${st.round.sampleIndex || 1}`}`,
+        );
+        await engine.loadSource(st.round.sourceUrl, st.round.sampleIndex || 1);
+        engine.resetPreviewRef('new image loaded');
+        await ensureCamera();
+        if (net.phase === 'CAPTURE_CLEAN') startCleanSampler();
         break;
 
-      case 'REWIND':
+      case 'OBSERVE':
         stopAllLoops();
-        rewindSfx(Math.max(0.3, net.remainingMs() / 1000));
-        if (assets.rewind && !rewindFailed) {
-          if (!rewindV.src) videoSrc(rewindV, 'rewind.mp4');
-          rewindV.classList.remove('hidden');
-          if (elapsedSec > 0.3) rewindV.currentTime = elapsedSec;
-          rewindV.play().catch(() => (rewindFailed = true));
-        }
+        if (fresh) safelightClick();
+        timelineBar.classList.remove('hidden');
+        setActiveSegment(segObserve);
+        tlPrompt.className = 'tl-prompt';
+        tlPrompt.textContent = 'FIND WHAT YOU WANT TO SOFTEN OR ERASE';
         break;
 
-      case 'REPLAY_TRUTH':
-        // total silence: drop all score and alarms, keep only the visitor's voice
+      case 'EXPOSE':
         stopAllLoops();
-        rewindV.pause();
-        if (replayUrl && replayRound === roundId) {
-          replayV.src = replayUrl;
-          replayV.classList.remove('hidden');
-          try {
-            if (elapsedSec > 0.5) replayV.currentTime = elapsedSec;
-          } catch {
-            /* webm may not be seekable */
+        if (fresh) relayClick(true);
+        enlargerTimer.start(0.85, 0.1, 1.0);
+        timelineBar.classList.remove('hidden');
+        setActiveSegment(segExpose);
+        tlPrompt.className = 'tl-prompt';
+        tlPrompt.textContent = net.config?.mouseSimulator
+          ? 'SIMULATOR ACTIVE · PAINT ON PHOTO TO DODGE'
+          : 'BLOCK LIGHT WITH BOARDS, HANDS OR FILMS TO DODGE';
+        await ensureCamera();
+        if (net.phase === 'EXPOSE') startExposeSampler();
+        break;
+
+      case 'DEVELOP':
+        enlargerTimer.stop();
+        if (fresh) relayClick(false);
+        engine.finalizeDodgeMap();
+        liveDevProgress = st.round.devProgress ?? 0;
+        timelineBar.classList.remove('hidden');
+        devBathAudio.start();
+        devBathAudio.update(liveDevProgress);
+        break;
+
+      case 'LIGHT_LEAK':
+        stopAllLoops();
+        engine.finalizeDodgeMap();
+        frozenDevProgress = st.round.finalDevProgress ?? st.round.devProgress ?? liveDevProgress;
+        if (fresh) lightLeakBurst();
+        timelineBar.classList.remove('hidden');
+        setActiveSegment(segDevelop, 'burn');
+        tlPrompt.className = 'tl-prompt burn';
+        tlPrompt.textContent = 'UNFIXED · LIGHT LEAK — IMAGE DESTROYED';
+        break;
+
+      case 'REVEAL': {
+        stopAllLoops();
+        engine.finalizeDodgeMap();
+        frozenDevProgress = st.round.finalDevProgress ?? st.round.devProgress ?? liveDevProgress;
+        const outcome = st.round.outcome ?? (prevPhase === 'LIGHT_LEAK' ? 'UNFIXED_LIGHT_LEAK' : 'FIXED_OPTIMAL');
+        const isLeak = outcome === 'UNFIXED_LIGHT_LEAK' || prevPhase === 'LIGHT_LEAK';
+        if (fresh && !isLeak) {
+          if (outcome === 'FIXED_OPTIMAL') {
+            shutter();
+            triggerFlashPulse(0.45, 70, 120);
+          } else {
+            stopBathThud();
+            triggerFlashPulse(0.22, 50, 90);
           }
-          replayV.play().catch(() => {});
         }
-        scheduleVoice();
-        break;
-
-      case 'CCTV_REVEAL':
-        stopAllLoops();
-        stopVoice();
-        replayV.pause();
-        cctv.classList.remove('hidden');
-        frameNo.textContent = `FR ${String(roundId).padStart(3, '0')}`;
-        cctvPhaseStart = Date.now();
-        lastCctvAt = 0;
-        cctvImg.classList.add('hidden');
-        nosig.classList.add('hidden');
-        if (freezeDataUrl && freezeRound === roundId) freezeImg.src = freezeDataUrl;
-        else if (net.doorPhoto?.url) freezeImg.src = net.doorPhoto.url;
-        else {
-          const c = document.createElement('canvas');
-          drawDefaultDoorPhoto(c);
-          freezeImg.src = c.toDataURL('image/jpeg', 0.8);
+        const jpegData = engine.exportCleanInstaxPrint(frozenDevProgress, isLeak);
+        if (freezeUploadedRound !== roundId) {
+          freezeUploadedRound = roundId;
+          net.send({ type: 'freeze', data: jpegData });
         }
+        timelineBar.classList.remove('hidden');
+        setActiveSegment(segFixed);
+        tlPrompt.className = 'tl-prompt';
+        tlPrompt.textContent = '04 FIXED · CHEMICAL PRINT ARCHIVED';
         break;
+      }
     }
   }
 
   net.on('state', (m) => {
     const fresh = m.state !== curPhase || m.round.id !== curRound;
     if (!fresh) return;
+    const prev = curPhase;
     curPhase = m.state;
     curRound = m.round.id;
-    onPhase(m.state, true);
+    void onPhase(m.state, true, prev);
   });
 
-  net.on('cctv', (m) => {
-    if (net.phase !== 'CCTV_REVEAL') return;
-    cctvImg.src = m.data;
-    cctvImg.classList.remove('hidden');
-    lastCctvAt = Date.now();
+  // admin DETECT VIEW: stream a low-fps debug frame + stats to /admin
+  const detectCanvas = document.createElement('canvas');
+  let detectTimer: number | null = null;
+  let detectPhase: Phase | null = null;
+  function stopDetectView(): void {
+    if (detectTimer !== null) clearInterval(detectTimer);
+    detectTimer = null;
+  }
+  function startDetectView(): void {
+    stopDetectView();
+    engine.resetPreviewRef();
+    void ensureCamera();
+    detectTimer = window.setInterval(() => {
+      const phase = net.phase ?? 'IDLE';
+      if (phase !== detectPhase) {
+        detectPhase = phase;
+        engine.resetPreviewRef(`projection changed → ${phase}`);
+      }
+      const stats =
+        phase === 'EXPOSE' && !net.config?.mouseSimulator
+          ? engine.getDetectStats()
+          : engine.previewDetect(camLive() ? camV : null, net.calibration?.hInv ?? null, detectOpts(), false);
+      engine.renderDetectView(detectCanvas, net.calibration?.corners ?? null);
+      net.send({
+        type: 'DETECT_FRAME',
+        imageData: detectCanvas.toDataURL('image/jpeg', 0.6),
+        stats: { ...stats, phase },
+      });
+    }, DETECT_VIEW_MS);
+  }
+  net.on('DETECT_VIEW', (m) => {
+    if (!m.on) return stopDetectView();
+    if (m.reref) engine.resetPreviewRef('admin RE-REFERENCE');
+    if (detectTimer === null) startDetectView();
   });
+  net.on('close', stopDetectView);
 
-  // ====================================================================
+  // Re-reference whenever the image that will be projected changes (sample switch / queue head change)
+  let lastImageKey = '';
+  const imageKey = () => `${net.config?.sampleFallback ?? 0}|${net.persisted?.queuedPhotoUrl ?? ''}`;
+  const checkImageChange = () => {
+    const k = imageKey();
+    if (lastImageKey && k !== lastImageKey) engine.resetPreviewRef('next image changed');
+    lastImageKey = k;
+  };
+  net.on('config', checkImageChange);
+  net.on('STATE_SYNC', checkImageChange);
+
+  // Report every reference capture to the server log + /admin
+  let lastRefSentAt = 0;
+  window.setInterval(() => {
+    const r = engine.lastRef;
+    if (!r || r.at === lastRefSentAt) return;
+    lastRefSentAt = r.at;
+    net.send({ type: 'REREF_EVENT', kind: r.kind, reason: r.reason, frames: r.frames });
+  }, 300);
+
   // render loop
-  // ====================================================================
-  let lastDrift = 0;
   function frame(): void {
     const phase = net.phase;
-    const t = net.storySec();
     const st = net.state;
+    const margin = net.config?.easelMargin ?? 6;
+    engine.setEaselMargin(margin);
+
     switch (phase) {
       case 'IDLE':
-        drawIdle(g, net.now());
+        drawIdleDarkroom(g, net.now());
         break;
-      case 'ENTER_BUFFER': {
-        drawIdle(g, net.now());
-        const remain = net.remainingMs() / 1000 / net.timeScale;
-        countdown.textContent = remain > 3 ? '' : String(Math.max(1, Math.ceil(remain)));
+
+      case 'CALIBRATING':
+        drawCalibrationTarget(g, margin);
         break;
-      }
-      case 'ACTIVE_30S':
-        heartbeat.setRate(72 + (Math.min(30, t) / 30) * 60);
-        if (!assets.base || baseFailed) drawSimFilm(g, t);
-        else {
-          clear(g);
-          // drift correction (real-time scale only)
-          if (net.timeScale === 1 && performance.now() - lastDrift > 2000 && !baseV.paused) {
-            lastDrift = performance.now();
-            const want = net.elapsedMs() / 1000;
-            if (Math.abs(baseV.currentTime - want) > 0.25 && want < (baseV.duration || 30)) baseV.currentTime = want;
-          }
+
+      case 'CAPTURE_CLEAN':
+        engine.drawExpose(g, margin);
+        break;
+
+      case 'OBSERVE':
+        engine.drawObserve(g, margin);
+        break;
+
+      case 'EXPOSE': {
+        engine.drawExpose(g, margin);
+        const total = Math.max(1, net.config?.exposeSec ?? 30);
+        const elapsed = net.storySec();
+        expFill.style.width = `${Math.min(100, (elapsed / total) * 100).toFixed(1)}%`;
+        const remainSec = Math.max(0, total - elapsed);
+        if (!exposeFastTickStarted && remainSec <= 5.0 && remainSec > 0) {
+          exposeFastTickStarted = true;
+          enlargerTimer.start(0.85, 0.05, 0.5);
         }
         break;
-      case 'REWIND':
-        if (!assets.rewind || rewindFailed) drawRewind(g, net.elapsedMs() / Math.max(1, st?.phaseDurationMs || 3000));
-        else clear(g);
-        break;
-      case 'REPLAY_TRUTH': {
-        if (!(replayUrl && replayRound === st?.round.id)) drawNoRecording(g, t);
-        else clear(g);
-        const show = !!st && !st.round.didSpeak && !st.round.didPullBreaker && t >= 30 - TIMELINE.bystanderLastSec;
-        bystander.classList.toggle('show', show);
+      }
+
+      case 'DEVELOP': {
+        engine.drawDevelop(g, liveDevProgress, margin);
+        const remainSec = Math.max(0, net.remainingMs() / 1000 / net.timeScale);
+        devFill.style.width = `${Math.min(100, (liveDevProgress / 1.2) * 100).toFixed(1)}%`;
+
+        if (remainSec > 0 && remainSec <= 6) {
+          setActiveSegment(segDevelop, 'burn');
+          tlPrompt.className = 'tl-prompt burn';
+          tlPrompt.textContent = `LIGHT LEAK IN ${Math.ceil(remainSec)}s — PULL FIX NOW →`;
+        } else if (liveDevProgress > 1.0) {
+          setActiveSegment(segDevelop, 'burn');
+          tlPrompt.className = 'tl-prompt burn';
+          tlPrompt.textContent = 'BURNING — PULL FIX NOW →';
+        } else if (liveDevProgress >= 0.75) {
+          setActiveSegment(segDevelop, 'gold');
+          tlPrompt.className = 'tl-prompt gold';
+          tlPrompt.textContent = 'OPTIMAL — PULL FIX LEVER AT RIGHT NOW →';
+        } else if (liveDevProgress >= 0.25) {
+          setActiveSegment(segDevelop);
+          tlPrompt.className = 'tl-prompt';
+          tlPrompt.textContent = 'KEEP DEVELOPING · PREPARE RIGHT LEVER';
+        } else {
+          setActiveSegment(segDevelop);
+          tlPrompt.className = 'tl-prompt';
+          tlPrompt.textContent = 'MAKE NOISE AT LEFT TO DEVELOP';
+        }
+
+        if (!devWarnTickStarted && remainSec > 0 && remainSec <= 5.0) {
+          devWarnTickStarted = true;
+          enlargerTimer.start(0.32, 0.06, 0.5);
+        }
         break;
       }
-      case 'CCTV_REVEAL': {
-        clear(g);
-        const now = Date.now();
-        const firstWait = Math.min(1500, (st?.phaseDurationMs || 6000) * 0.25);
-        const noFrames = lastCctvAt === 0 ? now - cctvPhaseStart > firstWait : now - lastCctvAt > 2000;
-        nosig.classList.toggle('hidden', !noFrames);
-        cctvClock.textContent = new Date(net.now()).toLocaleTimeString('en-GB', { hour12: false });
-        if (noFrames) cctvImg.classList.add('hidden');
+
+      case 'LIGHT_LEAK':
+        engine.drawLightLeak(g, net.storySec(), frozenDevProgress, margin);
+        break;
+
+      case 'REVEAL': {
+        const outcome = st?.round.outcome ?? 'FIXED_OPTIMAL';
+        const isLeak = outcome === 'UNFIXED_LIGHT_LEAK';
+        engine.drawSideBySideReveal(g, frozenDevProgress, outcomeFullLabel(outcome), isLeak);
         break;
       }
-      default:
-        clear(g);
     }
     requestAnimationFrame(frame);
   }
 
-  // ====================================================================
-  // setup panel
-  // ====================================================================
+  // setup panel (S reopens, F fullscreen)
   await setupPanel();
   net.connect();
   requestAnimationFrame(frame);
 
   window.addEventListener('keydown', (e) => {
-    if (e.key === 's' || e.key === 'S') setupPanel();
-    if (e.key === 'f' || e.key === 'F') requestFullscreen();
+    if (e.key === 's' || e.key === 'S') void setupPanel();
+    if (e.key === 'f' || e.key === 'F') void requestFullscreen();
   });
 
   function setupPanel(): Promise<void> {
@@ -510,18 +519,20 @@ export default async function mainPage(app: HTMLElement): Promise<void> {
       el.className = 'setup';
       el.innerHTML = `
         <div class="ticket">
-          <div class="head"><h2><small>RUHUA FILM LAB · JOB TICKET · PROJ /main</small>Main projector<br>setup</h2><span class="stamp double">Pre-flight</span></div>
-          <div class="fields">
-            <label><span class="no">01 / CAMERA</span>Choose the external USB wide-angle camera<select id="camSel"></select></label>
-            <label><span class="no">02 / AUDIO OUT</span>Audio output device<select id="sinkSel"></select></label>
-            <div class="assets" id="assetInfo"></div>
-            <div class="hint">While running: press S to reopen this panel, F for fullscreen.</div>
+          <div class="head">
+            <h2><small>RH-30 · COLOR ENLARGER · /main</small>Main projector setup</h2>
+            <span class="mono">S = SETUP · F = FULLSCREEN</span>
           </div>
           <div class="fields">
-            <div class="pv"><video id="pv" muted playsinline autoplay></video>${cropMarks()}<span class="mono">PREVIEW · CAM</span></div>
+            <label><span class="no">01 / CAMERA</span>External USB wide-angle camera<select id="camSel"></select></label>
+            <label><span class="no">02 / AUDIO OUT</span>Audio output device<select id="sinkSel"></select></label>
+            <div class="hint" id="camHint">Camera stream stays strictly local for optical dodging &amp; remote homography calibration.</div>
+          </div>
+          <div class="fields">
+            <div class="pv"><video id="pv" muted playsinline autoplay></video><span class="mono">LIVE CAMERA PREVIEW</span></div>
             <div class="row">
-              <button id="refresh">Refresh devices</button>
-              <button class="primary" id="go">Unlock audio/video &amp; go fullscreen</button>
+              <button id="refresh" type="button">Refresh devices</button>
+              <button class="primary" id="go" type="button">UNLOCK &amp; GO FULLSCREEN</button>
             </div>
           </div>
         </div>`;
@@ -529,19 +540,12 @@ export default async function mainPage(app: HTMLElement): Promise<void> {
       const camSel = el.querySelector('#camSel') as HTMLSelectElement;
       const sinkSel = el.querySelector('#sinkSel') as HTMLSelectElement;
       const pv = el.querySelector('#pv') as HTMLVideoElement;
-      const info = el.querySelector('#assetInfo') as HTMLDivElement;
-      updateAssetInfo = () => {
-        info.innerHTML =
-          `<b>base.mp4</b> ··· ${assets.base ? '<span class="ok">FOUND</span>' : '<span class="warn">MISSING → simulated film (canvas)</span>'}<br>` +
-          `<b>rewind.mp4</b> ··· ${assets.rewind ? '<span class="ok">FOUND</span>' : '<span class="warn">MISSING → procedural rewind</span>'}`;
-      };
-      checkAssets();
+      const hint = el.querySelector('#camHint') as HTMLDivElement;
 
       async function fill(): Promise<void> {
         try {
           let devs = await navigator.mediaDevices.enumerateDevices();
           if (!devs.some((d) => d.kind === 'videoinput' && d.label)) {
-            // ask for permission once so device labels become available
             const tmp = await navigator.mediaDevices.getUserMedia({ video: true, audio: false }).catch(() => null);
             tmp?.getTracks().forEach((t) => t.stop());
             devs = await navigator.mediaDevices.enumerateDevices();
@@ -554,7 +558,7 @@ export default async function mainPage(app: HTMLElement): Promise<void> {
             o.textContent = d.label || `Camera ${i + 1}`;
             camSel.appendChild(o);
           });
-          if (!cams.length) camSel.innerHTML = '<option value="">(no camera detected)</option>';
+          if (!cams.length) camSel.innerHTML = '<option value="">(no camera detected — use Mouse Dodge Simulator)</option>';
           const saved = cams.find((d) => d.deviceId === camId);
           const external = cams.find((d) => !/facetime|built-?in|integrated|\u5185\u5efa/i.test(d.label));
           camSel.value = (saved || external || cams[0])?.deviceId || '';
@@ -563,7 +567,7 @@ export default async function mainPage(app: HTMLElement): Promise<void> {
           sinkSel.innerHTML = '';
           const canSink = typeof (audioCtx() as any).setSinkId === 'function' || 'setSinkId' in HTMLMediaElement.prototype;
           if (!canSink || !sinks.length) {
-            sinkSel.innerHTML = '<option value="">System default output (this browser cannot choose an output)</option>';
+            sinkSel.innerHTML = '<option value="">System default output</option>';
           } else {
             sinks.forEach((d, i) => {
               const o = document.createElement('option');
@@ -575,7 +579,7 @@ export default async function mainPage(app: HTMLElement): Promise<void> {
           }
           await preview();
         } catch (err) {
-          info.innerHTML += `<br>Device enumeration failed: ${(err as Error).message} (HTTPS required)`;
+          hint.textContent = `Device enumeration failed: ${(err as Error).message} (HTTPS required)`;
         }
       }
 
@@ -586,32 +590,24 @@ export default async function mainPage(app: HTMLElement): Promise<void> {
         pv.play().catch(() => {});
       }
 
-      camSel.addEventListener('change', preview);
-      (el.querySelector('#refresh') as HTMLButtonElement).addEventListener('click', fill);
+      camSel.addEventListener('change', () => void preview());
+      (el.querySelector('#refresh') as HTMLButtonElement).addEventListener('click', () => void fill());
       (el.querySelector('#go') as HTMLButtonElement).addEventListener('click', async () => {
         const fsP = requestFullscreen();
         const auP = unlockAudio();
-        keepAwake();
+        void keepAwake();
         camId = camSel.value;
         sinkId = sinkSel.value;
         localStorage.setItem(LS_CAM, camId);
         localStorage.setItem(LS_SINK, sinkId);
-        await Promise.allSettled([fsP, auP]);
-        if (sinkId) await setAudioSink(sinkId);
-        sinkAll();
-        // unlock autoplay on the video elements
-        for (const v of [baseV, rewindV, replayV]) {
-          v.muted = v === replayV;
-          v.play().catch(() => {});
-          v.pause();
-        }
-        if (!camLive()) await openCamera(camId);
+        await Promise.allSettled([withTimeout(fsP), withTimeout(auP)]);
+        if (sinkId) await withTimeout(setAudioSink(sinkId));
+        if (!camLive()) await withTimeout(openCamera(camId), 1500);
         pv.srcObject = null;
         el.remove();
-        updateAssetInfo = null;
         resolve();
       });
-      fill();
+      void fill();
     });
   }
 }

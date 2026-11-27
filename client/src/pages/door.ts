@@ -1,150 +1,151 @@
-/**
- * /door — tablet 1: entrance darkroom screen (display only)
- * - Never asks for the microphone and detects nothing; only /admin starts a round.
- * - During CCTV_REVEAL it optionally opens the front camera and pushes 3–4 FPS mono frames; any failure is skipped silently.
- */
 import { Net, mountNetDot } from '../lib/net';
-import { cctvFrame, drawDefaultDoorPhoto } from '../lib/media';
-import { cropMarks, filmStrip, showStartOverlay } from '../lib/unlock';
+import { generateQrSvg } from '../lib/qr';
+import { escapeHtml, showStartOverlay } from '../lib/unlock';
 import { TITLE_EN } from '../lib/brand';
-import type { Phase } from '../../../shared/protocol';
+import type { ContactSheetInfo, PersistedState, Phase } from '../../../shared/protocol';
 
-const CAPTION_T = 'Node time 00:30';
-const CAPTION = 'An anomalous shadow collapsed the frame';
-const CCTV_INTERVAL_MS = 280; // ~3.6 FPS
+function pad2(n: number): string {
+  return String(Math.max(0, Math.floor(n))).padStart(2, '0');
+}
 
 export default async function door(app: HTMLElement): Promise<void> {
-  document.title = `Entrance · ${TITLE_EN}`;
+  document.title = `Entrance & Upload QR · ${TITLE_EN}`;
+
+  const uploadUrl = `${location.origin}/upload`;
+  const qrSvg = generateQrSvg(uploadUrl, '#E8E2D5', '#080706');
+
   app.innerHTML = `
-    <canvas class="layer door-photo" id="def"></canvas>
-    <img class="layer door-photo hidden" id="photo" alt="" />
-    <div class="door-shade"></div>
-    <div class="door-crops">${cropMarks()}</div>
-    <div class="door-edge">${filmStrip(7, 'v')}</div>
-    <div class="door-msg" id="msg"><small>ENTRANCE · T-01</small><span id="msgText"><span class="l1">LIFT THE CURTAIN</span><span class="sep"> · </span><span class="l2">STEP INTO THE PHOTOGRAPH</span></span></div>
-    <div class="door-standby" id="standby"><span>SHOOTING IN PROGRESS · PLEASE WAIT</span></div>
-    <div class="door-caption" id="cap"><div class="tag" id="tag"></div><div class="line" id="capLine"></div></div>`;
-  const def = app.querySelector('#def') as HTMLCanvasElement;
-  const photo = app.querySelector('#photo') as HTMLImageElement;
-  const msg = app.querySelector('#msg') as HTMLDivElement;
-  const standby = app.querySelector('#standby') as HTMLDivElement;
-  const cap = app.querySelector('#cap') as HTMLDivElement;
-  const tag = app.querySelector('#tag') as HTMLDivElement;
-  (app.querySelector('#capLine') as HTMLDivElement).innerHTML = `<span class="t">${CAPTION_T.toUpperCase()}</span> · ${CAPTION.toUpperCase()}`;
-  drawDefaultDoorPhoto(def);
+    <div class="door-sheet" id="sheetWrap">
+      <main class="door-split door-qr-split">
+        <section class="door-qr-panel">
+          <div class="zone-head future"><span>NEXT EXPOSURE QUEUE</span><span class="mono" id="queuePill">WAITING FOR UPLOAD</span></div>
+          <div class="qr-stage">
+            <div class="qr-frame">${qrSvg}</div>
+            <div class="qr-prompt">SCAN TO LOAD A MEMORY FOR THE NEXT EXPOSURE</div>
+            <div class="qr-url mono">${escapeHtml(uploadUrl)}</div>
+          </div>
+        </section>
+        <section class="door-past">
+          <div class="zone-head"><span>CONTACT SHEET · ARCHIVED PRINTS</span><span class="mono" id="rollTag">ROLL 01</span></div>
+          <div class="past-grid cols-3" id="pastGrid"></div>
+        </section>
+      </main>
+      <footer class="cs-foot">
+        <span>Your uploaded photograph is used only for this live exposure and permanently deleted afterward.</span>
+      </footer>
+    </div>`;
+
+  const sheetWrap = app.querySelector('#sheetWrap') as HTMLDivElement;
+  const queuePill = app.querySelector('#queuePill') as HTMLSpanElement;
+  const rollTag = app.querySelector('#rollTag') as HTMLSpanElement;
+  const pastGrid = app.querySelector('#pastGrid') as HTMLDivElement;
 
   const net = new Net('door');
-  (window as any).__net = net; // debugging / automated tests
+  (window as any).__net = net;
 
-  // ---------------- negative display ----------------
-  let showingUrl: string | null = null;
-  const applyPhoto = () => {
-    const p = net.doorPhoto;
-    if (p?.has && p.url) {
-      if (showingUrl !== p.url) {
-        showingUrl = p.url;
-        const pre = new Image();
-        pre.onload = () => {
-          if (showingUrl !== p.url) return;
-          photo.src = p.url!;
-          photo.classList.remove('hidden');
-          def.classList.add('hidden');
-        };
-        pre.onerror = () => {
-          photo.classList.add('hidden');
-          def.classList.remove('hidden');
-        };
-        pre.src = p.url;
-      }
+  let sheetKey = '';
+
+  function updateQueueStatus(st?: PersistedState | null): void {
+    const sampleIdx = net.config?.sampleFallback ?? 0;
+    if (st?.hasQueuedPhoto) {
+      const n = st.queueLength ?? 1;
+      queuePill.textContent = `NEXT PHOTO: READY (UPLOADED) · ${n} IN QUEUE`;
+      queuePill.className = 'mono q-ready';
+    } else if (sampleIdx > 0) {
+      queuePill.textContent = sampleIdx === 7 ? 'NEXT PHOTO: LAST PRINT' : `NEXT PHOTO: BUILT-IN SAMPLE #${sampleIdx}`;
+      queuePill.className = 'mono q-ready';
     } else {
-      showingUrl = null;
-      drawDefaultDoorPhoto(def);
-      photo.classList.add('hidden');
-      def.classList.remove('hidden');
+      queuePill.textContent = 'WAITING FOR UPLOAD';
+      queuePill.className = 'mono q-wait';
     }
-  };
+  }
 
-  const render = (phase: Phase) => {
-    const dim = phase !== 'IDLE' && phase !== 'CCTV_REVEAL';
-    for (const el of [photo, def]) el.classList.toggle('dim', dim);
-    msg.classList.toggle('show', phase === 'ENTER_BUFFER');
-    standby.classList.toggle('show', ['ACTIVE_30S', 'FLASH_FREEZE', 'REWIND', 'REPLAY_TRUTH'].includes(phase));
-    cap.style.opacity = phase === 'IDLE' ? '1' : '0';
-    const p = net.doorPhoto;
-    const fr = String(net.round?.id ?? 0).padStart(2, '0');
-    tag.innerHTML = p?.has
-      ? `<span class="fr">FR ${fr}A</span><span>RH-30 · ENTRANCE NEGATIVE</span><span>EXPOSED ${new Date(p.version).toLocaleTimeString('en-GB', { hour12: false })}</span>`
-      : '<span class="fr">FR 00</span><span>RH-30 · ENTRANCE NEGATIVE</span><span>DEFAULT PLATE</span>';
-    if (phase === 'CCTV_REVEAL') startCctv();
-    else stopCctv();
-  };
+  function renderSheet(sheet?: ContactSheetInfo | null): void {
+    const rollNo = sheet?.rollNumber ?? net.config?.rollNumber ?? net.round?.rollNumber ?? 1;
+    const allFrames = sheet?.frames ?? [];
+    const totalExposed = sheet?.totalInRoll ?? allFrames.length;
+    const key = JSON.stringify([rollNo, totalExposed, allFrames.map((f) => [f.url, f.outcomeCode])]);
+    rollTag.textContent = `ROLL ${pad2(rollNo)}`;
+    updateQueueStatus(net.persisted);
 
-  // ---------------- optional front-camera CCTV feed (CCTV_REVEAL only) ----------------
-  let stream: MediaStream | null = null;
-  let camVideo: HTMLVideoElement | null = null;
-  let timer: number | null = null;
-  let starting = false;
-  const frameCanvas = document.createElement('canvas');
+    if (key === sheetKey) return;
+    sheetKey = key;
 
-  async function startCctv(): Promise<void> {
-    if (timer || starting) return;
-    starting = true;
+    const visible = allFrames.slice(-9);
+    const totalSlots = visible.length <= 4 ? 4 : visible.length <= 6 ? 6 : 9;
+    pastGrid.className = `past-grid ${totalSlots === 4 ? 'cols-2' : 'cols-3'}`;
+
+    const cells: string[] = [];
+    visible.forEach((f) => {
+      const code = f.outcomeCode || 'FIXED';
+      cells.push(`
+        <div class="cs-cell filled">
+          <div class="cs-imgbox">
+            <img src="${escapeHtml(f.url)}" alt="${escapeHtml(f.frameNo)}" loading="eager" />
+          </div>
+          <div class="cs-label">${escapeHtml(f.frameNo)} · ${escapeHtml(code)}</div>
+        </div>`);
+    });
+
+    const startIdx = visible.length === 0 ? 1 : (visible[visible.length - 1]?.index ?? visible.length) + 1;
+    for (let k = visible.length; k < totalSlots; k++) {
+      const nextNo = startIdx + (k - visible.length);
+      cells.push(`
+        <div class="cs-cell empty">
+          <div class="cs-imgbox"></div>
+          <div class="cs-label">${pad2(nextNo)}A</div>
+        </div>`);
+    }
+    pastGrid.innerHTML = cells.join('');
+  }
+
+  async function refreshStateHttp(): Promise<void> {
     try {
-      if (!navigator.mediaDevices?.getUserMedia) return;
-      stream = await navigator.mediaDevices.getUserMedia({
-        video: { facingMode: 'user', width: { ideal: 640 }, height: { ideal: 480 }, frameRate: { ideal: 15 } },
-        audio: false,
-      });
-      if (net.phase !== 'CCTV_REVEAL') return stopCctv();
-      camVideo = document.createElement('video');
-      camVideo.muted = true;
-      camVideo.playsInline = true;
-      camVideo.setAttribute('playsinline', '');
-      camVideo.srcObject = stream;
-      await camVideo.play();
-      timer = window.setInterval(() => {
-        try {
-          if (!camVideo || camVideo.readyState < 2 || net.phase !== 'CCTV_REVEAL') return;
-          if (net.buffered() > 256 * 1024) return; // back-pressure on weak networks: drop the frame
-          cctvFrame(camVideo, frameCanvas, 'CAM-01 ENTRANCE');
-          net.send({ type: 'cctv', data: frameCanvas.toDataURL('image/jpeg', 0.5) });
-        } catch {
-          /* silent */
-        }
-      }, CCTV_INTERVAL_MS);
+      const r = await fetch('/api/state', { cache: 'no-store' });
+      const j = await r.json();
+      if (j?.ok && j.state) {
+        net.persisted = j.state;
+        const sheet: ContactSheetInfo = {
+          rollNumber: j.state.rollNumber,
+          totalInRoll: j.state.frames?.length ?? 0,
+          frames: j.state.frames ?? [],
+        };
+        net.contactSheet = sheet;
+        renderSheet(sheet);
+      }
     } catch {
-      // no camera / permission denied / anything else: skip silently, display is unaffected
-      stopCctv();
-    } finally {
-      starting = false;
+      /* ignore */
     }
   }
 
-  function stopCctv(): void {
-    if (timer) clearInterval(timer);
-    timer = null;
-    stream?.getTracks().forEach((t) => t.stop());
-    stream = null;
-    if (camVideo) camVideo.srcObject = null;
-    camVideo = null;
+  function renderPhase(phase: Phase): void {
+    const isDim = phase === 'OBSERVE' || phase === 'EXPOSE' || phase === 'DEVELOP' || phase === 'LIGHT_LEAK';
+    sheetWrap.classList.toggle('dim', isDim);
+    renderSheet(net.contactSheet);
   }
 
-  net.on('state', (m) => render(m.state));
-  net.on('door-photo', () => {
-    applyPhoto();
-    render(net.phase);
+  net.on('state', (m) => renderPhase(m.state));
+  net.on('contact-sheet', (m) => renderSheet(m.sheet));
+  net.on('STATE_SYNC', (m) => {
+    updateQueueStatus(m.persisted);
+    void refreshStateHttp();
   });
-  net.on('open', applyPhoto);
-  net.on('state', applyPhoto);
+  net.on('config', () => renderSheet(net.contactSheet));
+  net.on('open', () => {
+    renderSheet(net.contactSheet);
+    void refreshStateHttp();
+  });
+
   mountNetDot(net);
+  renderSheet(null);
 
   await showStartOverlay({
     code: 'T-01',
     kicker: '/door',
-    title: 'Entrance darkroom screen',
-    subtitle: 'Tap to go fullscreen and keep the screen awake.\nDisplay only. No microphone needed.',
-    button: 'Tap to start',
+    title: 'ENTRANCE & UPLOAD QR',
+    subtitle: 'Tap to lock fullscreen',
+    button: 'TAP TO START',
   });
   net.connect();
-  render(net.phase);
+  renderPhase(net.phase);
 }

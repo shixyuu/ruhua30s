@@ -38,6 +38,8 @@ async function boot(): Promise<void> {
       return (await import('./pages/station2')).default(app);
     case '/admin':
       return (await import('./pages/admin')).default(app);
+    case '/upload':
+      return (await import('./pages/upload')).default(app);
     default:
       return (await import('./pages/home')).default(app);
   }

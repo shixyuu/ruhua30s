@@ -1,177 +1,144 @@
-/**
- * /station1 — tablet 2: south-west comms terminal
- *  Window A 05s–13s: red incoming-call screen + ring; hold the button to record (stops on release or at 13s) → sends audio + audioOffsetMs
- *  Window B 13s–21s: overexposure alarm screen
- */
 import { Net, mountNetDot } from '../lib/net';
-import { alarm, ring, stopAllLoops } from '../lib/sfx';
-import { blobToDataURL, pickAudioMime } from '../lib/media';
+import { audioCtx, stationWakeChime } from '../lib/sfx';
 import { showStartOverlay } from '../lib/unlock';
 import { TITLE_EN } from '../lib/brand';
-import { TIMELINE } from '../../../shared/protocol';
 
-const TEXT_A = 'ANOMALY DETECTED! HOLD THE BUTTON BELOW AND SHOUT TO STOP HIM — NOW!';
-const TEXT_B = 'WARNING: OVEREXPOSURE IS BURNING THE NEGATIVE! RUN TO THE CENTRE OF THE ROOM AND SPREAD YOUR ARMS TO BLOCK THE BEAM ON THE WALL!';
+const SEND_INTERVAL_MS = 83; // ~12 Hz
 
-type Seg = 'black' | 'A' | 'B';
+function arcPoint(cx: number, cy: number, r: number, deg: number): [number, number] {
+  const rad = ((deg - 90) * Math.PI) / 180;
+  return [cx + r * Math.cos(rad), cy + r * Math.sin(rad)];
+}
+
+function arcPath(cx: number, cy: number, r: number, startDeg: number, endDeg: number): string {
+  const [x1, y1] = arcPoint(cx, cy, r, startDeg);
+  const [x2, y2] = arcPoint(cx, cy, r, endDeg);
+  const large = Math.abs(endDeg - startDeg) > 180 ? 1 : 0;
+  return `M ${x1.toFixed(1)} ${y1.toFixed(1)} A ${r} ${r} 0 ${large} 1 ${x2.toFixed(1)} ${y2.toFixed(1)}`;
+}
 
 export default async function station1(app: HTMLElement): Promise<void> {
-  document.title = `Comms terminal · ${TITLE_EN}`;
+  document.title = `Acoustic Developer · ${TITLE_EN}`;
+
+  const ticks: string[] = [];
+  for (let i = 0; i <= 20; i++) {
+    const deg = -52 + (i / 20) * 104;
+    const major = i % 5 === 0;
+    const [x1, y1] = arcPoint(240, 230, major ? 150 : 160, deg);
+    const [x2, y2] = arcPoint(240, 230, 174, deg);
+    ticks.push(
+      `<line x1="${x1.toFixed(1)}" y1="${y1.toFixed(1)}" x2="${x2.toFixed(1)}" y2="${y2.toFixed(1)}" stroke="rgba(232,226,213,${major ? 0.85 : 0.35})" stroke-width="${major ? 2.2 : 1.1}" />`,
+    );
+  }
+
   app.innerHTML = `
-    <div class="station black" id="root">
-      <div class="st-band"><span class="id"><span>T-02</span></span><span class="zone" id="zone">SW comms terminal</span><span class="clock" id="clock">--.-</span></div>
-      <div class="st-body stack" id="body">
-        <p class="st-msg" id="msg"></p>
-        <div class="st-aside" id="aside">
-          <div class="plate-col"><div class="plate">PUSH TO TALK<b>Release to send</b></div><div class="st-sub" id="sub"></div></div>
-          <div class="mush"><div class="collar"></div><button class="talk-btn" id="talk">Hold<br>to talk</button></div>
-        </div>
+    <div class="inst-screen black" id="root">
+      <div class="meter-stage">
+        <svg class="analog-meter" viewBox="0 0 480 300" aria-label="Acoustic developer meter">
+          <rect x="14" y="14" width="452" height="272" rx="4" fill="#0B0A09" stroke="rgba(232,226,213,0.22)" stroke-width="1.5" />
+          <path id="arcQuiet" d="${arcPath(240, 230, 184, -52, -40)}" fill="none" stroke="#9E2A22" stroke-width="8" stroke-linecap="butt" />
+          <path id="arcActive" d="${arcPath(240, 230, 184, -40, 52)}" fill="none" stroke="#538C4D" stroke-width="8" stroke-linecap="butt" />
+          <path d="${arcPath(240, 230, 174, -52, 52)}" fill="none" stroke="rgba(232,226,213,0.35)" stroke-width="1.2" />
+          ${ticks.join('')}
+          <text x="64" y="250" fill="rgba(232,226,213,0.45)" font-family="'RH Mono', monospace" font-size="11" letter-spacing="2">QUIET</text>
+          <text x="364" y="250" fill="rgba(123,168,98,0.75)" font-family="'RH Mono', monospace" font-size="11" letter-spacing="2">DEVELOP</text>
+          <g id="needle" transform="rotate(-52 240 230)">
+            <line x1="240" y1="230" x2="240" y2="56" stroke="#E8E2D5" stroke-width="2.6" stroke-linecap="round" />
+            <circle cx="240" cy="230" r="10" fill="#1C1916" stroke="#E8E2D5" stroke-width="2" />
+            <circle cx="240" cy="230" r="3" fill="#9E2A22" />
+          </g>
+        </svg>
+        <div class="inst-caption">MAKE NOISE TO DEVELOP</div>
+        <div class="inst-sub">Watch the wall — stop before it turns black</div>
       </div>
-      <div class="st-foot"><span>RH-30 / LINE 02 · <span id="foot"></span></span><span class="chem" id="chem"><span data-s="A"><b>DEV</b> 05–13</span><span data-s="B"><b>STOP</b> 13–21</span><span data-s="C"><b>FIX</b> 21–30</span></span></div>
     </div>`;
+
   const root = app.querySelector('#root') as HTMLDivElement;
-  const aside = app.querySelector('#aside') as HTMLDivElement;
-  const zone = app.querySelector('#zone') as HTMLSpanElement;
-  const clock = app.querySelector('#clock') as HTMLSpanElement;
-  const foot = app.querySelector('#foot') as HTMLSpanElement;
-  const msgEl = app.querySelector('#msg') as HTMLDivElement;
-  const subEl = app.querySelector('#sub') as HTMLDivElement;
-  const btn = app.querySelector('#talk') as HTMLButtonElement;
-  const chem = Array.from(app.querySelectorAll<HTMLSpanElement>('#chem > span'));
+  const arcQuiet = app.querySelector('#arcQuiet') as SVGPathElement;
+  const arcActive = app.querySelector('#arcActive') as SVGPathElement;
+  const needle = app.querySelector('#needle') as SVGGElement;
 
   const net = new Net('station1');
-  (window as any).__net = net; // debugging / automated tests
+  (window as any).__net = net;
   mountNetDot(net);
 
   let mic: MediaStream | null = null;
-  const mime = pickAudioMime();
+  let analyser: AnalyserNode | null = null;
+  let micSrc: MediaStreamAudioSourceNode | null = null;
+  const waveBuf = new Uint8Array(256);
 
-  // ---------------- recording ----------------
-  let rec: MediaRecorder | null = null;
-  let chunks: Blob[] = [];
-  let recStartServer = 0;
-  let sentRound = -1;
-  let recRound = -1;
-
-  async function ensureMic(): Promise<MediaStream | null> {
-    if (mic && mic.getAudioTracks().some((t) => t.readyState === 'live')) return mic;
+  async function ensureMic(): Promise<void> {
+    if (mic && mic.getAudioTracks().some((t) => t.readyState === 'live')) return;
     try {
       mic = await navigator.mediaDevices.getUserMedia({
         audio: { echoCancellation: true, noiseSuppression: false, autoGainControl: true },
         video: false,
       });
+      const c = audioCtx();
+      analyser = c.createAnalyser();
+      analyser.fftSize = 256;
+      analyser.smoothingTimeConstant = 0.65;
+      micSrc?.disconnect();
+      micSrc = c.createMediaStreamSource(mic);
+      micSrc.connect(analyser);
     } catch (e) {
       console.warn('microphone unavailable', e);
       mic = null;
-    }
-    return mic;
-  }
-
-  async function startRec(): Promise<void> {
-    const r = net.round;
-    if (rec || !r || sentRound === r.id || seg !== 'A') return;
-    const s = await ensureMic();
-    if (!s || seg !== 'A') return;
-    try {
-      rec = mime ? new MediaRecorder(s, { mimeType: mime }) : new MediaRecorder(s);
-    } catch {
-      rec = new MediaRecorder(s);
-    }
-    chunks = [];
-    recRound = r.id;
-    recStartServer = net.now();
-    rec.onstart = () => (recStartServer = net.now());
-    rec.ondataavailable = (e) => e.data && e.data.size && chunks.push(e.data);
-    rec.onstop = async () => {
-      const type = rec?.mimeType || mime || 'audio/webm';
-      const blob = new Blob(chunks, { type });
-      const round = net.round;
-      rec = null;
-      btn.classList.remove('rec');
-      if (!round || round.id !== recRound || blob.size < 800 || !round.activeStartedAt) {
-        subEl.textContent = '';
-        return;
-      }
-      const audioOffsetMs = Math.max(0, Math.round(recStartServer - round.activeStartedAt));
-      const data = await blobToDataURL(blob);
-      if (net.send({ type: 'speak', mime: type, data, audioOffsetMs })) {
-        sentRound = round.id;
-        subEl.textContent = 'Connected · signal sent';
-        btn.disabled = true;
-      }
-    };
-    rec.start(250);
-    ring.duck(0.05);
-    btn.classList.add('rec');
-    subEl.textContent = 'Recording… release to end';
-  }
-
-  function stopRec(): void {
-    if (rec && rec.state !== 'inactive') {
-      try {
-        rec.requestData();
-      } catch {
-        /* ignore */
-      }
-      rec.stop();
-    }
-    ring.duck(1);
-  }
-
-  btn.addEventListener('pointerdown', (e) => {
-    e.preventDefault();
-    try {
-      btn.setPointerCapture(e.pointerId);
-    } catch {
-      /* ignore */
-    }
-    startRec();
-  });
-  for (const ev of ['pointerup', 'pointercancel', 'lostpointercapture'] as const) btn.addEventListener(ev, () => stopRec());
-
-  // ---------------- phase rendering ----------------
-  let seg: Seg = 'black';
-  function setSeg(next: Seg): void {
-    if (next === seg) return;
-    seg = next;
-    chem.forEach((c) => c.classList.toggle('on', c.dataset.s === next));
-    root.className = 'station black';
-    aside.classList.add('hidden');
-    msgEl.textContent = '';
-    subEl.textContent = '';
-    ring.stop();
-    alarm.stop();
-    if (next !== 'A') stopRec();
-    if (next === 'A') {
-      root.className = 'station st-call';
-      zone.textContent = 'SW comms terminal · Incoming call';
-      foot.textContent = 'PHASE A';
-      msgEl.textContent = TEXT_A;
-      aside.classList.remove('hidden');
-      btn.disabled = sentRound === net.round?.id;
-      ring.start();
-    } else if (next === 'B') {
-      root.className = 'station st-over';
-      zone.textContent = 'SW comms terminal · Overexposure';
-      foot.textContent = 'PHASE B';
-      msgEl.textContent = TEXT_B;
-      alarm.start('overexposure', 0.7);
-    } else {
-      stopAllLoops();
+      analyser = null;
     }
   }
+
+  function updateThresholdArc(): void {
+    const floor = Math.max(0.02, Math.min(0.5, net.config?.noiseFloor ?? 0.08));
+    const splitDeg = -52 + floor * 104;
+    arcQuiet.setAttribute('d', arcPath(240, 230, 184, -52, splitDeg));
+    arcActive.setAttribute('d', arcPath(240, 230, 184, splitDeg, 52));
+  }
+  net.on('config', updateThresholdArc);
+
+  function readEnergy(): number {
+    if (!analyser) return 0;
+    analyser.getByteTimeDomainData(waveBuf);
+    let sum = 0;
+    for (let i = 0; i < waveBuf.length; i++) {
+      const d = (waveBuf[i] - 128) / 128;
+      sum += d * d;
+    }
+    const rms = Math.sqrt(sum / waveBuf.length);
+    return Math.max(0, Math.min(1, rms * 3.8));
+  }
+
+  let smoothed = 0;
+  let lastSentAt = 0;
+  let wasActive = false;
+
+  function renderPhase(): void {
+    const active = net.connected && net.phase === 'DEVELOP';
+    root.classList.toggle('black', !active);
+    if (active && !wasActive) stationWakeChime();
+    wasActive = active;
+    if (active) void ensureMic();
+  }
+  net.on('state', renderPhase);
+  net.on('open', renderPhase);
 
   function tick(): void {
-    let next: Seg = 'black';
-    if (net.connected && net.phase === 'ACTIVE_30S') {
-      const t = net.storySec();
-      if (t >= TIMELINE.station1A[0] && t < TIMELINE.station1A[1]) next = 'A';
-      else if (t >= TIMELINE.station1B[0] && t < TIMELINE.station1B[1]) next = 'B';
-    }
-    setSeg(next);
-    if (next !== 'black') {
-      const end = next === 'A' ? TIMELINE.station1A[1] : TIMELINE.station1B[1];
-      clock.textContent = Math.max(0, end - net.storySec()).toFixed(1).padStart(4, '0');
+    const active = net.connected && net.phase === 'DEVELOP';
+    if (active) {
+      const raw = readEnergy();
+      // Fast needle attack, calm physical ballistic decay
+      smoothed = raw > smoothed ? smoothed + (raw - smoothed) * 0.42 : smoothed + (raw - smoothed) * 0.14;
+      const deg = -52 + smoothed * 104;
+      needle.setAttribute('transform', `rotate(${deg.toFixed(2)} 240 230)`);
+
+      const now = performance.now();
+      if (now - lastSentAt >= SEND_INTERVAL_MS) {
+        lastSentAt = now;
+        net.send({ type: 'AUDIO_ENERGY', level: Number(raw.toFixed(3)) });
+      }
+    } else if (smoothed > 0.001) {
+      smoothed = 0;
+      needle.setAttribute('transform', 'rotate(-52 240 230)');
     }
     requestAnimationFrame(tick);
   }
@@ -179,13 +146,15 @@ export default async function station1(app: HTMLElement): Promise<void> {
   await showStartOverlay({
     code: 'T-02',
     kicker: '/station1',
-    title: 'South-west comms terminal',
-    subtitle: 'Tap to allow the microphone, go fullscreen\nand keep the screen awake.',
-    button: 'Tap to start',
+    title: 'ACOUSTIC DEVELOPER',
+    subtitle: 'Tap to allow microphone & fullscreen',
+    button: 'TAP TO START',
     onUnlock: async () => {
       await ensureMic();
     },
   });
   net.connect();
+  updateThresholdArc();
+  renderPhase();
   requestAnimationFrame(tick);
 }

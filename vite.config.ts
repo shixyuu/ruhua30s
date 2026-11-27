@@ -1,6 +1,6 @@
 import { defineConfig } from 'vite';
 
-// 注意：后端 /assets 路径用于托管实拍视频，所以 Vite 构建产物放在 /static 目录下，避免冲突。
+// Built assets go in /static so they do not collide with the server /assets path.
 const backend = process.env.BACKEND_URL || 'http://localhost:3000';
 
 export default defineConfig({

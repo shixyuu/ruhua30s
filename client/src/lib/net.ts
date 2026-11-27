@@ -1,14 +1,21 @@
-import type { AppConfig, ClientMsg, DoorPhotoInfo, Phase, Role, RoundInfo, ServerMsg } from '../../../shared/protocol';
+import type {
+  AppConfig,
+  CalibrationData,
+  ClientMsg,
+  ContactSheetInfo,
+  DoorPhotoInfo,
+  PersistedState,
+  Phase,
+  Role,
+  RoundInfo,
+  ServerMsg,
+} from '../../../shared/protocol';
 
 export type StateMsg = Extract<ServerMsg, { type: 'state' }>;
+export type DevMsg = Extract<ServerMsg, { type: 'dev' }>;
 type Handler<T extends ServerMsg['type']> = (msg: Extract<ServerMsg, { type: T }>) => void;
 
-/**
- * WebSocket client:
- *  - exponential back-off reconnect (0.5s → 1s → 2s … capped at 10s, with jitter)
- *  - after reconnecting the server immediately sends state / config / door-photo for a full resync
- *  - NTP-style clock sync: uses the offset of the lowest-RTT sample among recent ones
- */
+/** WebSocket client with backoff reconnect and NTP-style clock sync. */
 export class Net {
   readonly role: Role;
   private ws: WebSocket | null = null;
@@ -26,7 +33,11 @@ export class Net {
   connected = false;
   state: StateMsg | null = null;
   config: AppConfig | null = null;
+  calibration: CalibrationData | null = null;
+  persisted: PersistedState | null = null;
   doorPhoto: DoorPhotoInfo | null = null;
+  contactSheet: ContactSheetInfo | null = null;
+  lastDev: DevMsg | null = null;
 
   constructor(role: Role, token?: string) {
     this.role = role;
@@ -66,11 +77,6 @@ export class Net {
     return Math.max(0, this.state.phaseDurationMs - this.elapsedMs());
   }
 
-  /** server time → local Date.now() time usable for performance/AudioContext */
-  toLocal(serverMs: number): number {
-    return serverMs - this.offset;
-  }
-
   on<T extends ServerMsg['type'] | 'open' | 'close'>(
     type: T,
     fn: T extends ServerMsg['type'] ? Handler<T> : () => void,
@@ -96,11 +102,6 @@ export class Net {
       return true;
     }
     return false;
-  }
-
-  /** bytes queued in the send buffer (CCTV frame back-pressure) */
-  buffered(): number {
-    return this.ws?.bufferedAmount ?? 0;
   }
 
   connect(): void {
@@ -203,15 +204,63 @@ export class Net {
       case 'config':
         this.config = msg.config;
         break;
+      case 'calibration':
+        this.calibration = msg.calibration;
+        break;
+      case 'STATE_SYNC':
+        this.persisted = msg.persisted;
+        break;
       case 'door-photo':
         this.doorPhoto = msg.photo;
+        break;
+      case 'contact-sheet':
+        this.contactSheet = msg.sheet;
+        break;
+      case 'dev':
+        this.lastDev = msg;
         break;
     }
     this.emit(msg.type, msg);
   }
 }
 
-/** connection dot in the corner (turns red when offline) */
+let sharedFlashEl: HTMLDivElement | null = null;
+let flashHoldTimer = 0;
+
+/** Trigger crisp full-screen white flash (instant 1.0 -> hold ~100ms -> 220ms smooth decay) */
+export function triggerFlashPulse(peakOpacity = 1, holdMs = 100, decayMs = 220): void {
+  if (!sharedFlashEl) {
+    sharedFlashEl = document.createElement('div');
+    sharedFlashEl.className = 'flash-pulse';
+    document.body.appendChild(sharedFlashEl);
+  }
+  const el = sharedFlashEl;
+  clearTimeout(flashHoldTimer);
+  el.style.transition = 'none';
+  el.style.opacity = '0';
+  void el.offsetWidth; // force reflow so repeated clicks always re-trigger
+  el.style.opacity = String(peakOpacity);
+  flashHoldTimer = window.setTimeout(() => {
+    el.style.transition = `opacity ${decayMs}ms ease-out`;
+    el.style.opacity = '0';
+  }, holdMs);
+}
+
+/** Shared Flash Overlay mounted across all screens (/main, /door, /station1, /station2, /admin) */
+export function mountFlashOverlay(net: Net): void {
+  if (!sharedFlashEl) {
+    sharedFlashEl = document.createElement('div');
+    sharedFlashEl.className = 'flash-pulse';
+    document.body.appendChild(sharedFlashEl);
+  }
+  net.on('FLASH_PULSE', (m) => {
+    const hold = Math.max(60, Math.min(140, Math.round(m.durationMs * 0.38)));
+    const decay = Math.max(140, m.durationMs - hold);
+    triggerFlashPulse(1, hold, decay);
+  });
+}
+
+/** connection dot in the corner (turns safelight red when offline) + shared flash overlay */
 export function mountNetDot(net: Net): void {
   const dot = document.createElement('div');
   dot.className = 'net-dot';
@@ -220,4 +269,5 @@ export function mountNetDot(net: Net): void {
   net.on('open', upd);
   net.on('close', upd);
   upd();
+  mountFlashOverlay(net);
 }
